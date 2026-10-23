@@ -729,7 +729,9 @@ export async function packWorkspacePackages(outDir: string): Promise<PackedTarba
 			const before = new Set(await fs.readdir(outDir));
 			const result = await $`bun pm pack --quiet --destination ${outDir}`.cwd(pkgDir).quiet().nothrow();
 			if (result.exitCode !== 0) {
-				throw new Error(`bun pm pack exited with ${result.exitCode} for ${pkg.dir}: ${result.stderr.toString().trim()}`);
+				throw new Error(
+					`bun pm pack exited with ${result.exitCode} for ${pkg.dir}: ${result.stderr.toString().trim()}`,
+				);
 			}
 			const tarball = (await fs.readdir(outDir)).find(entry => entry.endsWith(".tgz") && !before.has(entry));
 			if (!tarball) throw new Error(`bun pm pack produced no tarball for ${pkg.dir}`);

@@ -54,6 +54,8 @@ async function createReloadSession(tempDir: TempDir): Promise<{ session: AgentSe
 	const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
 	authStorage.keys.setRuntime("managed-primary", "test-key");
 	const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+	const model = buildLocalModel(`rules-reload-${marker}`);
+	vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([model]);
 	const { session } = await createAgentSession({
 		cwd: tempDir.path(),
 		agentDir: tempDir.path(),
@@ -64,7 +66,7 @@ async function createReloadSession(tempDir: TempDir): Promise<{ session: AgentSe
 			"compaction.enabled": false,
 			modelRoles: { default: "managed-primary/rules-reload-model" },
 		}),
-		model: buildLocalModel(`rules-reload-${marker}`),
+		model,
 		disableExtensionDiscovery: true,
 		skills: [],
 		// rules intentionally omitted so discovery runs against disk.

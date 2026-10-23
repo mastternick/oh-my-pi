@@ -38,6 +38,8 @@ async function expectContextReload(reset: (session: AgentSession) => Promise<unk
 	const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
 	authStorage.keys.setRuntime("managed-primary", "test-key");
 	const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+	const model = buildLocalModel(api);
+	vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([model]);
 
 	const { session } = await createAgentSession({
 		cwd: tempDir.path(),
@@ -49,7 +51,7 @@ async function expectContextReload(reset: (session: AgentSession) => Promise<unk
 			"compaction.enabled": false,
 			modelRoles: { default: "managed-primary/context-reload-model" },
 		}),
-		model: buildLocalModel(api),
+		model,
 		disableExtensionDiscovery: true,
 		skills: [],
 		// contextFiles intentionally omitted so discovery runs against disk.

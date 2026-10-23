@@ -68,6 +68,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+          set +e
           log="$RUNNER_TEMP/coding-agent-native-tests.log"
           bun scripts/ci-test-ts.ts "${{ matrix.mode }}" --full 2>&1 | tee "$log"
           test_status=${PIPESTATUS[0]}

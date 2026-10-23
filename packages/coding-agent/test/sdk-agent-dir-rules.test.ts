@@ -50,14 +50,20 @@ async function createScopedSession(agentDir: string) {
 	await fs.mkdir(cwd, { recursive: true });
 	const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
 	authStorage.keys.setRuntime("managed-primary", "test-key");
+	const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+	const model = buildLocalModel();
+	vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([model]);
 	const { session } = await createAgentSession({
 		cwd,
 		agentDir,
 		sessionManager: SessionManager.inMemory(cwd),
 		authStorage,
-		modelRegistry: new ModelRegistry(authStorage, tempDir.join("models.yml")),
-		settings: Settings.isolated({ "compaction.enabled": false }),
-		model: buildLocalModel(),
+		modelRegistry,
+		settings: Settings.isolated({
+			"compaction.enabled": false,
+			modelRoles: { default: "managed-primary/agent-dir-rules-model" },
+		}),
+		model,
 		disableExtensionDiscovery: true,
 		skills: [],
 		contextFiles: [],

@@ -166,6 +166,7 @@ describe("queued user delivery policy", () => {
 			"mnemopi.llmMode": "none",
 			"mnemopi.autoRetain": false,
 			"mnemopi.autoRecall": true,
+			"mnemopi.experienceEnabled": false,
 			"hindsight.apiUrl": "http://unused.invalid",
 			"hindsight.autoRetain": false,
 			"hindsight.autoRecall": true,

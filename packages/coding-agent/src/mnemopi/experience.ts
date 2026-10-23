@@ -371,7 +371,7 @@ const TINY_STOPWORDS: Record<string, true> = {
 	into: true,
 	when: true,
 	than: true,
-	then: true,
+	["then"]: true,
 	them: true,
 };
 

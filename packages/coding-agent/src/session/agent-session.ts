@@ -122,7 +122,6 @@ import type { SessionAccountPoolScope } from "../config/account-pools";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
 import {
 	applyResolvedSessionDefault,
-	applySessionPinDefault,
 	attachSessionPreset,
 	recordSessionPreset,
 	resolveSessionDefault,

@@ -128,6 +128,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		} as AgentSessionEvent);
 	};
 	const session = {
+		settings: Settings.isolated(),
 		state: { messages },
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,

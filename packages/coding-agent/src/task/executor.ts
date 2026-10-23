@@ -108,7 +108,7 @@ import { generateTaskLabel } from "./label";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
-import { createStallGuard, type StallDecision, type StallEvidence, type StallVerdict } from "./stall-guard";
+import { createStallGuard, type StallDecision, type StallVerdict } from "./stall-guard";
 import { createRoleStallJudge, type StallJudge } from "./stall-judge";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import type { WorkPoolYieldItem } from "./workpool-yield";

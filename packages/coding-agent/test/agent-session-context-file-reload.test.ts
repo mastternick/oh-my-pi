@@ -45,7 +45,10 @@ async function expectContextReload(reset: (session: AgentSession) => Promise<unk
 		sessionManager: SessionManager.inMemory(tempDir.path()),
 		authStorage,
 		modelRegistry,
-		settings: Settings.isolated({ "compaction.enabled": false }),
+		settings: Settings.isolated({
+			"compaction.enabled": false,
+			modelRoles: { default: "managed-primary/context-reload-model" },
+		}),
 		model: buildLocalModel(api),
 		disableExtensionDiscovery: true,
 		skills: [],

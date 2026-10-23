@@ -3241,6 +3241,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							primary: primarySelector,
 							chain: fallbackSelectors,
 						});
+						if (settings.isSessionView) {
+							const pin = settings.sessionPin();
+							if (pin) recordSessionPreset(sessionManager, pin);
+						}
 						modelPatternRetryFallbackRole = options.modelPatternFallbackRole;
 					}
 				}

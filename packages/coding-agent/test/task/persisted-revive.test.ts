@@ -209,7 +209,9 @@ interface ReviveOwnerOptions {
 }
 
 function createFactory(cwd: string, eventBus?: EventBus, owner: ReviveOwnerOptions = {}) {
+	const settings = owner.settings ?? Settings.isolated();
 	const parentSession = {
+		settings,
 		sessionManager: {
 			getCwd: () => cwd,
 			getArtifactManager: () => undefined,
@@ -235,7 +237,7 @@ function createFactory(cwd: string, eventBus?: EventBus, owner: ReviveOwnerOptio
 		session: parentSession,
 		authStorage: owner.authStorage ?? ({} as never),
 		modelRegistry: owner.modelRegistry ?? ({ authStorage: {} } as ModelRegistry),
-		settings: owner.settings ?? Settings.isolated(),
+		settings,
 		enableLsp: true,
 		eventBus,
 	});

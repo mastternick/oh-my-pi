@@ -1,8 +1,9 @@
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 
 /** Spread first in a session fake; keep state and behavior overrides on the fake itself. */
 export function createSessionDefaults() {
 	return {
+		settings: Settings.isolated(),
 		setActiveToolsByName: async (_toolNames: string[]) => {},
 		waitForIdle: async () => {},
 		prepareForHeadlessAdvisorDrain: () => {},

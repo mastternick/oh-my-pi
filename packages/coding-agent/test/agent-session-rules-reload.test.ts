@@ -60,7 +60,10 @@ async function createReloadSession(tempDir: TempDir): Promise<{ session: AgentSe
 		sessionManager: SessionManager.inMemory(tempDir.path()),
 		authStorage,
 		modelRegistry,
-		settings: Settings.isolated({ "compaction.enabled": false }),
+		settings: Settings.isolated({
+			"compaction.enabled": false,
+			modelRoles: { default: "managed-primary/rules-reload-model" },
+		}),
 		model: buildLocalModel(`rules-reload-${marker}`),
 		disableExtensionDiscovery: true,
 		skills: [],

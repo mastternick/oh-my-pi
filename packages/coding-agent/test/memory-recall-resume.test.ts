@@ -68,6 +68,7 @@ function startProcess(
 			getApiKeyForProvider: async () => undefined,
 			resolver: () => async () => undefined,
 		},
+		messages: [],
 		getXdevToolEntries: () => [],
 		emitNotice: () => {},
 		getHindsightSessionState: () => undefined,

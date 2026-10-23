@@ -1,0 +1,1430 @@
+#!/usr/bin/env bash
+# omp-launcher — persistent OMP sessions with a hidden tmux backend.
+# User-facing product: "OMP sessions". tmux is internal infrastructure only.
+#
+# Commands:
+#   omp                     projects (most recent activity first), then one project's sessions
+#                             projects: number = project, Enter = current dir, text = search, q = quit
+#                             sessions: number = open (a stopped one resumes), Enter = new, b = projects
+#                             '#N' or 'id:N' (any prompt) opens that session globally by its id
+#   omp new [t] [d] [--flags]   create + attach; dash-flags go to real OMP
+#   omp list | ls [words...]    all sessions, most recent first; words filter (AND, any case;
+#                             '#N' or 'id:N' matches one session's id exactly)
+#   omp attach [title|#N]   attach without picker extras (id works across all projects)
+#   omp kill [title|#N]     terminate session + remove metadata (confirmed)
+#   omp rename [old|#N] [new]   change title
+#   omp desc [title|#N] [text]  change description
+#   omp help                usage
+#   omp real <args...>      exec the real OMP binary directly (escape hatch)
+# Sessions carry a persistent integer id (shown as '#N' next to the row number):
+# globally unique, immutable, never reused (killed sessions keep theirs). Bare numbers
+# stay row positions.
+# Status: open (attached), working / waiting (live), paused (idle-closed), finished (exited).
+# Anything else (flags, messages) is passed through to the real OMP.
+set -uo pipefail
+
+DATA_DIR="${OMP_LAUNCHER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/omp-launcher}"
+SESS_DIR="$DATA_DIR/sessions"
+CONFIG_FILE="$DATA_DIR/config"
+mkdir -p "$SESS_DIR"
+
+# ---------- colors (fallback when not a tty / dumb / NO_COLOR) ----------
+if [[ -t 1 && "${TERM:-dumb}" != "dumb" && -z "${NO_COLOR:-}" ]]; then
+  c_reset=$'\e[0m'; c_bold=$'\e[1m'; c_dim=$'\e[2m'
+  c_green=$'\e[32m'; c_cyan=$'\e[36m'; c_yellow=$'\e[33m'; c_red=$'\e[31m'
+else
+  c_reset=""; c_bold=""; c_dim=""; c_green=""; c_cyan=""; c_yellow=""; c_red=""
+fi
+
+die()  { printf '%s\n' "${c_red}error:${c_reset} $*" >&2; exit 1; }
+info() { printf '%s\n' "${c_dim}$*${c_reset}"; }
+warn() { printf '%s\n' "${c_yellow}⚠ $*${c_reset}" >&2; }
+
+# ---------- real OMP resolution (anti-recursion) ----------
+OMP_REAL_BIN=""; OMP_REAL_RUNNER=""
+[[ -f "$CONFIG_FILE" ]] && . "$CONFIG_FILE"
+# Test/override hooks (also documented escape hatches).
+if [[ -n "${OMP_LAUNCHER_REAL_BIN:-}" ]]; then
+  OMP_REAL_BIN="$OMP_LAUNCHER_REAL_BIN"
+  OMP_REAL_RUNNER="${OMP_LAUNCHER_REAL_RUNNER:-}"
+fi
+: "${OMP_REAL_BIN:=}"
+: "${OMP_REAL_RUNNER:=}"
+# idle auto-close: minutes with no attached client AND no pane output before a
+# session is closed (0 disables). See 'omp sweep'.
+IDLE_TIMEOUT_MIN="${OMP_LAUNCHER_IDLE_MIN:-${IDLE_TIMEOUT_MIN:-30}}"
+# a session counts as "still working" if its process tree used more than this
+# fraction of one CPU since the previous sweep (0.05 = 5%)
+IDLE_CPU_RATE="${OMP_LAUNCHER_IDLE_CPU_RATE:-${IDLE_CPU_RATE:-0.05}}"
+
+# ---------- fallback-chain patch guard (ensure.sh) ----------
+# After an omp update the local preset-fallback patch must be re-applied before any real OMP
+# starts (an unpatched /modelpreset save erases fallbackChains). Runs at most once per launcher
+# invocation, in this process, so its progress/warnings reach the terminal before tmux takes
+# over. A failure never blocks the launch: ensure.sh has already printed the warning.
+# Opt-in: the legacy preset-fallback guard runs only when OMP_LAUNCHER_PFB_ENSURE names an ensure.sh.
+PFB_ENSURE="${OMP_LAUNCHER_PFB_ENSURE:-}"
+PFB_CHECKED=0
+pfb_guard() {
+  (( PFB_CHECKED == 0 )) || return 0
+  PFB_CHECKED=1
+  [[ "${OMP_PFB_GUARD_SKIP:-}" == 1 ]] && return 0
+  [[ -x "$PFB_ENSURE" ]] || return 0
+  "$PFB_ENSURE" --launcher </dev/null || { [[ -t 2 ]] && sleep 2; }
+  return 0
+}
+
+exec_real() {
+  [[ -n "$OMP_REAL_BIN" ]] || die "real OMP binary not configured ($CONFIG_FILE)"
+  [[ -e "$OMP_REAL_BIN" ]] || die "real OMP binary missing: $OMP_REAL_BIN"
+  local self real
+  self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+  real="$(readlink -f "$OMP_REAL_BIN" 2>/dev/null || true)"
+  [[ "$self" != "$real" ]] || die "refusing recursion: OMP_REAL_BIN points at the launcher"
+  pfb_guard
+  if [[ -n "$OMP_REAL_RUNNER" ]]; then exec "$OMP_REAL_RUNNER" "$OMP_REAL_BIN" "$@"
+  else exec "$OMP_REAL_BIN" "$@"; fi
+}
+
+# Guard: if invoked from inside a launcher-managed context, be the real OMP.
+if [[ -n "${OMP_LAUNCHER_GUARD:-}" ]]; then
+  exec_real "$@"
+fi
+
+TMUX_BIN="$(command -v tmux || true)"
+TMUX_SOCKET="${OMP_LAUNCHER_TMUX_SOCKET:-}"   # isolation hook (tests): tmux -L <name>
+need_tmux() { [[ -n "$TMUX_BIN" ]] || die "tmux not found; install it (apt install tmux)"; }
+tmx() { "$TMUX_BIN" ${TMUX_SOCKET:+-L "$TMUX_SOCKET"} "$@"; }
+
+check_attach_tty() { # attaching needs a usable terminal; be explicit instead of leaking tmux's error
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    die "attaching needs an interactive terminal (stdin/stdout not a tty). Use 'omp list' to see sessions, or create one from your SSH shell."
+  fi
+  case "${TERM:-dumb}" in
+    dumb|""|unknown)
+      die "TERM='${TERM:-<unset>}' cannot be used by tmux (it refuses to attach). Run this in a normal SSH terminal, or: TERM=xterm-256color omp attach" ;;
+  esac
+}
+
+# ---------- helpers ----------
+shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }   # POSIX sh single-quote
+sanitize() { local LC_ALL=C s="$1"; s="${s//[$'\x01'-$'\x1f']/}"; while [[ "$s" == *'  '* ]]; do s="${s//  / }"; done; printf '%s' "$s"; }
+now() { date -Iseconds; }
+PROJ_OVERRIDE=""        # set only while the picker creates a session in another project; cmd_new reads it via proj_path
+proj_path() { if [[ -n "$PROJ_OVERRIDE" ]]; then printf '%s\n' "$PROJ_OVERRIDE"; else readlink -f "$PWD"; fi; }
+
+# All session files -> TSV: id title desc proj_path proj_name backend created
+sessions_tsv() {   # rows separated by US (0x01): tab is IFS-whitespace and collapses empty fields
+  local f
+  for f in "$SESS_DIR"/*.json; do
+    [[ -e "$f" ]] || continue
+    jq -r '[(.session_id//""),(.title//""),(.description//""),(.project_path//""),
+            (.project_name//""),(.backend_session_name//""),(.created_at//"")]|join("\u0001")' "$f" 2>/dev/null
+  done
+}
+
+# ---------- persistent session ids ----------
+# Every session has an immutable integer id, globally unique across projects and NEVER
+# reused: the next id is max(counter file, max .id over all session files) + 1, so even a
+# killed session's id stays reserved. Allocation and backfill run under flock on ids.lock.
+ID_LOCK_FILE="$DATA_DIR/ids.lock"
+MAX_ID_FILE="$DATA_DIR/max_id"
+MISS_ID_JQ='select((.id|type) != "number") | [input_filename, ((.created_at//"")|tostring)] | join("\u0001")'
+
+ids_missing() { # files... -> "file US created_at" lines for sessions whose .id is not a number
+  # ONE jq for the whole set (hot path); a file jq cannot parse fails the batch and each
+  # file is retried alone (same two-stage pattern as session_snapshot).
+  local out f
+  if out="$(jq -r "$MISS_ID_JQ" "$@" 2>/dev/null)"; then printf '%s' "$out"; return 0; fi
+  for f in "$@"; do
+    jq -r "$MISS_ID_JQ" "$f" 2>/dev/null || true
+  done
+}
+
+scan_max_id() { # -> highest numeric .id over all session files (0 when none)
+  local -a files=("$SESS_DIR"/*.json)
+  [[ -e "${files[0]}" ]] || { printf 0; return 0; }
+  local m v f
+  if m="$(jq -rn '[inputs | select((.id|type)=="number") | .id] | max // 0' "${files[@]}" 2>/dev/null)"; then
+    printf '%s' "$m"; return 0
+  fi
+  # a corrupt file broke the batch: scan one by one, skipping only the broken record
+  m=0
+  for f in "${files[@]}"; do
+    v="$(jq -r 'if (.id|type)=="number" then .id else 0 end' "$f" 2>/dev/null)" || continue
+    [[ "$v" =~ ^[0-9]+$ ]] && (( v > m )) && m=$v
+  done
+  printf '%s' "$m"
+}
+
+id_counter() { # -> the max_id counter file's value (0 when missing or corrupt: file scan self-heals)
+  local c=""
+  [[ -f "$MAX_ID_FILE" ]] && IFS= read -r c < "$MAX_ID_FILE"
+  [[ "$c" =~ ^[0-9]+$ ]] && printf '%s' "$c" || printf 0
+}
+
+next_id_locked() { # caller holds ids.lock -> the next free id (max(counter, max .id in files) + 1)
+  local c s
+  c="$(id_counter)"; s="$(scan_max_id)"
+  printf '%s' "$(( c > s ? c + 1 : s + 1 ))"
+}
+
+alloc_id_locked() { # caller holds ids.lock -> fresh id; counter written back so ids are never reused
+  local n
+  n="$(next_id_locked)"
+  printf '%s\n' "$n" > "$MAX_ID_FILE"
+  printf '%s' "$n"
+}
+
+set_num_id() { # file id -> store the integer .id as the FIRST key (mktemp+mv keeps 0600)
+  local tmp; tmp="$(mktemp)"
+  jq --argjson v "$2" '{id:$v} + (. | del(.id))' "$1" > "$tmp" && mv "$tmp" "$1"
+}
+
+backfill_session_ids() { # assign an .id to every session file that has none (idempotent)
+  local -a files=("$SESS_DIR"/*.json)
+  [[ -e "${files[0]}" ]] || return 0
+  local out f ca n
+  exec 9>"$ID_LOCK_FILE"
+  flock 9
+  out="$(ids_missing "${files[@]}")"
+  if [[ -n "${out//$'\n'/}" ]]; then
+    n="$(next_id_locked)"
+    # deterministic order: created_at first (all stamps share one offset, so string order
+    # is chronological), then file path — the ids follow creation order
+    while IFS=$'\x01' read -r f ca; do
+      [[ -n "$f" ]] || continue
+      set_num_id "$f" "$n"
+      n=$(( n + 1 ))
+    done < <(printf '%s\n' "$out" | sort -t$'\x01' -k2,2 -k1,1)
+    printf '%s\n' "$(( n - 1 ))" > "$MAX_ID_FILE"
+  fi
+  exec 9>&-
+}
+
+# Every session record in ONE jq run (SNAP_JQ). A file jq cannot parse fails the batch; each file
+# is then read alone, so one broken record never hides the others.
+SNAP_JQ='[input_filename,(.session_id//""),(.title//""),(.description//""),(.project_path//""),(.project_name//""),(.backend_session_name//""),(.last_attached_at//""),(.created_at//""),(.last_active_at//""),(.omp_session_file//""),(.auto_stopped_at//""),(.title_auto//false|tostring),(.desc_auto//false|tostring),(.omp_cwd//""),(.pane_pid//""),(.pane_starttime//""),((.id//"")|tostring)]|join("\u0001")'
+session_snapshot() { # -> one US-separated line per session: file id title desc project_path project_name backend last_attached created last_active omp_session_file auto_stopped_at title_auto desc_auto omp_cwd pane_pid pane_starttime sid
+  local f out
+  local -a files=("$SESS_DIR"/*.json)
+  [[ -e "${files[0]}" ]] || return 0
+  if out="$(jq -r "$SNAP_JQ" "${files[@]}" 2>/dev/null)"; then printf '%s\n' "$out"; return 0; fi
+  for f in "${files[@]}"; do
+    jq -r "$SNAP_JQ" "$f" 2>/dev/null || true
+  done
+}
+
+live_info() {  # $1 = backend session name -> "<attached|running|stopped> <window_activity epoch|0>"
+  local att dead act=0
+  if tmx has-session -t "=$1" 2>/dev/null; then
+    read -r att dead act < <(tmx display-message -p -t "=$1:" '#{session_attached} #{pane_dead} #{window_activity}' 2>/dev/null) || true
+    if [[ "${dead:-0}" == "1" ]]; then echo "stopped 0"          # OMP exited (pane lingering)
+    elif [[ "${att:-0}" -gt 0 ]]; then echo "attached ${act:-0}"
+    else echo "running ${act:-0}"; fi
+  else
+    echo "stopped 0"
+  fi
+}
+
+# One tmux call for every session's live state (same rules as live_info), kept in LIVE_STATE.
+declare -A LIVE_STATE=()
+live_snapshot() { # fills LIVE_STATE[backend] = "<attached|running|stopped> <window_activity epoch|0>"
+  local name att dead act win pane
+  LIVE_STATE=()
+  while IFS='|' read -r name att dead act win pane; do
+    [[ "$win" == 1 && "$pane" == 1 ]] || continue
+    if [[ "${dead:-0}" == 1 ]]; then LIVE_STATE[$name]="stopped 0"
+    elif [[ "${att:-0}" -gt 0 ]]; then LIVE_STATE[$name]="attached ${act:-0}"
+    else LIVE_STATE[$name]="running ${act:-0}"; fi
+  done < <(tmx list-panes -a -F '#{session_name}|#{session_attached}|#{pane_dead}|#{window_activity}|#{window_active}|#{pane_active}' 2>/dev/null)
+}
+live_state_of() { # backend -> sets LIVE_ST / LIVE_ACT from the last live_snapshot ("stopped" when unknown)
+  local s=""
+  [[ -n "$1" ]] && s="${LIVE_STATE[$1]:-}"
+  [[ -n "$s" ]] || s="stopped 0"
+  LIVE_ST="${s%% *}"; LIVE_ACT="${s#* }"
+}
+
+status_of() {  # $1 = backend session name -> attached|running|stopped
+  local st _
+  read -r st _ < <(live_info "$1")
+  printf '%s\n' "$st"
+}
+
+iso_epoch() {  # ISO timestamp -> sets EPOCH to its epoch seconds (pure bash, same result as date); 0 when empty or unparsable
+  local s="$1" re='^([0-9]{4})-([0-9]{2})-([0-9]{2})[T ]([0-9]{2}):([0-9]{2})(:([0-9]{2}))?(\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})$'
+  local y mo dd hh mi ss tz oh om era yoe doy doe days off
+  EPOCH=0
+  if [[ -z "$s" ]]; then return 0; fi
+  if [[ ! "$s" =~ $re ]]; then EPOCH="$(date -d "$s" +%s 2>/dev/null || echo 0)"; return 0; fi
+  y=$((10#${BASH_REMATCH[1]})); mo=$((10#${BASH_REMATCH[2]})); dd=$((10#${BASH_REMATCH[3]}))
+  hh=$((10#${BASH_REMATCH[4]})); mi=$((10#${BASH_REMATCH[5]})); ss=$((10#${BASH_REMATCH[7]:-0}))
+  tz="${BASH_REMATCH[9]}"
+  (( mo <= 2 )) && y=$(( y - 1 ))
+  era=$(( y / 400 )); yoe=$(( y - era * 400 ))
+  doy=$(( (153 * (mo > 2 ? mo - 3 : mo + 9) + 2) / 5 + dd - 1 ))
+  doe=$(( yoe * 365 + yoe / 4 - yoe / 100 + doy ))
+  days=$(( era * 146097 + doe - 719468 ))
+  off=0
+  if [[ "$tz" != Z ]]; then
+    tz="${tz//:/}"; oh=$((10#${tz:1:2})); om=$((10#${tz:3:2}))
+    off=$(( oh * 3600 + om * 60 ))
+    [[ "${tz:0:1}" == - ]] && off=$(( -off ))
+  fi
+  EPOCH=$(( days * 86400 + hh * 3600 + mi * 60 + ss - off ))
+}
+
+# One line per session: epoch US id US title US desc US project_path US project_name US backend
+#   US status US display US omp_session_file US created_at US sid
+# epoch = last activity: newest of live pane output, transcript mtime, last attach, creation and
+# the stored last_active_at. The stored value only grows: it is rewritten here when newer activity is seen.
+# display: open (attached) | working (output < 2 min) | waiting (live, quiet) | paused (idle-closed) | finished
+session_rows() {
+  local now id t d pp pn b la ca stored omp ast st act ep mt disp v stored_ep f sid OFS=$'\x01'
+  now="$(date +%s)"
+  live_snapshot
+  while IFS=$'\x01' read -r f id t d pp pn b la ca stored omp ast _ _ _ _ _ sid; do
+    [[ -n "$id" ]] || continue
+    live_state_of "$b"; st="$LIVE_ST"; act="$LIVE_ACT"
+    ep="${act:-0}"
+    if [[ -n "$omp" && -f "$omp" ]]; then mt="$(stat -c %Y "$omp")"; (( mt > ep )) && ep="$mt"; fi
+    for v in "$la" "$ca" "$stored"; do
+      iso_epoch "$v"; (( EPOCH > ep )) && ep="$EPOCH"
+    done
+    iso_epoch "$stored"; stored_ep="$EPOCH"
+    if (( ep > stored_ep )); then update_field "$f" last_active_at "$(date -Iseconds -d "@$ep")"; fi
+    if [[ "$st" == attached ]]; then disp=open
+    elif [[ "$st" == running ]]; then
+      if (( now - ${act:-0} < 120 )); then disp=working; else disp=waiting; fi
+    elif [[ -n "$ast" ]]; then disp=paused
+    else disp=finished; fi
+    printf '%s\n' "$ep$OFS$id$OFS$t$OFS$d$OFS$pp$OFS$pn$OFS$b$OFS$st$OFS$disp$OFS$omp$OFS$ast$OFS$ca$OFS$sid"
+  done < <(session_snapshot)
+}
+
+icon_of() {  # display status -> colored marker
+  case "$1" in
+    open)    printf '%s◉%s' "$c_cyan"   "$c_reset" ;;
+    working) printf '%s●%s' "$c_green"  "$c_reset" ;;
+    waiting) printf '%s●%s' "$c_yellow" "$c_reset" ;;
+    paused)  printf '%s◌%s' "$c_dim"    "$c_reset" ;;
+    *)       printf '%s○%s' "$c_dim"    "$c_reset" ;;
+  esac
+}
+
+file_of_id()      { printf '%s/%s.json' "$SESS_DIR" "$1"; }
+backend_of_file() { jq -r '.backend_session_name' "$1"; }
+proj_of_file()    { jq -r '.project_path' "$1"; }
+git_root_of()     { git -C "$1" rev-parse --show-toplevel 2>/dev/null || true; }
+
+# ---- process identity helpers (pid reuse-safe) ----
+proc_starttime() { # pid -> kernel starttime (identity token)
+  local pid="$1" rest
+  [[ -r "/proc/$pid/stat" ]] || return 1
+  read -r rest < "/proc/$pid/stat" || return 1
+  rest="${rest#*) }"; set -- $rest              # from the state field on: starttime is field 22 = ${20}
+  [[ -n "${20:-}" ]] || return 1
+  printf '%s' "${20}"
+}
+
+proc_tree_ident() { # pid -> "pid starttime" lines for pid + all descendants
+  local p c st
+  declare -A seen=()
+  local -a q=("$1")
+  while (( ${#q[@]} )); do
+    p="${q[0]}"; q=("${q[@]:1}")
+    [[ -n "$p" && -z "${seen[$p]:-}" ]] || continue
+    seen[$p]=1
+    st="$(proc_starttime "$p")" || continue
+    printf '%s %s\n' "$p" "$st"
+    for c in $(cat /proc/"$p"/task/*/children 2>/dev/null); do q+=("$c"); done
+  done
+}
+
+kill_tree_ident() { # reads "pid starttime" lines; $1 = signal name
+  local p st cur sig="${1:-TERM}"
+  while read -r p st; do
+    [[ -n "$p" && -n "$st" && "$p" != "$$" ]] || continue
+    cur="$(proc_starttime "$p")" || continue
+    [[ "$cur" == "$st" ]] || continue          # pid was reused -> not ours
+    kill "-$sig" "$p" 2>/dev/null || true
+  done
+}
+
+stop_backend() { # backend — end the tmux session AND the OMP process itself, gracefully
+  local b="$1" pane tree=""
+  tmx has-session -t "=$b" 2>/dev/null || return 0
+  pane="$(tmx display-message -p -t "=$b:" '#{pane_pid}' 2>/dev/null || true)"
+  [[ -n "$pane" ]] && tree="$(proc_tree_ident "$pane")"
+  tmx kill-session -t "=$b" 2>/dev/null || true
+  [[ -z "$tree" ]] && return 0
+  # tmux panes inherit SIGHUP ignored from the server: kill-session alone leaves the
+  # OMP process alive as an orphan, so signal the tree ourselves.
+  printf '%s\n' "$tree" | stop_tree_gracefully
+}
+
+tree_alive() { # reads "pid starttime" lines; true if any is still the same process
+  local p st
+  while read -r p st; do
+    [[ -n "$p" && -n "$st" ]] || continue
+    [[ "$(proc_starttime "$p" 2>/dev/null || true)" == "$st" ]] && return 0
+  done
+  return 1
+}
+
+stop_tree_gracefully() { # reads "pid starttime" lines; TERM, wait for a clean exit, then KILL
+  local tree waited=0
+  tree="$(cat)"
+  [[ -n "$tree" ]] || return 0
+  printf '%s\n' "$tree" | kill_tree_ident TERM
+  # OMP flushes its transcript and writes a session_exit record on SIGTERM
+  # (measured: ~0.3-0.5 s for an idle session); give it time before escalating.
+  while (( waited < 5000 )); do
+    printf '%s\n' "$tree" | tree_alive || return 0
+    sleep 0.2
+    waited=$(( waited + 200 ))
+  done
+  printf '%s\n' "$tree" | kill_tree_ident KILL
+  sleep 0.5
+  printf '%s\n' "$tree" | kill_tree_ident KILL
+}
+
+stop_orphan() { # file — kill a surviving OMP process whose session is gone
+  local op st
+  op="$(orphan_pid "$1" 2>/dev/null || true)"
+  [[ -n "$op" ]] || return 0
+  st="$(jq -r '.pane_starttime // ""' "$1" 2>/dev/null)"
+  printf '%s %s\n' "$op" "$st" | stop_tree_gracefully
+}
+
+orphan_pid() { # file -> pid of a still-running OMP process of a dead session
+  local pid st cur
+  IFS=$'\x01' read -r pid st < <(jq -r '[.pane_pid // "", .pane_starttime // ""] | join("\u0001")' "$1" 2>/dev/null)
+  [[ -n "$pid" && -n "$st" ]] || return 1
+  cur="$(proc_starttime "$pid")" || return 1
+  [[ "$cur" == "$st" ]] || return 1
+  tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF "${OMP_REAL_BIN:-/nonexistent}" || return 1
+  printf '%s' "$pid"
+}
+
+stop_orphan() { # file — kill a surviving OMP process whose session is gone
+  local op st
+  op="$(orphan_pid "$1" 2>/dev/null || true)"
+  [[ -n "$op" ]] || return 0
+  st="$(jq -r '.pane_starttime // ""' "$1" 2>/dev/null)"
+  printf '%s %s\n' "$op" "$st" | kill_tree_ident TERM
+  sleep 1
+  printf '%s %s\n' "$op" "$st" | kill_tree_ident KILL
+}
+
+cpu_of_tree() { # pid -> accumulated CPU jiffies of pid + descendants (0 if unknown)
+  local p st u s sum=0
+  while read -r p st; do
+    [[ -n "$p" ]] || continue
+    u="$(sed 's/^[^)]*) //' "/proc/$p/stat" 2>/dev/null | awk '{print $12}')"
+    s="$(sed 's/^[^)]*) //' "/proc/$p/stat" 2>/dev/null | awk '{print $13}')"
+    [[ "$u" =~ ^[0-9]+$ && "$s" =~ ^[0-9]+$ ]] && sum=$(( sum + u + s ))
+  done < <(proc_tree_ident "$1")
+  printf '%s' "$sum"
+}
+
+# ---- OMP's own session store (used to auto-name sessions) ----
+omp_store_root() { printf '%s' "${OMP_LAUNCHER_OMP_STORE:-$HOME/.omp/agent/sessions}"; }
+
+omp_slug() { # project_path -> OMP's per-project directory name (exact port of OMP's encoder:
+  # tmp-relative -> "-tmp[-rest]", home-relative -> "-[-rest]" (home itself -> "-"),
+  # anything else -> "--abs-path-with-dashes--"; e.g. /home/goldbars -> --home-goldbars--)
+  local abs home tmp rel s
+  abs="$(realpath -m -- "$1" 2>/dev/null)" || abs="$1"
+  home="$(realpath -m -- "$HOME" 2>/dev/null)" || home="$HOME"
+  tmp="${TMPDIR:-/tmp}"; tmp="$(realpath -m -- "$tmp" 2>/dev/null)" || tmp="${TMPDIR:-/tmp}"
+  rel="$(realpath -m --relative-to="$tmp" -- "$abs" 2>/dev/null)" || rel="ERR"
+  [[ "$rel" == "." ]] && rel=""
+  if [[ "$rel" != ERR && "$rel" != ../* && "$rel" != /* ]]; then
+    s="${rel//\//-}"; s="${s//:/-}"
+    if [[ -n "$s" ]]; then printf -- '-tmp-%s' "$s"; else printf -- '-tmp'; fi
+    return
+  fi
+  rel="$(realpath -m --relative-to="$home" -- "$abs" 2>/dev/null)" || rel="ERR"
+  [[ "$rel" == "." ]] && rel=""
+  if [[ "$rel" != ERR && "$rel" != ../* && "$rel" != /* ]]; then
+    s="${rel//\//-}"; s="${s//:/-}"
+    if [[ -n "$s" ]]; then printf -- '-%s' "$s"; else printf -- '-'; fi
+    return
+  fi
+  s="${abs#/}"; s="${s//\//-}"; s="${s//:/-}"
+  printf -- '--%s--' "$s"
+}
+
+# transcript -> its start stamp "YYYY-MM-DDTHH-MM-SS" (UTC, from the file name). Stamps share one
+# fixed format, so they compare as strings: no date(1) fork per candidate.
+omp_file_stamp() {   # transcript -> sets STAMP to its start stamp "YYYY-MM-DDTHH-MM-SS" (UTC, file name) or ""
+  local ts="${1##*/}"; ts="${ts%%_*}"; STAMP=""
+  [[ "$ts" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2} ]] && STAMP="${ts:0:19}"
+  return 0
+}
+
+# OMP's top-level session file is <store>/<project dir>/<file>.jsonl; deeper files are subagent
+# transcripts (<project dir>/<session dir>/<agent>.jsonl) and never a session's own transcript
+top_transcript() { # store-root transcript -> 0 when it is a top-level transcript
+  local rel
+  [[ "$2" == "$1"/*/*.jsonl ]] || return 1
+  rel="${2#"$1"/}"
+  [[ "$rel" != */*/* ]]
+}
+
+pane_live_pid() { # pane pid + starttime from a session record -> pid when it is still the SAME process (pid-reuse safe)
+  local pid="$1" st="$2"
+  [[ -n "$pid" && -n "$st" ]] || return 1
+  [[ "$(proc_starttime "$pid" 2>/dev/null || true)" == "$st" ]] || return 1
+  printf '%s' "$pid"
+}
+
+# transcript claimed by each session metadata file (refilled by load_claims on every refresh)
+declare -A CLAIMED=()
+
+load_claims() { # per refresh: the real store root and every session's claimed transcript
+  local f omp _
+  STORE_ROOT="$(realpath -m -- "$(omp_store_root)" 2>/dev/null || omp_store_root)"
+  CLAIMED=()
+  while IFS=$'\x01' read -r f _ _ _ _ _ _ _ _ _ omp _; do
+    [[ -n "$f" ]] && CLAIMED[$f]="$omp"
+  done < <(session_snapshot)
+}
+
+set_claim() { # metadata file, transcript ("" = none) -> stored claim and the claim map
+  update_field "$1" omp_session_file "$2"
+  CLAIMED[$1]="$2"
+}
+
+claimed_by_other() { # transcript, own-metadata-file -> 0 when another session claims it
+  local k
+  for k in "${!CLAIMED[@]}"; do
+    [[ "$k" != "$2" && "${CLAIMED[$k]}" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+omp_fd_transcript() { # pane pid -> transcript this OMP process tree holds open for writing
+  local pid="$1" root p fd tgt n fl k v
+  root="$STORE_ROOT"
+  while read -r p _; do
+    [[ -n "$p" && -d "/proc/$p/fd" ]] || continue
+    for fd in /proc/"$p"/fd/*; do
+      tgt="$(readlink "$fd" 2>/dev/null)" || continue
+      top_transcript "$root" "$tgt" || continue   # top-level transcripts only (not subagent files)
+      n="${fd##*/}"
+      fl=""
+      [[ -r "/proc/$p/fdinfo/$n" ]] && while read -r k v _; do [[ "$k" == flags: ]] && fl="$v"; done < "/proc/$p/fdinfo/$n"
+      [[ -n "$fl" ]] || continue
+      (( (8#$fl) & 3 )) || continue                 # written fd: OMP's active conversation
+      printf '%s' "$tgt"; return 0
+    done
+  done < <(proc_tree_ident "$pid")
+  return 1
+}
+
+omp_file_cwd() { # transcript -> cwd recorded in its session record (empty when absent)
+  head -n 5 "$1" 2>/dev/null | jq -r 'select(.type=="session")|.cwd // empty' 2>/dev/null | head -1
+}
+
+claim_omp_file() { # session fields (session_snapshot) -> transcript path (deterministic pairing) or nothing
+  local f="$1" pp="$2" cand="$3" created="$4" cwd="$5" ppid="$6" pst="$7" pid created_e d ccwd lo hi stamp best="" beste=""
+  local -a dirs
+  [[ -n "$pp" ]] || return 1
+  if [[ -n "$cand" && -f "$cand" ]] && top_transcript "$STORE_ROOT" "$cand"; then printf '%s' "$cand"; return 0; fi
+  pid="$(pane_live_pid "$ppid" "$pst")"
+  if [[ -n "$pid" ]]; then
+    # ground truth while the agent is active: OMP keeps its transcript open for writing
+    cand="$(omp_fd_transcript "$pid" 2>/dev/null || true)"
+    if [[ -n "$cand" && -f "$cand" ]] && ! claimed_by_other "$cand" "$f"; then
+      printf '%s' "$cand"; return 0
+    fi
+  fi
+  iso_epoch "$created"; created_e="$EPOCH"
+  # candidate window as file-name stamps: 60 s before creation up to 15 min after it
+  lo="$(date -u -d "@$((created_e - 60))" +%Y-%m-%dT%H-%M-%S)"
+  hi="$(date -u -d "@$((created_e + 900))" +%Y-%m-%dT%H-%M-%S)"
+  # OMP may run in a different directory than the launcher recorded (it can restore the
+  # last project dir on start), so try its real cwd before the recorded project path.
+  dirs=("$STORE_ROOT/$(omp_slug "$pp")")
+  if [[ -n "$cwd" ]]; then
+    d="$STORE_ROOT/$(omp_slug "$cwd")"
+    [[ "$d" != "${dirs[0]}" ]] && dirs=("$d" "${dirs[@]}")
+  fi
+  for d in "${dirs[@]}"; do
+    [[ -d "$d" ]] || continue
+    best=""; beste=""
+    for cand in "$d"/*.jsonl; do
+      [[ -f "$cand" ]] || continue
+      omp_file_stamp "$cand"; stamp="$STAMP"
+      [[ -n "$stamp" && ! "$stamp" < "$lo" ]] || continue          # transcript started before this session
+      claimed_by_other "$cand" "$f" && continue
+      if [[ -z "$best" || "$stamp" < "$beste" ]]; then best="$cand"; beste="$stamp"; fi
+    done
+    [[ -n "$best" ]] && { printf '%s' "$best"; return 0; }
+  done
+  # last resort (the OMP process is gone and its transcript drifted out of the recorded
+  # project dir): unclaimed transcript started within a tight window around creation
+  best=""; beste=""
+  for d in "$STORE_ROOT"/*/; do
+    [[ -d "$d" ]] || continue
+    for cand in "$d"*.jsonl; do
+      [[ -f "$cand" ]] || continue
+      omp_file_stamp "$cand"; stamp="$STAMP"
+      [[ -n "$stamp" && ! "$stamp" < "$lo" && ! "$stamp" > "$hi" ]] || continue
+      claimed_by_other "$cand" "$f" && continue
+      ccwd="$(omp_file_cwd "$cand")"
+      [[ -z "$ccwd" || "$ccwd" == "$pp" || "$ccwd" == "$pp"/* ]] || continue
+      if [[ -z "$best" || "$stamp" < "$beste" ]]; then best="$cand"; beste="$stamp"; fi
+    done
+  done
+  [[ -n "$best" ]] && printf '%s' "$best"
+}
+
+omp_file_title() { # transcript -> OMP's generated title (last title record)
+  local f="$1" t=""
+  [[ -n "$f" && -f "$f" ]] || return 1
+  # newest title wins; OMP may leave an empty placeholder record, so skip empty lines
+  t="$(grep -E '"type": *"title(_change)?"' "$f" 2>/dev/null | jq -Rrs 'split("\n") | map(fromjson? | select(.type=="title" or .type=="title_change") | .title // empty | select(length>0)) | last // empty' 2>/dev/null)"
+  [[ -n "$t" ]] || return 1
+  printf '%s' "$t"
+}
+
+omp_file_desc() { # transcript -> first user message, single line, truncated
+  local f="$1" t=""
+  [[ -n "$f" && -f "$f" ]] || return 1
+  t="$(jq -n -r 'first(inputs | select(.type=="message" and (.message.role=="user")) | .message.content[]? | select(.type=="text") | .text)' "$f" 2>/dev/null | head -1)"
+  [[ -n "$t" ]] || return 1
+  t="${t//[$'\n\t']/ }"; printf '%s' "${t:0:120}"
+}
+
+refresh_auto_titles() { # claim every session's transcript; fill title/description only where auto-named
+  local want f id t d pp pn b la ca stored old ast ta da omc ppid pst pid cwd claim title desc stale rows
+  load_claims
+  rows="$(session_snapshot)"
+  # auto-titled sessions claim first, so a manual-titled session cannot take their transcript
+  for want in true false; do
+    while IFS=$'\x01' read -r f id t d pp pn b la ca stored old ast ta da omc ppid pst _; do
+      [[ -n "$id" ]] || continue
+      [[ "$ta" == "$want" ]] || continue
+      # remember where OMP really runs: its cwd picks the store directory the transcript
+      # lands in, and it can differ from the recorded project path (home -> last project)
+      pid="$(pane_live_pid "$ppid" "$pst")"
+      if [[ -n "$pid" ]]; then
+        cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
+        if [[ -n "$cwd" && "$omc" != "$cwd" ]]; then
+          update_field "$f" omp_cwd "$cwd"
+          omc="$cwd"
+        fi
+      fi
+      stale=0
+      if [[ -n "$old" ]] && ! top_transcript "$STORE_ROOT" "$old"; then stale=1; fi
+      claim="$(claim_omp_file "$f" "$pp" "$old" "$ca" "$omc" "$ppid" "$pst" 2>/dev/null || true)"
+      if (( stale )); then
+        # the stored transcript is a subagent file (older launcher bug): forget the text it filled in
+        t=""; d=""
+        [[ "$ta" == true ]] && update_field "$f" title ""
+        [[ "$da" == true ]] && update_field "$f" description ""
+      fi
+      if [[ -z "$claim" ]]; then
+        (( stale )) && set_claim "$f" ""
+        continue
+      fi
+      [[ "$old" == "$claim" ]] || set_claim "$f" "$claim"
+      if [[ "$ta" == true ]]; then
+        title="$(omp_file_title "$claim" 2>/dev/null || true)"
+        if [[ -n "$title" && "$title" != "$t" ]]; then
+          update_field "$f" title "$(sanitize "$title")"
+        fi
+      fi
+      if [[ "$da" == true ]]; then
+        desc="$(omp_file_desc "$claim" 2>/dev/null || true)"
+        [[ -n "$desc" ]] && update_field "$f" description "$(sanitize "$desc")"
+      fi
+    done <<<"$rows"
+  done
+}
+
+disp_title() { [[ -n "${1:-}" ]] && printf '%s' "$1" || printf '(auto)'; }
+
+concurrency_warning() { # $1 = project filter ("" = all)
+  # Classify by observed omp_cwd (falls back to project_path); group by Git checkout path, not common root.
+  local filter="${1:-}" _ id t d pp pn b st dir checkout key k omc
+  declare -A groups=()
+  live_snapshot
+  while IFS=$'\x01' read -r _ id t d pp pn b _ _ _ _ _ _ _ omc _; do
+    [[ -z "$id" ]] && continue
+    dir="${omc:-$pp}"
+    [[ -z "$filter" || "$pp" == "$filter" || "$dir" == "$filter" ]] || continue
+    live_state_of "$b"; st="$LIVE_ST"
+    [[ "$st" == stopped ]] && continue
+    checkout="$(git_root_of "$dir")"
+    if [[ -n "$checkout" ]]; then key="git:$checkout"; else key="dir:$dir"; fi
+    groups[$key]=$(( ${groups[$key]:-0} + 1 ))
+  done < <(session_snapshot)
+  for k in "${!groups[@]}"; do
+    (( ${groups[$k]} > 1 )) || continue
+    if [[ "$k" == git:* ]]; then
+      warn "${groups[$k]} OMP sessions are using the same Git checkout (${k#git:})."
+      printf '%s\n' "  Concurrent edits may conflict." >&2
+    else
+      warn "${groups[$k]} OMP sessions share the non-Git directory ${k#dir:}. Advisory only: no Git checkout is involved and no conflicting writes are known."
+    fi
+  done
+}
+
+# ---------- metadata ops ----------
+save_session() { # sid id proj_path proj_name title desc backend args_json
+  local tmp; tmp="$(mktemp)"
+  jq -n --argjson sid "$1" --arg id "$2" --arg pp "$3" --arg pn "$4" --arg t "$5" --arg d "$6" \
+        --arg b "$7" --argjson args "$8" --arg ts "$(now)" \
+    '{id:$sid, session_id:$id, project_path:$pp, project_name:$pn, title:$t,
+      description:$d, created_at:$ts, last_attached_at:null,
+      backend_session_name:$b, omp_args:$args, worktree_path:null, status:null,
+      pane_pid:null, pane_starttime:null, omp_session_file:null, omp_cwd:null,
+      title_auto:($t|length==0), desc_auto:($d|length==0)}' > "$tmp" \
+    && mv "$tmp" "$(file_of_id "$2")"
+}
+
+update_field() { # file field value
+  local tmp; tmp="$(mktemp)"
+  jq --arg v "$3" --arg f "$2" '.[$f]=$v' "$1" > "$tmp" && mv "$tmp" "$1"
+}
+
+set_flag() { # file field true|false
+  local tmp; tmp="$(mktemp)"
+  jq --argjson v "$3" --arg f "$2" '.[$f]=$v' "$1" > "$tmp" && mv "$tmp" "$1"
+}
+
+touch_attached() { # file
+  local tmp; tmp="$(mktemp)"
+  jq --arg ts "$(now)" '.last_attached_at=$ts' "$1" > "$tmp" && mv "$tmp" "$1"
+}
+
+# ---------- tmux backend ----------
+start_backend() { # backend file [omp args...]
+  local backend="$1" file="$2"; shift 2
+  [[ -n "$OMP_REAL_BIN" ]] || die "real OMP binary not configured"
+  local cwd; cwd="$(proj_of_file "$file")"
+  [[ -n "$cwd" ]] || die "session metadata has no project_path"
+
+  # the fallback patch must be in place before this session's OMP starts (tmux takes over next)
+  pfb_guard
+  # NOTE: no OMP_LAUNCHER_GUARD here on purpose — sessions exec the absolute
+  # runner+binary, so recursion is impossible, and exporting the guard would make
+  # 'omp <subcommand>' invoked inside a session (e.g. by an agent's shell) exec the
+  # real OMP with the subcommand as a message instead of the launcher.
+  local inner="exec"
+  [[ -n "$OMP_REAL_RUNNER" ]] && inner+=" $(printf %q "$OMP_REAL_RUNNER")"
+  inner+=" $(printf %q "$OMP_REAL_BIN")"
+  local a
+  for a in "$@"; do inner+=" $(printf %q "$a")"; done
+  tmx new-session -d -s "$backend" -c "$cwd" "bash -c $(shq "$inner")" \
+    || die "failed to create tmux session '$backend'"
+  # remember the pane process so kill/status work even if tmux dies
+  local pid st tmp
+  pid="$(tmx display-message -p -t "=$backend:" '#{pane_pid}' 2>/dev/null || true)"
+  st="$(proc_starttime "$pid" 2>/dev/null || true)"
+  tmp="$(mktemp)"
+  # a successful start ends an earlier idle auto-close: the session is no longer 'paused'
+  jq --arg p "${pid:-}" --arg s "${st:-}" '.pane_pid=$p|.pane_starttime=$s|.auto_stopped_at=null|.last_stop_reason=null' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+attach_backend() { # backend file
+  check_attach_tty
+  touch_attached "$2"
+  local -a c=("$TMUX_BIN")
+  [[ -n "$TMUX_SOCKET" ]] && c+=(-L "$TMUX_SOCKET")
+  if [[ -n "${TMUX:-}" ]]; then
+    exec "${c[@]}" switch-client -t "=$1"
+  else
+    exec "${c[@]}" attach-session -t "=$1"
+  fi
+}
+
+# ---------- selection (globals: sel_* arrays, one entry per shown row) ----------
+sel_ids=(); sel_files=(); sel_titles=(); sel_descs=(); sel_status=(); sel_disp=()
+sel_last=(); sel_ca=(); sel_pp=(); sel_pn=(); sel_conv=(); sel_num=(); sel_found=""; sel_now=0
+sel_new_auto=0          # 1 when "new" came from a bare Enter (skip title prompts)
+AUTO_NAME_NEW=""        # caller flag for cmd_new: create auto-named, no prompts
+
+stamp_of() {   # epoch -> "Oct 12 14:03" (year added when it is not the current year)
+  local y
+  printf -v y '%(%Y)T' "$1"
+  if [[ "$y" == "$(printf '%(%Y)T' -1)" ]]; then printf '%(%b %-d %H:%M)T' "$1"
+  else printf '%(%b %-d %Y %H:%M)T' "$1"; fi
+}
+created_stamp() { # ISO timestamp -> " · created Oct 10 09:12" (or "" when missing/unparseable)
+  local s="$1"
+  [[ -n "$s" ]] || return 0
+  iso_epoch "$s"
+  (( EPOCH > 0 )) || return 0
+  printf ' · created %s' "$(stamp_of "$EPOCH")"
+}
+
+
+when_text() {  # epoch now -> "active 3 min ago (Oct 12 14:03)", "active yesterday 14:03"
+  local e="$1" now="$2" d ed nd
+  if (( e <= 0 )); then printf 'active unknown'; return; fi
+  d=$(( now - e )); (( d < 0 )) && d=0
+  if (( d < 60 )); then printf 'active just now (%s)' "$(stamp_of "$e")"
+  elif (( d < 3600 )); then printf 'active %d min ago (%s)' "$((d/60))" "$(stamp_of "$e")"
+  else
+    printf -v ed '%(%F)T' "$e"; printf -v nd '%(%F)T' "$now"
+    if [[ "$ed" == "$nd" ]]; then printf 'active %d h ago (%s)' "$((d/3600))" "$(stamp_of "$e")"
+    elif (( d < 2*86400 )) && [[ "$ed" == "$(printf '%(%F)T' "$((now-86400))")" ]]; then
+      printf 'active yesterday %s' "$(printf '%(%H:%M)T' "$e")"
+    else printf 'active %s' "$(stamp_of "$e")"; fi
+  fi
+}
+
+print_sel_row() {  # index show_project(0|1)
+  local i="$1" show="$2" meta op n pad sid
+  n=$(( i + 1 ))
+  sid="${sel_num[$i]:-?}"      # defensive: '?' keeps the alignment sane when the id is missing
+  # continuation lines sit under the title: "  N. #SID ◉ " is len(N)+len(SID)+8 columns wide
+  printf -v pad '%*s' $(( ${#n} + ${#sid} + 8 )) ''
+  printf '  %s%d.%s %s#%s%s %s %s%s%s\n' "$c_dim" "$n" "$c_reset" "$c_dim" "$sid" "$c_reset" \
+    "$(icon_of "${sel_disp[$i]}")" "$c_bold" "$(disp_title "${sel_titles[$i]}")" "$c_reset"
+  [[ -n "${sel_descs[$i]}" ]] && printf '%s%s%s%s\n' "$pad" "$c_dim" "${sel_descs[$i]}" "$c_reset"
+  meta="${sel_disp[$i]} · $(when_text "${sel_last[$i]}" "$sel_now")$(created_stamp "${sel_ca[$i]}")"
+  (( show )) && meta+=" · ${sel_pn[$i]}"
+  (( sel_conv[i] )) && meta+=" (match in conversation)"
+  printf '%s%s%s%s\n' "$pad" "$c_dim" "$meta" "$c_reset"
+  [[ -n "${sel_ast[$i]}" ]] && printf '%s%s%s%s\n' "$pad" "$c_dim" 'auto-closed after idle' "$c_reset"
+  if [[ "${sel_status[$i]}" == stopped ]]; then
+    op="$(orphan_pid "${sel_files[$i]}" 2>/dev/null || true)"
+    [[ -n "$op" ]] && printf '%s%s⚠ orphaned OMP process (pid %s) still running%s\n' "$pad" "$c_yellow" "$op" "$c_reset"
+  fi
+  printf '\n'
+}
+
+# proj_path ("" = all projects) [word...] -> fills sel_*, oldest first (most recent activity at the end).
+# Words are AND-ed and case-insensitive. A word matches title, description, project name or
+# path; failing that, the claimed transcript (the row is then marked "match in conversation").
+# A '#N' or 'id:N' word matches a session with .id == N exactly; a bare all-digit word also
+# matches a session whose sid equals it.
+collect_rows() {
+  local want="$1" ep id t d pp pn b st disp omp ast w hay conv ok sid num
+  local -a words=()
+  shift
+  words=("$@")
+  sel_ids=(); sel_files=(); sel_titles=(); sel_descs=(); sel_status=(); sel_disp=()
+  sel_last=(); sel_ca=(); sel_pp=(); sel_pn=(); sel_conv=(); sel_ast=(); sel_num=()
+  sel_now="$(date +%s)"
+  while IFS=$'\x01' read -r ep id t d pp pn b st disp omp ast ca sid; do
+    [[ -n "$id" ]] || continue
+    [[ -z "$want" || "$pp" == "$want" ]] || continue
+    conv=0; ok=1
+    hay="${t} ${d} ${pp} ${pn}"; hay="${hay,,}"
+    for w in "${words[@]}"; do
+      w="${w,,}"
+      if [[ "$w" =~ ^(#|id:)([0-9]+)$ ]]; then
+        [[ "$sid" == "${BASH_REMATCH[2]}" ]] && continue
+        ok=0; break
+      fi
+      [[ "$hay" == *"$w"* ]] && continue
+      if [[ "$w" =~ ^[0-9]+$ && -n "$sid" && "$sid" == "$w" ]]; then continue; fi
+      if [[ -f "$omp" ]] && grep -qiF -- "$w" "$omp"; then conv=1; continue; fi
+      ok=0; break
+    done
+    (( ok )) || continue
+    sel_ids+=("$id"); sel_files+=("$SESS_DIR/$id.json")
+    sel_titles+=("$t"); sel_descs+=("$d"); sel_status+=("$st"); sel_disp+=("$disp")
+    sel_last+=("$ep"); sel_ca+=("$ca"); sel_pp+=("$pp"); sel_pn+=("$pn"); sel_conv+=("$conv"); sel_ast+=("$ast")
+    sel_num+=("$sid")
+  done < <(session_rows | sort -t$'\x01' -k1,1n)
+}
+
+find_by_title() { # proj_path title -> sets sel_found; 0 ok, 1 not found, 2 ambiguous
+  collect_rows "$1"
+  local i hits=0
+  sel_found=""
+  for i in "${!sel_ids[@]}"; do
+    if [[ "${sel_titles[$i]}" == "$2" ]]; then
+      sel_found="$i"; hits=$((hits+1))
+    fi
+  done
+  case "$hits" in
+    0) return 1 ;;
+    1) return 0 ;;
+    *) printf '%s\n' "${c_yellow}⚠ ${hits} sessions named '$2' in this project.${c_reset}" >&2
+       printf '%s\n' "  Use the picker:  omp attach   /  omp kill   /  omp rename" >&2
+       return 2 ;;
+  esac
+}
+
+id_token() { # word -> the digits of a '#N' / 'id:N' token (N = 1-6 digits); exit 1 otherwise
+  local w="$1"
+  if [[ "$w" =~ ^\#([0-9]{1,6})$ ]]; then printf '%s' "${BASH_REMATCH[1]}"; return 0; fi
+  if [[ "$w" =~ ^id:([0-9]{1,6})$ ]]; then printf '%s' "${BASH_REMATCH[1]}"; return 0; fi
+  return 1
+}
+
+find_by_id() { # id (digits) -> GLOBAL lookup across all projects; sets sel_found to a row index; 0 ok, 1 miss
+  collect_rows ""
+  local i hits=0
+  sel_found=""
+  for i in "${!sel_ids[@]}"; do
+    if [[ "${sel_num[$i]}" == "$1" ]]; then
+      hits=$((hits+1))
+      if [[ -z "$sel_found" ]]; then sel_found="$i"; fi    # duplicate ids (corruption): first wins
+    fi
+  done
+  if (( hits > 1 )); then
+    printf '%s\n' "${c_yellow}⚠ session id $1 is assigned to ${hits} sessions (corrupted metadata); using the first.${c_reset}" >&2
+  fi
+  (( hits >= 1 ))
+}
+
+show_picker() {  # proj_path allow_new query -> header and rows (query "" = current project)
+  local pp="$1" allow_new="$2" query="$3" i sp n=${#sel_ids[@]}
+  if [[ -n "$query" ]]; then
+    printf '\n%s%sOMP · search %s (all projects)%s\n\n' "$c_bold" "$c_cyan" "'$query'" "$c_reset"
+  else
+    printf '\n%s%sOMP · %s%s\n' "$c_bold" "$c_cyan" "$(basename "$pp")" "$c_reset"
+    printf '%s%s%s\n\n' "$c_dim" "$pp" "$c_reset"
+  fi
+  for i in "${!sel_ids[@]}"; do
+    sp=0; [[ "${sel_pp[$i]}" != "$pp" ]] && sp=1
+    print_sel_row "$i" "$sp"
+  done
+  if (( allow_new == 1 )) && [[ -z "$query" ]]; then
+    printf '  %s%d.%s %s+ Create new session%s\n\n' "$c_dim" "$((n+1))" "$c_reset" "$c_green" "$c_reset"
+  fi
+}
+
+pick_session() { # proj_path question allow_new [allow_back] -> sets sel_found to an index, "new" or "back"; 1 = cancelled
+  local pp="$1" prompt="$2" allow_new="${3:-0}" allow_back="${4:-0}"
+  local r n num rc disp idn
+  local -a words=()
+  collect_rows "$pp"
+  n=${#sel_ids[@]}
+  if (( n == 0 && allow_new == 0 )); then
+    info "No OMP sessions for this project yet. Create one with: omp new"
+    info "(a session id like #12 still works: ids are global)"
+  fi
+  sel_new_auto=0
+  show_picker "$pp" "$allow_new" ""
+  while true; do
+    disp="$prompt (number, #id, text = search"
+    (( allow_new == 1 )) && disp+=", Enter = new"
+    (( allow_back == 1 )) && disp+=", b = projects"
+    disp+=", q = cancel):"
+    read -r -p "$disp " r || { printf '\n'; return 1; }
+    if [[ -z "${r//[[:space:]]/}" ]]; then
+      # bare Enter creates (allow_new) or cancels
+      if (( allow_new == 1 )); then sel_found="new"; sel_new_auto=1; return 0; fi
+      return 1
+    fi
+    [[ "$r" == q || "$r" == Q ]] && return 1
+    if (( allow_back == 1 )) && [[ "$r" == b || "$r" == B ]]; then sel_found="back"; return 0; fi
+    num="${r//[[:space:]]/}"
+    if idn="$(id_token "$num")"; then
+      # global id lookup: find_by_id replaces sel_* with the ALL-projects list
+      if find_by_id "$idn"; then return 0; fi
+      printf '%s\n' "No session with id $idn."
+      collect_rows "$pp"; n=${#sel_ids[@]}   # restore this project's list before re-prompting
+      continue
+    fi
+    if [[ "$num" =~ ^[0-9]+$ ]]; then
+      if [[ "$num" =~ ^0*[1-9][0-9]{0,5}$ ]]; then
+        num=$((10#$num))
+        if (( num <= n )); then sel_found="$((num-1))"; return 0; fi
+        if (( allow_new == 1 && num == n+1 )); then sel_found="new"; sel_new_auto=0; return 0; fi
+      fi
+      printf '%s\n' "Invalid choice."
+      continue
+    fi
+    read -r -a words <<< "${r#/}"
+    if (( ${#words[@]} == 0 )); then printf '%s\n' "Invalid choice."; continue; fi
+    search_sessions "$pp" "${words[@]}"; rc=$?
+    if (( rc == 0 )); then return 0; fi
+    if (( rc == 2 )); then return 1; fi
+    # Enter in the search: back to this project's list
+    collect_rows "$pp"; n=${#sel_ids[@]}
+    show_picker "$pp" "$allow_new" ""
+  done
+}
+
+search_sessions() { # pp words... -> 0 = row picked (sel_found), 1 = back to the caller's list, 2 = cancelled
+  local pp="$1" r n num idn
+  local -a qwords=("${@:2}") words=()
+  collect_rows "" "${qwords[@]}"
+  n=${#sel_ids[@]}
+  if (( n == 0 )); then printf "No sessions match '%s'.\n" "${qwords[*]}"; return 1; fi
+  show_picker "$pp" 0 "${qwords[*]}"
+  while true; do
+    read -r -p "Select (number, #id, text = search, Enter = back, q = cancel): " r || { printf '\n'; return 2; }
+    if [[ -z "${r//[[:space:]]/}" ]]; then return 1; fi
+    [[ "$r" == q || "$r" == Q ]] && return 2
+    num="${r//[[:space:]]/}"
+    if idn="$(id_token "$num")"; then
+      if find_by_id "$idn"; then return 0; fi
+      printf '%s\n' "No session with id $idn."
+      collect_rows "" "${qwords[@]}"; n=${#sel_ids[@]}   # restore the search results before re-prompting
+      continue
+    fi
+    if [[ "$num" =~ ^[0-9]+$ ]]; then
+      if [[ "$num" =~ ^0*[1-9][0-9]{0,5}$ ]] && (( 10#$num <= n )); then
+        sel_found="$((10#$num - 1))"; return 0
+      fi
+      printf '%s\n' "Invalid choice."
+      continue
+    fi
+    read -r -a words <<< "${r#/}"
+    if (( ${#words[@]} == 0 )); then printf '%s\n' "Invalid choice."; continue; fi
+    collect_rows "" "${words[@]}"
+    if (( ${#sel_ids[@]} == 0 )); then
+      printf "No sessions match '%s'.\n" "${words[*]}"
+      collect_rows "" "${qwords[@]}"   # keep the results on screen selectable
+      continue
+    fi
+    qwords=("${words[@]}"); n=${#sel_ids[@]}
+    show_picker "$pp" 0 "${qwords[*]}"
+  done
+}
+
+# ---------- commands ----------
+# ---------- projects (Screen 1) and one project's sessions (Screen 2) ----------
+collect_projects() { # -> proj_paths, proj_ep (newest activity), proj_counts, proj_live; newest activity first
+  local ep id t d pp pn b st disp omp ast ca p _
+  local -A newest=() nsess=() nlive=()
+  proj_paths=(); proj_ep=(); proj_counts=(); proj_live=()
+  while IFS=$'\x01' read -r ep id t d pp pn b st disp omp ast ca _; do
+    [[ -n "$id" && -n "$pp" ]] || continue
+    if [[ -z "${newest[$pp]:-}" ]] || (( ep > ${newest[$pp]} )); then newest[$pp]=$ep; fi
+    nsess[$pp]=$(( ${nsess[$pp]:-0} + 1 ))
+    [[ "$st" == stopped ]] || nlive[$pp]=$(( ${nlive[$pp]:-0} + 1 ))
+  done < <(session_rows)
+  while IFS=$'\x01' read -r ep p; do
+    proj_paths+=("$p"); proj_ep+=("$ep"); proj_counts+=("${nsess[$p]}"); proj_live+=("${nlive[$p]:-0}")
+  done < <(for p in "${!newest[@]}"; do printf '%s\x01%s\n' "${newest[$p]}" "$p"; done | sort -t$'\x01' -k1,1nr -k2,2)
+}
+
+show_projects() { # cur -> numbered project list (Screen 1)
+  local cur="$1" i n=${#proj_paths[@]} num ind mark summary now_e
+  printf '\n%s%sOMP · projects%s\n\n' "$c_bold" "$c_cyan" "$c_reset"
+  if (( n == 0 )); then printf '%sNo OMP sessions yet.%s\n\n' "$c_dim" "$c_reset"; fi
+  now_e="$(date +%s)"
+  for i in "${!proj_paths[@]}"; do
+    num=$(( i + 1 ))
+    printf -v ind '%*s' $(( ${#num} + 4 )) ''
+    mark=""
+    [[ "${proj_paths[$i]}" == "$cur" ]] && mark=" ${c_dim}(current dir)${c_reset}"
+    printf '  %s%d.%s %s%s%s%s\n' "$c_dim" "$num" "$c_reset" "$c_bold" "$(basename "${proj_paths[$i]}")" "$c_reset" "$mark"
+    printf '%s%s%s%s\n' "$ind" "$c_dim" "${proj_paths[$i]}" "$c_reset"
+    summary="${proj_counts[$i]} session(s) · $(when_text "${proj_ep[$i]}" "$now_e")"
+    (( proj_live[i] > 0 )) && summary+=" · ${proj_live[$i]} live"
+    printf '%s%s%s%s\n\n' "$ind" "$c_dim" "$summary" "$c_reset"
+  done
+  printf '  %s%d.%s %s+ Other project (enter path)...%s\n\n' "$c_dim" "$((n+1))" "$c_reset" "$c_green" "$c_reset"
+}
+
+pick_top() { # Screen 1. Enter = current dir, number = project, text = search sessions, q = quit
+  local cur r num rc idn
+  local -a words=()
+  cur="$(proj_path)"
+  while true; do
+    collect_projects
+    show_projects "$cur"
+    read -r -p "Project (number, text = search sessions, Enter = current dir, q = cancel): " r || { printf '\n'; return 0; }
+    num="${r//[[:space:]]/}"
+    rc=0
+    if [[ -z "$num" ]]; then
+      open_project "$cur"; rc=$?
+    elif [[ "$num" == q || "$num" == Q ]]; then
+      return 0
+    elif idn="$(id_token "$num")"; then
+      # global session id: opens that session from the projects screen too
+      if find_by_id "$idn"; then attach_choice; return 0; fi
+      printf '%s\n' "No session with id $idn."
+      rc=1
+    elif [[ "$num" =~ ^[0-9]+$ ]]; then
+      if [[ ! "$num" =~ ^0*[1-9][0-9]{0,5}$ ]] || (( 10#$num > ${#proj_paths[@]} + 1 )); then
+        printf '%s\n' "Invalid choice."; continue
+      fi
+      num=$((10#$num))
+      if (( num == ${#proj_paths[@]} + 1 )); then other_project; rc=$?
+      else open_project "${proj_paths[$((num-1))]}"; rc=$?; fi
+    else
+      read -r -a words <<< "${r#/}"
+      if (( ${#words[@]} == 0 )); then printf '%s\n' "Invalid choice."; continue; fi
+      search_sessions "" "${words[@]}"; rc=$?
+      if (( rc == 0 )); then attach_choice; return 0; fi
+    fi
+    (( rc == 1 )) || return 0
+  done
+}
+
+other_project() { # Other project: asks for a path -> open_project's code; 1 = blank input (back), 2 = EOF (cancel)
+  local raw p
+  while true; do
+    read -r -e -p "Project path: " raw || { printf '\n'; return 2; }
+    if [[ -z "${raw//[[:space:]]/}" ]]; then return 1; fi
+    p="$raw"
+    case "$p" in
+      "~") p="$HOME" ;;
+      "~/"*) p="$HOME/${p#"~/"}" ;;
+    esac
+    p="$(readlink -f -- "$p" 2>/dev/null)"
+    if [[ -n "$p" && -d "$p" ]]; then open_project "$p"; return $?; fi
+    printf '%s\n' "Not a directory: $raw"
+  done
+}
+
+open_project() { # project_path -> its sessions (Screen 2). 0 = created or attached, 1 = back to projects, 2 = cancelled
+  pick_session "$1" "Select" 1 1 || return 2
+  case "$sel_found" in
+    back) return 1 ;;
+    new)  create_session_in "$1" "$sel_new_auto" ;;
+    *)    attach_choice ;;
+  esac
+  return 0
+}
+
+create_session_in() { # project_path auto(0|1): a new session there; auto = no title prompts
+  PROJ_OVERRIDE="$1"
+  if [[ "$2" == 1 ]]; then AUTO_NAME_NEW=1; fi
+  cmd_new
+  PROJ_OVERRIDE=""; AUTO_NAME_NEW=""
+}
+
+resume_session() { # file backend -> start the stopped session on its own conversation (never 'omp -c'), then attach
+  local file="$1" backend="$2" line a t title
+  local skip=0
+  local -a saved=() kept=() args=()
+  while IFS= read -r line; do [[ -n "$line" ]] && saved+=("$line"); done < <(jq -r '.omp_args[]?' "$file")
+  t="$(jq -r '.omp_session_file // ""' "$file")"
+  title="$(jq -r '.title // ""' "$file")"
+  if [[ -n "$t" && -f "$t" ]] && top_transcript "$STORE_ROOT" "$t"; then
+    for a in ${saved[@]+"${saved[@]}"}; do
+      if (( skip )); then skip=0; continue; fi
+      case "$a" in
+        -c|--continue|--resume=*|--restore=*) ;;
+        -r|--resume|--restore) skip=1 ;;
+        *) kept+=("$a") ;;
+      esac
+    done
+    info "Resuming conversation '$(disp_title "$title")' ..."
+    args=(--resume "$t" ${kept[@]+"${kept[@]}"})
+  else
+    info "No saved conversation yet - starting fresh"
+    args=(${saved[@]+"${saved[@]}"})
+  fi
+  stop_backend "$backend"
+  stop_orphan "$file"
+  start_backend "$backend" "$file" ${args[@]+"${args[@]}"}
+  attach_backend "$backend" "$file"
+}
+
+cmd_new() {
+  need_tmux
+  local pp pn title="" desc=""
+  local -a oargs=()
+  pp="$(proj_path)"; pn="$(basename "$pp")"
+  local a seen_flags=0
+  for a in "$@"; do
+    if (( seen_flags )) || [[ "$a" == -* ]]; then
+      seen_flags=1
+      [[ "$a" == "--" ]] || oargs+=("$a")   # everything from the first flag on goes to OMP
+      continue
+    fi
+    if [[ -z "$title" ]]; then title="$(sanitize "$a")"
+    else desc="$(sanitize "$desc $a")"; fi
+  done
+  desc="${desc# }"
+  if [[ -z "$title" && -n "${AUTO_NAME_NEW:-}" ]]; then
+    info "No title given — it will be filled in automatically from the session."
+  elif [[ -z "$title" ]]; then
+    read -r -p "Session title (Enter = name it automatically from the session later): " title || title=""
+    title="$(sanitize "$title")"
+    if [[ -n "$title" ]]; then
+      read -r -p "Description (Enter = skip): " desc || desc=""
+      desc="$(sanitize "$desc")"
+    else
+      info "No title given — it will be filled in automatically from the session."
+    fi
+  fi
+  local id backend args_json sid
+  id="$(uuidgen)"
+  backend="omp-$(printf '%s' "$id" | sha256sum | cut -c1-12)"
+  if (( ${#oargs[@]} )); then args_json="$(printf '%s\n' "${oargs[@]}" | jq -R . | jq -s -c .)"
+  else args_json='[]'; fi
+  # allocate the persistent id and write the metadata under the same lock, so two
+  # concurrent 'omp new' can never draw the same id
+  exec 9>"$ID_LOCK_FILE"; flock 9
+  sid="$(alloc_id_locked)"
+  save_session "$sid" "$id" "$pp" "$pn" "$title" "$desc" "$backend" "$args_json"
+  exec 9>&-
+  if (( ${#oargs[@]} )); then start_backend "$backend" "$(file_of_id "$id")" "${oargs[@]}"
+  else start_backend "$backend" "$(file_of_id "$id")"; fi
+  concurrency_warning "$pp"
+  info "Created session '$(disp_title "$title")' (id $sid) in $pn."
+  if [[ -t 0 && -t 1 && "${TERM:-dumb}" != "dumb" ]]; then
+    attach_backend "$backend" "$(file_of_id "$id")"
+  else
+    info "No usable terminal here, so it was created detached. Attach with:  omp   (picker)"
+  fi
+}
+
+cmd_pick() { # mode(pick|attach) [title]
+  need_tmux
+  check_attach_tty
+  refresh_auto_titles
+  local mode="$1"; shift
+  local pp idn; pp="$(proj_path)"
+  if (( $# > 0 )); then
+    if idn="$(id_token "$1")"; then
+      find_by_id "$idn" || die "no session with id $idn"   # ids are global: not limited to this project
+    else
+      find_by_title "$pp" "$1" || die "no unique session '$1' in this project"
+    fi
+    attach_choice
+    return
+  fi
+  if [[ "$mode" == pick ]]; then pick_top; return; fi
+  pick_session "$pp" "Select" 0 || return 0
+  attach_choice
+}
+
+attach_choice() { # attaches to the session at sel_found; a stopped one resumes its conversation first
+  local i="$sel_found" file backend st n
+  file="${sel_files[$i]}"
+  backend="$(backend_of_file "$file")"
+  st="${sel_status[$i]}"
+  if [[ "$st" == stopped ]]; then resume_session "$file" "$backend"; return; fi
+  if [[ "$st" == attached ]]; then
+    n="$(tmx display-message -p -t "=$backend:" '#{session_attached}' 2>/dev/null || echo 1)"
+    warn "'${sel_titles[$i]}' is already attached in $n client(s). Attaching shares it (multi-attach); nobody is disconnected."
+  fi
+  attach_backend "$backend" "$file"
+}
+
+cmd_list() {   # [words...]: all sessions, oldest first (most recent at the end); words narrow the list (AND, any case)
+  need_tmux
+  refresh_auto_titles
+  collect_rows "" "$@"
+  if (( ${#sel_ids[@]} == 0 )); then
+    if (( $# )); then printf "\n  No sessions match '%s'.\n\n" "$*"
+    else printf '\n  No sessions yet. Create one with: omp new\n\n'; fi
+  else
+    if (( $# )); then printf '\n%s%sOMP · sessions matching %s%s\n\n' "$c_bold" "$c_cyan" "'$*'" "$c_reset"
+    else printf '\n%s%sOMP · all sessions%s\n\n' "$c_bold" "$c_cyan" "$c_reset"; fi
+    local i
+    for i in "${!sel_ids[@]}"; do print_sel_row "$i" 1; done
+  fi
+  concurrency_warning ""
+}
+
+cmd_kill() {
+  need_tmux
+  refresh_auto_titles
+  local pp idn; pp="$(proj_path)"
+  if (( $# > 0 )); then
+    if idn="$(id_token "$1")"; then
+      find_by_id "$idn" || die "no session with id $idn"   # ids are global: not limited to this project
+    else
+      find_by_title "$pp" "$1" || die "no unique session '$1' in this project"
+    fi
+  else
+    pick_session "$pp" "Kill which session?" 0 || return 0
+  fi
+  local i="$sel_found"
+  local title="${sel_titles[$i]}" file="${sel_files[$i]}" backend st r
+  backend="$(backend_of_file "$file")"
+  st="$(status_of "$backend")"
+  if [[ "$st" != stopped ]]; then
+    printf '%s\n' "Session '${c_bold}$title${c_reset}' is ${c_yellow}$st${c_reset}."
+    read -r -p "Kill it? The OMP process will be TERMINATED and metadata removed. [y/N] " r
+  else
+    read -r -p "Remove stopped session '$title' and its metadata? [y/N] " r
+  fi
+  [[ "$r" =~ ^[Yy] ]] || { info "Cancelled."; return 0; }
+  stop_backend "$backend"
+  stop_orphan "$file"
+  rm -f "$file"
+  info "Session '$title' killed."
+}
+
+cmd_rename() {
+  local pp old="${1:-}" new="${2:-}" idn
+  pp="$(proj_path)"
+  refresh_auto_titles
+  if [[ -z "$old" ]]; then
+    pick_session "$pp" "Rename which session?" 0 || return 0
+  elif idn="$(id_token "$old")"; then
+    find_by_id "$idn" || die "no session with id $idn"   # ids are global: not limited to this project
+  else
+    find_by_title "$pp" "$old" || die "no unique session '$old' in this project"
+  fi
+  old="${sel_titles[$sel_found]}"
+  if [[ -z "$new" ]]; then
+    read -r -p "New title [${sel_titles[$sel_found]}]: " new || return 0
+    new="$(sanitize "$new")"
+    [[ -n "$new" ]] || new="${sel_titles[$sel_found]}"
+  fi
+  new="$(sanitize "$new")"
+  update_field "${sel_files[$sel_found]}" title "$new"
+  set_flag "${sel_files[$sel_found]}" title_auto false
+  info "Renamed '$old' -> '$new'."
+}
+
+cmd_desc() {
+  local pp txt="" idx="" first="${1:-}" idn hit=0
+  pp="$(proj_path)"
+  refresh_auto_titles
+  if [[ -n "$first" ]]; then
+    if idn="$(id_token "$first")"; then
+      find_by_id "$idn" || die "no session with id $idn"   # ids are global: not limited to this project
+      hit=1
+    elif find_by_title "$pp" "$first"; then
+      hit=1
+    fi
+  fi
+  if (( hit )); then
+    shift
+    txt="$(sanitize "$*")"
+    if [[ -z "$txt" ]]; then
+      read -r -p "New description [${sel_descs[$sel_found]}]: " txt || return 0
+      txt="$(sanitize "$txt")"
+    fi
+  else
+    txt="$(sanitize "${*:-}")"
+    pick_session "$pp" "Set description for which session?" 0 || return 0
+    if [[ -z "${txt//[[:space:]]/}" ]]; then
+      read -r -p "New description [${sel_descs[$sel_found]}]: " txt || return 0
+      txt="$(sanitize "$txt")"
+    fi
+  fi
+  update_field "${sel_files[$sel_found]}" description "$txt"
+  set_flag "${sel_files[$sel_found]}" desc_auto false
+  info "Description updated for '${sel_titles[$sel_found]}'."
+}
+
+cmd_sweep() { # [--quiet] — close sessions left idle (no client, no output, no CPU work) for IDLE_TIMEOUT_MIN
+  need_tmux
+  local quiet=0
+  [[ "${1:-}" == --quiet || "${1:-}" == -q ]] && quiet=1
+  local mins="$IDLE_TIMEOUT_MIN"
+  [[ "$mins" =~ ^[0-9]+([.][0-9]+)?$ ]] || mins=30
+  if ! awk -v m="$mins" 'BEGIN{exit !(m>0)}'; then
+    (( quiet )) || info "idle auto-close is disabled (IDLE_TIMEOUT_MIN=$mins)"
+    return 0
+  fi
+  local hz; hz="$(getconf CLK_TCK 2>/dev/null || true)"; [[ "$hz" =~ ^[0-9]+$ ]] || hz=100
+  local secs now id t d pp pn b c act att dead f tmp age pane cpu prev prevt elapsed closed=0
+  secs="$(awk -v m="$mins" 'BEGIN{printf "%d", m*60}')"
+  now="$(date +%s)"
+  while IFS=$'\x01' read -r id t d pp pn b c; do
+    [[ -n "$id" ]] || continue
+    tmx has-session -t "=$b" 2>/dev/null || continue
+    read -r act att dead < <(tmx display-message -p -t "=$b:" '#{window_activity} #{session_attached} #{pane_dead}' 2>/dev/null) || continue
+    [[ "$act" =~ ^[0-9]+$ ]] || continue
+    (( ${att:-0} > 0 )) && continue      # someone is watching: never touch
+    [[ "${dead:-0}" == "1" ]] && continue
+    age=$(( now - act ))
+    (( age >= secs )) || continue        # recent output -> active
+    f="$(file_of_id "$id")"
+    pane="$(tmx display-message -p -t "=$b:" '#{pane_pid}' 2>/dev/null || true)"
+    cpu="$(cpu_of_tree "$pane")"
+    prev="$(jq -r '.cpu_jiffies // ""' "$f" 2>/dev/null)"
+    prevt="$(jq -r '.cpu_sampled_at // ""' "$f" 2>/dev/null)"
+    # "idle" must also mean "not working": a silently busy agent (long tool call with
+    # no TUI output) keeps burning CPU. Compare the CPU used since the previous sweep
+    # against IDLE_CPU_RATE (default 5% of one CPU) — an idle OMP TUI repaints well
+    # below that, a compiling/installing agent far above it.
+    if [[ ! "$prev" =~ ^[0-9]+$ || ! "$prevt" =~ ^[0-9]+$ ]]; then
+      update_field "$f" cpu_jiffies "$cpu"; update_field "$f" cpu_sampled_at "$now"
+      continue                                        # first sample: decide next sweep
+    fi
+    elapsed=$(( now - prevt )); (( elapsed < 60 )) && elapsed=60
+    if awk -v d="$(( cpu - prev ))" -v e="$elapsed" -v r="$IDLE_CPU_RATE" -v h="$hz" \
+         'BEGIN{exit !(d >= e*r*h)}'; then
+      update_field "$f" cpu_jiffies "$cpu"; update_field "$f" cpu_sampled_at "$now"
+      (( quiet )) || info "keeping '$t' — still working ($(( (cpu - prev) / hz ))s CPU in ${elapsed}s)"
+      continue
+    fi
+    stop_backend "$b"                                # end the tmux session AND the OMP process
+    stop_orphan "$f"
+    update_field "$f" last_stop_reason idle
+    update_field "$f" cpu_jiffies "$cpu"
+    update_field "$f" cpu_sampled_at "$now"
+    tmp="$(mktemp)"
+    jq --arg ts "$(date -Iseconds)" --arg a "$age" \
+      '.auto_stopped_at=$ts|.auto_stopped_after_sec=$a' "$f" > "$tmp" && mv "$tmp" "$f"
+    printf '%s auto-closed "%s" [%s] after %s min with no client, no output and no CPU work\n' \
+      "$(date -Iseconds)" "$t" "$pn" "$(awk -v a="$age" 'BEGIN{printf "%.1f", a/60}')" >> "$DATA_DIR/gc.log"
+    (( quiet )) || info "auto-closed '$t' ($pn) — idle $(( age / 60 )) min"
+    closed=$(( closed + 1 ))
+  done < <(sessions_tsv)
+  if (( ! quiet )); then
+    if (( closed )); then info "$closed session(s) auto-closed. Restart and continue with: omp attach <title>"
+    else info "nothing to close (needs ${mins} min with no client, no output and no CPU work)"; fi
+  fi
+}
+
+cmd_help() {
+  cat <<EOF
+${c_bold}OMP session launcher${c_reset} — persistent OMP sessions, tmux hidden.
+
+Usage:
+  omp                        projects, most recent activity first (number = open, Enter =
+                             current dir, text = search all sessions, q = quit). Inside a
+                             project: number = open (a stopped one resumes its conversation),
+                             Enter = new session, b = projects. '#N' / 'id:N' opens the
+                             session with that id (any screen, all projects)
+  omp new [title] [desc] [--flags-for-omp]
+                             create a persistent session; title/description are
+                             OPTIONAL — press Enter and they get filled in later
+                             from the session itself (OMP's auto title + first message)
+  omp list | ls [words...]   all sessions, most recent first; words filter (AND, any case;
+                             '#N' / 'id:N' selects that session's id exactly)
+  omp attach [title|#N]      attach to a session of this project (a stopped one resumes);
+                             an id works across ALL projects
+  omp kill [title|#N]        terminate a session (asks confirmation)
+  omp sweep [--quiet]        close sessions left idle (nobody attached, no output
+                             for ${IDLE_TIMEOUT_MIN} min) to free resources; metadata is
+                             kept, restart with 'omp attach <title>' (resumes its
+                             conversation). Runs automatically via the user timer.
+  omp rename [old|#N] [new]  change session title
+  omp desc [title|#N] [text] change session description
+  omp real <args...>         run the REAL omp binary directly (escape hatch)
+  omp help                   this help
+
+Session ids: every session has a permanent integer id, shown as '#N' beside the row
+number (e.g. "5. #57 ◉ Title"). It is global and immutable, and ids are never reused
+(killed sessions keep theirs reserved). Use '#57' or 'id:57' in any picker prompt or as
+the title argument: omp attach id:57, omp kill '#57', omp rename '#57' new-title,
+omp desc id:57 text, omp ls '#57'. Bare numbers stay row positions.
+
+Anything else (flags like -c/-r/--model, or messages) is passed through
+to the real OMP in the current terminal, e.g. 'omp -c', 'omp --model x "hi"'.
+Note: 'new/list/ls/attach/kill/rename/desc/help/real' are launcher commands;
+to send such a word as an OMP message use: omp real <word>.
+
+Status: ◉ open (attached)   ● working (output in the last 2 min)   ● waiting (quiet)
+        ◌ paused (closed by the idle sweeper, resumable)   ○ finished (OMP exited)
+
+Just close your SSH/PC — sessions keep running. Reattach later with 'omp'.
+Data: $DATA_DIR
+EOF
+}
+
+# ---------- dispatch ----------
+cmd="${1:-}"
+case "$cmd" in
+  "")             backfill_session_ids; cmd_pick pick ;;
+  new)            shift; backfill_session_ids; cmd_new "$@" ;;
+  list|ls)        shift; backfill_session_ids; cmd_list "$@" ;;
+  attach)         shift; backfill_session_ids; cmd_pick attach "$@" ;;
+  kill)           shift; backfill_session_ids; cmd_kill "$@" ;;
+  sweep)          shift; cmd_sweep "$@" ;;
+  rename)         shift; backfill_session_ids; cmd_rename "$@" ;;
+  desc)           shift; backfill_session_ids; cmd_desc "$@" ;;
+  help|--help|-h) cmd_help ;;
+  real)           shift; exec_real "$@" ;;
+  *)              exec_real "$@" ;;   # flags, messages, unknown subcommands -> real OMP
+esac

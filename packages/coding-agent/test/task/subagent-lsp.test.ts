@@ -142,9 +142,11 @@ function mockCreateAgentSession(): { getOptions: () => CreateAgentSessionOptions
 }
 
 function mockIsolation(): void {
+	// The custom isolation-runner canonicalizes repo roots while preserving task cwd.
+	const repoRoot = os.tmpdir();
 	const baseline: WorktreeBaseline = {
 		root: {
-			repoRoot: "/repo",
+			repoRoot,
 			headCommit: "HEAD",
 			staged: "",
 			unstaged: "",
@@ -160,7 +162,7 @@ function mockIsolation(): void {
 		fallbackReason: null,
 	};
 
-	vi.spyOn(worktreeModule, "getRepoRoot").mockResolvedValue("/repo");
+	vi.spyOn(worktreeModule, "getRepoRoot").mockResolvedValue(repoRoot);
 	vi.spyOn(worktreeModule, "captureBaseline").mockResolvedValue(baseline);
 	vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue(isolationHandle);
 	vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: "", nestedPatches: [] });

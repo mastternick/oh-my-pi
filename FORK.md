@@ -86,6 +86,11 @@ Source-only divergence: `coding-agent/src/cli/update-cli.ts` (see above). `codin
 ## Port to upstream v18.12.6
 
 - Base: upstream `45c35e40c4`. The snapshot's `src/mnemopi/*` and `src/config/model-presets.ts` semantics are kept. Upstream has no equivalent for the mnemopi modules.
+- Mnemopi's custom `agent_start` background recall is retained; after prompt-preparation recall fails, this hook may recover and inject memory into that same first request.
+- The custom tool-loop guard stops a run after three consecutive unresolved tool calls; tests of unrelated loop behavior should use registered tools.
+- The custom task isolation runner preserves the parent's relative working directory inside the worktree; test fixtures use an existing repo root because the runner canonicalizes it.
+- Custom Mnemopi experience may supplement a worker prompt after the parent's unchanged recall prefix; `/tan` keeps that prompt-cache prefix intact.
+- With `task.isolation.enabled` on, writable task spawns default to isolated execution; `isolated: false` is the explicit opt-out.
 - `createSettingsHost(view: Settings)` (`src/config/settings-ui.ts`) takes an instance. Tests that mutate the global `Settings.instance` pass `Settings.instance`, not `Settings.isolated()`: `plan-autosave`, `settings-layout`, `settings-selector-memory-refresh`, and `settings-multiselect`.
 - Mnemopi test stubs must match real shapes: session stubs need `messages: []`, and `modelRegistry` stubs need `getAvailable: () => []`. Applied in `memory-tools`, `mnemopi-recall-features`, and `mnemopi-loop-phase-coverage`.
 - Explicit enqueue with `autoRetain` disabled does not retain transcripts. `src/mnemopi/state.ts` and `backend.ts` gate retention on `autoRetain`. `memory-tools.test.ts` now expects 0 retained items (was 1). The `sleepAllSessions` assertion is kept.

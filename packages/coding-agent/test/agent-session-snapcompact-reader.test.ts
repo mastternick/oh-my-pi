@@ -9,6 +9,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:te
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Type } from "@oh-my-pi/omptype/typebox";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Context, Message, Model } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockModel } from "@oh-my-pi/pi-ai/providers/mock";
@@ -138,13 +139,30 @@ describe("snapcompact archive read by a Claude model", () => {
 		return archive;
 	}
 
-	function startSession(sessionManager: SessionManager, model: Model): { session: AgentSession; mock: MockModel } {
+	function startSession(
+		sessionManager: SessionManager,
+		model: Model,
+		withLoopTool = false,
+	): { session: AgentSession; mock: MockModel } {
 		const mock = createMockModel({ handler: { content: ["ok"] } });
 		const agent = new Agent({
 			initialState: {
 				model,
 				systemPrompt: ["Test"],
-				tools: [],
+				tools: withLoopTool
+					? [
+							{
+								name: "progress",
+								label: "progress",
+								description: "Record progress.",
+								parameters: Type.Object({ iteration: Type.Number() }),
+								execute: async (_id, params) => ({
+									content: [{ type: "text" as const, text: `progress ${params.iteration}` }],
+									details: {},
+								}),
+							},
+						]
+					: [],
 				messages: sessionManager.buildSessionContext().messages,
 			},
 			convertToLlm,
@@ -292,14 +310,15 @@ describe("snapcompact archive read by a Claude model", () => {
 	it("checks only messages appended since the previous model call of a tool loop", async () => {
 		const sessionManager = SessionManager.inMemory();
 		const original = await seedArchive(sessionManager);
-		const { session, mock } = startSession(sessionManager, claude);
+		const { session, mock } = startSession(sessionManager, claude, true);
 		const summaryChecks = vi.spyOn(snapcompact, "summaryIncludesThinking");
 		const checksAtCall: number[] = [];
+		// The custom tool-loop guard stops after three consecutive unresolved calls.
 		for (let call = 0; call < 4; call++) {
 			mock.push(() => {
 				checksAtCall.push(summaryChecks.mock.calls.length);
 				return call < 3
-					? { content: [{ type: "toolCall", name: "missing_tool", arguments: {} }] }
+					? { content: [{ type: "toolCall", name: "progress", arguments: { iteration: call } }] }
 					: { content: ["done"] };
 			});
 		}

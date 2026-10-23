@@ -44,12 +44,13 @@ function result(id: string): SingleResult {
 async function commitsAcrossRelease(id: string, runEndPatch: string, releasePatch: string): Promise<number> {
 	const artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-release-"));
 	tempRoots.push(artifactsDir);
+	// The custom isolation runner realpaths its source and task cwd before preserving their relative path.
 	const baseline = {
-		root: { repoRoot: "/repo", headCommit: "base", staged: "", unstaged: "", untracked: [], untrackedPatch: "" },
+		root: { repoRoot: artifactsDir, headCommit: "base", staged: "", unstaged: "", untracked: [], untrackedPatch: "" },
 		nested: [],
 	};
 	vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
-		mergedDir: "/repo/isolated",
+		mergedDir: path.join(artifactsDir, "isolated"),
 		backend: natives.IsoBackendKind.Rcopy,
 		fellBack: false,
 		fallbackReason: null,
@@ -92,13 +93,13 @@ async function commitsAcrossRelease(id: string, runEndPatch: string, releasePatc
 
 	await runIsolatedSubprocess({
 		baseOptions: {
-			cwd: "/repo",
+			cwd: artifactsDir,
 			agent: { name: "task", description: "Task agent", systemPrompt: "test", source: "bundled" },
 			task: "Do work",
 			index: 0,
 			id,
 		},
-		context: { repoRoot: "/repo" },
+		context: { repoRoot: artifactsDir },
 		preferredBackend: undefined,
 		agentId: id,
 		mergeMode: "branch",

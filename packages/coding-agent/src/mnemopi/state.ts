@@ -28,11 +28,7 @@ import { redactMemorySecrets, redactRememberWrite } from "../memory-backend/reda
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import memoryRecallChangesPrompt from "../prompts/system/memory-recall-changes.md" with { type: "text" };
 import mnemopiInstructions from "../prompts/system/mnemopi-instructions.md" with { type: "text" };
-import {
-	type MnemopiBackendConfig,
-	type MnemopiScoping,
-	truncateApproxTokens,
-} from "./config";
+import { type MnemopiBackendConfig, type MnemopiScoping, truncateApproxTokens } from "./config";
 import {
 	captureExperience,
 	collectExperienceEvidence,

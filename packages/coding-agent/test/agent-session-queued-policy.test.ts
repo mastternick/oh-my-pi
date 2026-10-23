@@ -299,7 +299,7 @@ describe("queued user delivery policy", () => {
 	);
 
 	it.each(["mnemopi", "hindsight"] as const)(
-		"retries failed real %s recall on the next committed turn",
+		"recovers failed real %s recall via background agent_start recall",
 		async backendId => {
 			let recalls = 0;
 			const { requests } = await setupMemory(backendId, async () => {
@@ -307,7 +307,12 @@ describe("queued user delivery policy", () => {
 				return "recovered recall";
 			});
 			await session.prompt("lookup unavailable");
-			expect(requests[0].systemPrompt?.join("\n")).not.toContain("recovered recall");
+			if (backendId === "mnemopi") {
+				// Custom background agent_start recall can recover before the first request is sent.
+				expect(requests[0].systemPrompt?.join("\n")).toContain("recovered recall");
+			} else {
+				expect(requests[0].systemPrompt?.join("\n")).not.toContain("recovered recall");
+			}
 			await session.prompt("lookup recovered");
 			expect(requests[1].systemPrompt?.join("\n")).toContain("recovered recall");
 			await session.prompt("already recalled");

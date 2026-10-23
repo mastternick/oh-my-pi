@@ -269,7 +269,8 @@ async function createSessionHarness(
 		// prewarm (models with `preferWebsockets`) would race in and replace the
 		// stub via `getCodexProviderSessionState`, orphaning the spy — disable
 		// websockets since these tests exercise reload semantics, not transport.
-		settings: Settings.isolated({ "providers.openaiWebsockets": "off" }),
+		// These replay tests do not exercise custom session-preset snapshots.
+		settings: Settings.isolated({ "providers.openaiWebsockets": "off" }).overlay(),
 		disableExtensionDiscovery: true,
 		skills: [],
 		contextFiles: [],

@@ -173,11 +173,12 @@ describe("failed child evidence", () => {
 		await finishChildrenThenBreakMerge(tempDir.path());
 
 		const tool = await TaskTool.create(createSession(tempDir.path(), { "async.enabled": false }));
+		// Custom task isolation is enabled here; the control child opts out so this test isolates merge-failure attribution.
 		const result = await tool.execute("tc-two-children", {
 			context: "Shared context.",
 			tasks: [
 				{ name: "Changer", agent: "worker", task: "Change the file.", isolated },
-				{ name: "Reader", agent: "worker", task: "Read the file." },
+				{ name: "Reader", agent: "worker", task: "Read the file.", isolated: false },
 			],
 		});
 
@@ -201,7 +202,7 @@ describe("failed child evidence", () => {
 				context: "Shared context.",
 				tasks: [
 					{ name: "Reviewer", agent: "reviewer", task: "Review the change.", isolated: true },
-					{ name: "Builder", agent: "worker", task: "Build the change." },
+					{ name: "Builder", agent: "worker", task: "Build the change.", isolated: false },
 				],
 			});
 			await manager.getJob("Builder")?.promise;

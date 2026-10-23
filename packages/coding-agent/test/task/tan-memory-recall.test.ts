@@ -1,8 +1,6 @@
 /**
- * `/tan` copies the parent's system prompt, which already carries the parent's
- * first-turn memory recall. The clone must send that prompt as-is: recalling
- * again would append the same memories as an extra block, duplicating them and
- * breaking the prompt-cache prefix the clone shares with its parent.
+ * `/tan` preserves the parent's recalled system prompt as a cache prefix; custom
+ * Mnemopi experience context may be appended after it for the clone.
  */
 import { afterEach, expect, it, vi } from "bun:test";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
@@ -30,7 +28,7 @@ afterEach(() => {
 	AgentRegistry.resetGlobalForTests();
 });
 
-it("sends the parent's recalled system prompt unchanged from a /tan clone", async () => {
+it("preserves the parent's recalled prompt prefix while adding custom experience to a /tan clone", async () => {
 	using dir = TempDir.createSync("@omp-tan-memory-recall-");
 	const auth = await AuthStorage.create(dir.join("auth.db"));
 	auth.keys.setRuntime("muse-code", "test-key");
@@ -134,7 +132,10 @@ it("sends the parent's recalled system prompt unchanged from a /tan clone", asyn
 		await runJob();
 
 		const clonePrompt = systemPrompts[requestsBeforeClone];
-		expect(clonePrompt).toEqual(parentPrompt);
+		// Custom Mnemopi experience context supplements, but does not change, the parent's recalled prefix.
+		expect(clonePrompt.slice(0, parentPrompt.length)).toEqual(parentPrompt);
+		expect(clonePrompt.slice(parentPrompt.length).join("\n")).toContain("Relevant verified experience");
+		expect(clonePrompt.slice(parentPrompt.length).join("\n")).toContain(MEMORY);
 	} finally {
 		await Promise.all(sessions.map(session => session.dispose()));
 		auth.close();

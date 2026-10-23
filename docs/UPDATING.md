@@ -43,8 +43,8 @@ The existing launcher is kept. The installer:
 
 - copies `scripts/custom/launcher/omp` into the launcher directory only when no launcher exists there;
 - backs up the launcher config once to `state/launcher-config.pre-custom`;
-- rewrites `OMP_REAL_BIN` to `current/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js` (stable across upgrades), `OMP_REAL_RUNNER` to the bun path, and `OMP_REAL_VERSION`;
-- sets `OMP_LAUNCHER_PFB_ENSURE=` to disable the legacy preset-fallback guard, which patches `~/node_modules` and is not used by the custom channel.
+- rewrites `OMP_REAL_BIN` to `current/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js` (stable across upgrades) and `OMP_REAL_RUNNER` to the bun path;
+- sets `OMP_PFB_GUARD_SKIP=1` to disable the legacy preset-fallback guard, which patches `~/node_modules` and is not used by the custom channel.
 
 `~/.local/bin/omp` and `~/.bun/bin/omp` are repointed at the launcher. Original entrypoint links are recorded in `state/entrypoints.tsv`. The installer refuses to replace an entrypoint that is a regular file.
 
@@ -53,8 +53,8 @@ Sessions already running keep the binary they started with until they exit. New 
 ## Rollback
 
 - `scripts/custom/rollback.sh` swaps `current` and `previous`.
-- `scripts/custom/rollback.sh --restore-entrypoints` also restores the links from `state/entrypoints.tsv`. Entries recorded as absent are removed.
-- Rollback does not restore the launcher config. To undo the config rewrite, copy `state/launcher-config.pre-custom` back over the launcher config by hand.
+- `scripts/custom/rollback.sh --restore-entrypoints` also copies `state/launcher-config.pre-custom` back over the launcher config and restores the links from `state/entrypoints.tsv`. Entries recorded as absent are removed.
+- A plain `rollback.sh` leaves the launcher config and entrypoints alone; `OMP_REAL_BIN` follows `current`, so the swap is enough.
 
 ## Notes
 

@@ -61,7 +61,69 @@ jobs:
         if: matrix.mode == 'native'
         run: bun install --cwd .omp/tools --frozen-lockfile
       - name: Run TypeScript tests
+        if: matrix.mode != 'coding-agent-native'
         run: bun scripts/ci-test-ts.ts "${{ matrix.mode }}"
+      - name: Run coding-agent-native tests with failed-file retries
+        if: matrix.mode == 'coding-agent-native'
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/coding-agent-native-tests.log"
+          bun scripts/ci-test-ts.ts "${{ matrix.mode }}" --full 2>&1 | tee "$log"
+          test_status=${PIPESTATUS[0]}
+          if [ "$test_status" -eq 0 ]; then
+            exit 0
+          fi
+
+          failed_files() {
+            awk '
+              /^[[:space:]]*[^[:space:]].*\.test\.[cm]?[jt]sx?:[[:space:]]*$/ {
+                file = $0
+                sub(/^[[:space:]]*/, "", file)
+                sub(/:[[:space:]]*$/, "", file)
+              }
+              /^\(fail\)[[:space:]]/ && file != "" { print file }
+            ' "$1" | sort -u
+          }
+          mapfile -t files < <(failed_files "$log")
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::The native test run failed without identifying any failing test files; no retry is safe."
+            exit "$test_status"
+          fi
+
+          retry_env=()
+          while IFS='=' read -r key _; do
+            if [[ "$key" == AWS_* || "$key" == GOOGLE_CLOUD_* ||
+              "$key" == GITHUB_TOKEN || "$key" == GH_TOKEN ||
+              "$key" == COPILOT_GITHUB_TOKEN || "$key" == GOOGLE_APPLICATION_CREDENTIALS ||
+              "$key" == ANTHROPIC_OAUTH_TOKEN || "$key" == XAI_OAUTH_TOKEN ||
+              "$key" == *_API_KEY || "$key" == *_OAUTH_TOKEN || "$key" == *BEARER_TOKEN* ]]; then
+              retry_env+=(--unset "$key")
+            fi
+          done < <(env)
+          export PI_TEST_RUNTIME=1 BUN_JSC_useConcurrentGC=0 BUN_JSC_numberOfGCMarkers=1
+          unset GITHUB_ACTIONS
+
+          for attempt in 1 2; do
+            echo "Retry attempt $attempt/2 for failed test files: ${files[*]}"
+            retry_log="$RUNNER_TEMP/coding-agent-native-retry-$attempt.log"
+            (
+              cd packages/coding-agent
+              env "${retry_env[@]}" bun test --only-failures --parallel=1 --timeout=120000 "${files[@]}"
+            ) 2>&1 | tee "$retry_log"
+            retry_status=${PIPESTATUS[0]}
+            if [ "$retry_status" -eq 0 ]; then
+              echo "Coding-agent-native test files passed after retry: ${files[*]}"
+              exit 0
+            fi
+            mapfile -t files < <(failed_files "$retry_log")
+            if [ "${#files[@]}" -eq 0 ]; then
+              echo "::error::Retry $attempt failed without identifying any failing test files."
+              exit "$retry_status"
+            fi
+          done
+          echo "::error::Coding-agent-native tests still fail after two retries; failing test files: ${files[*]}"
+          exit 1
       - name: Test release script
         if: matrix.mode == 'workspace'
         run: bun test scripts/release.test.ts

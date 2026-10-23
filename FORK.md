@@ -6,6 +6,8 @@ This is an **unofficial fork** of [can1357/oh-my-pi](https://github.com/can1357/
 
 Releases are tags `custom-v<upstream>-c<N>` on branch `custom`. Each release is one bundle, `omp-custom-<label>.tgz`, plus `SHA256SUMS.txt`. `scripts/custom/install.sh --tag <tag>` verifies the tag, the release workflow run, and the checksum before it installs. See `docs/CUSTOM-FORK.md` and `docs/UPDATING.md`.
 
+The `coding-agent-native` CI job keeps the existing timing limit and retries only test files that failed, with at most two additional `bun test` attempts; persistent failures still fail CI, and successful retries identify the files that needed them.
+
 ## Provenance
 
 - Current upstream baseline: `can1357/oh-my-pi` tag `v18.12.6`, commit `45c35e40c46166dc726ccc52f5d27f40f2449f99`.

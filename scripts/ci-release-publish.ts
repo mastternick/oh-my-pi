@@ -35,6 +35,9 @@
  * publish. Output is printed per package and the process exits non-zero
  * listing the packages that failed or were blocked.
  *
+ * `--pack-only <dir>` prepares and packs every public TypeScript package into `<dir>` without publishing,
+ * then restores each manifest and legal payload it touched.
+ *
  * Intended for CI. Mutates `package.json` in place — if you run this
  * locally, expect a dirty working tree and `git restore` after.
  */
@@ -136,6 +139,20 @@ function nativeLeafTagFromArgs(argv: readonly string[]): string | null {
 			return tag;
 		}
 		if (arg.startsWith("--native-leaf=")) return arg.slice("--native-leaf=".length);
+	}
+	return null;
+}
+
+/** Output directory for `--pack-only <dir>` (or `--pack-only=<dir>`): pack without publishing. */
+export function packOnlyDirFromArgs(argv: readonly string[]): string | null {
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		if (arg === "--pack-only") {
+			const dir = argv[i + 1];
+			if (!dir) throw new Error("--pack-only requires an output directory");
+			return dir;
+		}
+		if (arg.startsWith("--pack-only=")) return arg.slice("--pack-only=".length);
 	}
 	return null;
 }
@@ -682,10 +699,59 @@ async function publishWorkspacePackages(): Promise<string[]> {
 	);
 }
 
+/**
+ * Prepare and pack every public TypeScript package into `outDir` without publishing, for building the
+ * fork's release bundle. Manifests and legal payloads are restored after every package is packed, so the
+ * working tree is left as it was found.
+ */
+export async function packWorkspacePackages(outDir: string): Promise<PackedTarball[]> {
+	await fs.mkdir(outDir, { recursive: true });
+	const restores: Array<() => Promise<void>> = [];
+	const packed: PackedTarball[] = [];
+	try {
+		for (const pkg of packages) {
+			if (pkg.kind !== "typescript") continue;
+			const pkgDir = path.join(repoRoot, pkg.dir);
+			const manifestPath = path.join(pkgDir, "package.json");
+			const original = await Bun.file(manifestPath).text();
+			const source = JSON.parse(original) as PackageManifest;
+			if (source.private) continue;
+			const created: string[] = [];
+			for (const file of legalPayloadFiles(source.license)) {
+				const destination = path.join(pkgDir, file);
+				if (!(await Bun.file(destination).exists())) created.push(destination);
+			}
+			restores.push(async () => {
+				await Bun.write(manifestPath, original);
+				await Promise.all(created.map(file => fs.rm(file, { force: true })));
+			});
+			await preparePackage(pkg);
+			const before = new Set(await fs.readdir(outDir));
+			const result = await $`bun pm pack --quiet --destination ${outDir}`.cwd(pkgDir).quiet().nothrow();
+			if (result.exitCode !== 0) {
+				throw new Error(`bun pm pack exited with ${result.exitCode} for ${pkg.dir}: ${result.stderr.toString().trim()}`);
+			}
+			const tarball = (await fs.readdir(outDir)).find(entry => entry.endsWith(".tgz") && !before.has(entry));
+			if (!tarball) throw new Error(`bun pm pack produced no tarball for ${pkg.dir}`);
+			packed.push(await inspectPackedTarball(path.join(outDir, tarball)));
+		}
+	} finally {
+		for (const restore of restores.reverse()) await restore();
+	}
+	return packed;
+}
+
 if (import.meta.main) {
-	const failed = nativeLeafTag ? await publishNativeLeafPackage(nativeLeafTag) : await publishWorkspacePackages();
-	if (failed.length > 0) {
-		console.error(`Failed to publish ${failed.length} package(s): ${failed.join(", ")}`);
-		process.exit(1);
+	const packDir = packOnlyDirFromArgs(process.argv.slice(2));
+	if (packDir) {
+		for (const tarball of await packWorkspacePackages(path.resolve(packDir))) {
+			console.log(`packed ${tarball.name}@${tarball.version} -> ${tarball.path}`);
+		}
+	} else {
+		const failed = nativeLeafTag ? await publishNativeLeafPackage(nativeLeafTag) : await publishWorkspacePackages();
+		if (failed.length > 0) {
+			console.error(`Failed to publish ${failed.length} package(s): ${failed.join(", ")}`);
+			process.exit(1);
+		}
 	}
 }

@@ -1853,7 +1853,15 @@ export class SessionManager {
 			}
 			return;
 		}
-		this.#appendToCurrentSessionFile(entry);
+		try {
+			this.#appendToCurrentSessionFile(entry);
+		} catch (err) {
+			// Cold-file rewrites and atomic replacement paths can fail before the hot append's
+			// catch. Keep append callers non-throwing and report through the latched error surface.
+			this.#fileIsCurrent = false;
+			this.#rewriteRequired = true;
+			this.#noteDiskFailure(err);
+		}
 	}
 
 	#appendToCurrentSessionFile(entry: SessionEntry): void {

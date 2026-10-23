@@ -406,7 +406,17 @@ const SESSION_PRESET_ENTRY = "model-preset-session";
 
 /** Log `pin` on the session branch, where `attachSessionPreset` finds it again on reopen. */
 export function recordSessionPreset(manager: SessionManager, pin: SessionPresetPin): void {
-	manager.appendCustomEntry(SESSION_PRESET_ENTRY, pin, { persist: true });
+	try {
+		manager.appendCustomEntry(SESSION_PRESET_ENTRY, pin, { persist: true });
+	} catch (error) {
+		// RPC subscribes after session startup; the manager replays its latched write failure then.
+		let latched: Error | undefined;
+		const unsubscribe = manager.onPersistenceError(failure => {
+			latched = failure;
+		});
+		unsubscribe();
+		if (latched !== error) throw error;
+	}
 }
 
 /**

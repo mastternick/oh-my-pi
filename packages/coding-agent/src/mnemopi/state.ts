@@ -496,7 +496,7 @@ export class MnemopiSessionState {
 					try {
 						results = await target.memory.recallEnhanced(recallQuery, this.config.recallLimit, recallOptions);
 					} catch (error) {
-						if (this.config.noEmbeddings) throw error;
+						if (this.config.providerOptions.noEmbeddings) throw error;
 						logger.warn("Mnemopi: scoped recall enhanced search failed; retrying lexically", {
 							bank: target.bank,
 							error: toError(error).message,

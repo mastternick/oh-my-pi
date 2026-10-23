@@ -308,13 +308,14 @@ describe("queued user delivery policy", () => {
 			});
 			await session.prompt("lookup unavailable");
 			if (backendId === "mnemopi") {
-				// Custom background agent_start recall can recover before the first request is sent.
-				expect(requests[0].systemPrompt?.join("\n")).toContain("recovered recall");
+				// Custom background agent_start recall may win the race to the first request, but never duplicate it.
+				expect(requests[0].systemPrompt?.join("\n").match(/recovered recall/g)?.length ?? 0).toBeLessThanOrEqual(1);
 			} else {
 				expect(requests[0].systemPrompt?.join("\n")).not.toContain("recovered recall");
 			}
 			await session.prompt("lookup recovered");
 			expect(requests[1].systemPrompt?.join("\n")).toContain("recovered recall");
+			expect(requests[1].systemPrompt?.join("\n").match(/recovered recall/g)).toHaveLength(1);
 			await session.prompt("already recalled");
 			expect(recalls).toBe(2);
 		},

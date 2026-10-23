@@ -29,6 +29,7 @@ for tgz in "$work"/tarballs/*.tgz; do omp_custom_check_deps "$tgz"; done
 
 # Root dependency is the coding agent; every other workspace tarball overrides its @oh-my-pi/* dependency,
 # so the install runs exactly the packed sources.
+# shellcheck disable=SC2016 # the node program is single-quoted on purpose
 OMP_CUSTOM_TARBALLS="$work/tarballs" OMP_CUSTOM_BUNDLE="$work/bundle" OMP_CUSTOM_PKG="$OMP_CUSTOM_PKG" bun -e '
 const fs = require("node:fs");
 const path = require("node:path");

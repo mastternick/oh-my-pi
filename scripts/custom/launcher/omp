@@ -42,6 +42,7 @@ warn() { printf '%s\n' "${c_yellow}⚠ $*${c_reset}" >&2; }
 
 # ---------- real OMP resolution (anti-recursion) ----------
 OMP_REAL_BIN=""; OMP_REAL_RUNNER=""
+# shellcheck source=/dev/null # CONFIG_FILE is a runtime path, validated by the -f test
 [[ -f "$CONFIG_FILE" ]] && . "$CONFIG_FILE"
 # Test/override hooks (also documented escape hatches).
 if [[ -n "${OMP_LAUNCHER_REAL_BIN:-}" ]]; then
@@ -323,9 +324,10 @@ proc_starttime() { # pid -> kernel starttime (identity token)
   local pid="$1" rest
   [[ -r "/proc/$pid/stat" ]] || return 1
   read -r rest < "/proc/$pid/stat" || return 1
-  rest="${rest#*) }"; set -- $rest              # from the state field on: starttime is field 22 = ${20}
-  [[ -n "${20:-}" ]] || return 1
-  printf '%s' "${20}"
+  local -a f
+  rest="${rest#*) }"; read -r -a f <<< "$rest"   # from the state field on: starttime is field 22 = f[19]
+  [[ -n "${f[19]:-}" ]] || return 1
+  printf '%s' "${f[19]}"
 }
 
 proc_tree_ident() { # pid -> "pid starttime" lines for pid + all descendants
@@ -338,6 +340,7 @@ proc_tree_ident() { # pid -> "pid starttime" lines for pid + all descendants
     seen[$p]=1
     st="$(proc_starttime "$p")" || continue
     printf '%s %s\n' "$p" "$st"
+    # shellcheck disable=SC2013 # kernel lists child pids space-separated on one line
     for c in $(cat /proc/"$p"/task/*/children 2>/dev/null); do q+=("$c"); done
   done
 }
@@ -388,14 +391,6 @@ stop_tree_gracefully() { # reads "pid starttime" lines; TERM, wait for a clean e
   printf '%s\n' "$tree" | kill_tree_ident KILL
   sleep 0.5
   printf '%s\n' "$tree" | kill_tree_ident KILL
-}
-
-stop_orphan() { # file — kill a surviving OMP process whose session is gone
-  local op st
-  op="$(orphan_pid "$1" 2>/dev/null || true)"
-  [[ -n "$op" ]] || return 0
-  st="$(jq -r '.pane_starttime // ""' "$1" 2>/dev/null)"
-  printf '%s %s\n' "$op" "$st" | stop_tree_gracefully
 }
 
 orphan_pid() { # file -> pid of a still-running OMP process of a dead session
@@ -1067,6 +1062,7 @@ other_project() { # Other project: asks for a path -> open_project's code; 1 = b
     p="$raw"
     case "$p" in
       "~") p="$HOME" ;;
+      # shellcheck disable=SC2088 # literal "~/" prefix match on purpose
       "~/"*) p="$HOME/${p#"~/"}" ;;
     esac
     p="$(readlink -f -- "$p" 2>/dev/null)"
@@ -1273,7 +1269,7 @@ cmd_rename() {
 }
 
 cmd_desc() {
-  local pp txt="" idx="" first="${1:-}" idn hit=0
+  local pp txt="" first="${1:-}" idn hit=0
   pp="$(proj_path)"
   refresh_auto_titles
   if [[ -n "$first" ]]; then

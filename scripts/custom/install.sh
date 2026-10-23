@@ -92,7 +92,6 @@ if [[ -L "$ROOT/current" ]]; then
 fi
 omp_custom_atomic_link "versions/$label" "$ROOT/current"
 
-cli="$ROOT/current/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js"
 runner="$(command -v bun)"
 
 # Launcher: install the repo copy only on a fresh machine. An existing launcher is left in place.

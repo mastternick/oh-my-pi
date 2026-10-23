@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared helpers for scripts/custom/*. Sourced, never executed.
 
 OMP_CUSTOM_PKG="@oh-my-pi/pi-coding-agent"
@@ -8,6 +9,7 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 # @oh-my-pi/pi-natives pin is not exact. Every dependency must resolve from a bundled tarball or npm.
 # usage: omp_custom_check_deps <tarball>
 omp_custom_check_deps() {
+  # shellcheck disable=SC2016 # the node program is single-quoted on purpose
   tar -xzOf "$1" package/package.json | bun -e '
 let text = "";
 process.stdin.on("data", chunk => (text += chunk)).on("end", () => {

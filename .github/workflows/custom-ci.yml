@@ -1,0 +1,50 @@
+name: custom-ci
+
+on:
+  push:
+    branches: [custom]
+  pull_request:
+    branches: [custom]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: bun install --frozen-lockfile
+      - name: Privacy gate
+        run: scripts/custom/check-privacy.sh
+      - name: Shell syntax
+        run: |
+          bash -n scripts/custom/launcher/omp
+          for f in scripts/custom/*.sh; do bash -n "$f"; done
+      - name: Shellcheck
+        run: shellcheck scripts/custom/*.sh scripts/custom/launcher/omp
+      - name: Upstream full check
+        run: bun run ci:check:full
+
+  package:
+    needs: static
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Pack
+        run: |
+          label="$(node -p 'require("./packages/coding-agent/package.json").version')-c0"
+          scripts/custom/pack.sh "$RUNNER_TEMP/pack" "$label"
+          echo "LABEL=$label" >> "$GITHUB_ENV"
+      - name: Smoke
+        run: scripts/custom/smoke.sh "$RUNNER_TEMP/pack/omp-custom-$LABEL.tgz"

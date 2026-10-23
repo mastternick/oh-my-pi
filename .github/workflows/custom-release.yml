@@ -1,0 +1,57 @@
+name: custom-release
+
+on:
+  push:
+    tags: ['custom-v*']
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/custom-ci.yml
+    permissions:
+      contents: read
+
+  release:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+      - name: Require tag on custom
+        run: |
+          git fetch --quiet origin '+refs/heads/custom:refs/remotes/origin/custom'
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/custom \
+            || { echo "tag commit is not on custom"; exit 1; }
+          echo "LABEL=${GITHUB_REF_NAME#custom-v}" >> "$GITHUB_ENV"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Pack
+        run: scripts/custom/pack.sh dist "$LABEL"
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum "omp-custom-$LABEL.tgz" > SHA256SUMS.txt
+      - name: Attest
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            dist/omp-custom-${{ env.LABEL }}.tgz
+            dist/SHA256SUMS.txt
+      - name: Publish release
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/omp-custom-$LABEL.tgz" \
+            dist/SHA256SUMS.txt \
+            --verify-tag \
+            --title "omp-custom $LABEL" \
+            --notes "Unofficial fork of can1357/oh-my-pi. See docs/CUSTOM-FORK.md."

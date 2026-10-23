@@ -2,6 +2,10 @@
 
 This is an **unofficial fork** of [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi). It is not affiliated with or endorsed by the upstream project.
 
+## Custom release channel
+
+Releases are tags `custom-v<upstream>-c<N>` on branch `custom`. Each release is one bundle, `omp-custom-<label>.tgz`, plus `SHA256SUMS.txt`. `scripts/custom/install.sh --tag <tag>` verifies the tag, the release workflow run, and the checksum before it installs. See `docs/CUSTOM-FORK.md` and `docs/UPDATING.md`.
+
 ## Provenance
 
 - Upstream baseline: `can1357/oh-my-pi` tag `v18.10.3`, commit `81e1d8927a3c16cfaff2e9456baa8c060e1e0e9b`.
@@ -76,7 +80,7 @@ Source-only divergence: `coding-agent/src/cli/update-cli.ts` (see above). `codin
 ## Tests included
 
 - `coding-agent/acceptance/` (11 files, including `support.ts`, `unresolved-tool-loop.test.ts`, and `embed-stub-child.ts`). These import package subpaths, not absolute paths. Gated by `XM_ACCEPTANCE_HARNESS` (not verified against the gate).
-- `coding-agent/test/session-presets/{unit,sdk-race}.test.ts`. Run with an absolute `SOURCE_ROOT`, for example `env SOURCE_ROOT=$(pwd)/src bun test ...` from `packages/coding-agent`. The earlier `SOURCE_ROOT=packages/coding-agent` is wrong. `sdk-race.test.ts` also reads `ANTHROPIC_API_KEY` and `TMPDIR`.
+- `coding-agent/test/session-presets/{unit,sdk-race}.test.ts`. Source under test defaults to this package's `src/`; `SOURCE_ROOT` overrides it. Run `bun test test/session-presets/` from `packages/coding-agent`, no env needed (16/0). `sdk-race.test.ts` sets its own fake `ANTHROPIC_API_KEY` in `beforeAll` and restores it after, so no real key is needed. It uses `TMPDIR` for scratch.
 - `ai/acceptance/provider-tool-name.test.ts`.
 
 ## Port to upstream v18.12.6
@@ -94,7 +98,7 @@ Source-only divergence: `coding-agent/src/cli/update-cli.ts` (see above). `codin
 - **Stall-guard tests**: the scout's source is `~/.omp/agent/backups/stall-guard-20261013/corrected/test/`. Not copied: backup tree, not verified against the manifest rows. The original `stall-guard.patch` is marked UNSAFE and is not a source of truth.
 - **Judge-view tests**: none found in any location searched. Report as a gap, not a completion signal.
 - **Typefix declaration-only workarounds** under `pi-tui/dist/types/` and `pi-catalog/dist/types/` are not carried (generated declarations).
-- **Portable runtime pieces** (launcher `bin/omp`, `enable.sh`, `rollback.sh`, `omp-launcher-gc.{service,timer}`, `custom-provider-login.ts`, and the JEV advisory extension in shadow mode): outside the source tree. Delivery scope, not carried here.
+- **Portable runtime pieces** (`enable.sh`, `omp-launcher-gc.{service,timer}`, `custom-provider-login.ts`, and the JEV advisory extension in shadow mode): outside the source tree. The launcher, install, and rollback are shipped under `scripts/custom/`.
 - **Manifest test locations**: `ai/acceptance/` and `coding-agent/src/mnemopi/project-identity.test.ts` are kept at their manifest paths. Moving them to `test/` would require a manifest update.
 
 ## Generated inputs required for a clean build

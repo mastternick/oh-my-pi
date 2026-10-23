@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the native Judge view to Agent Hub (`Alt+A`, then `3`), showing per-session and descendant-scope Judge activity, actual questions and typed answers (with confidence when returned), raw automatic choices versus applied levels, and measured paid calls, tokens, cost, and reused cached-question counts.
+
+### Fixed
+
+- `/memory enqueue` no longer captures a raw transcript when `mnemopi.autoRetain` is off. Manual consolidation now passes the configured auto-retention setting to `consolidate()`, matching disposal. Explicit `xd://retain` and `/memory` writes are unchanged, and `autoRetain: true` still retains the transcript on enqueue.
+- Mnemopi startup no longer promotes working memory into regex episodes unless `mnemopi.autoRetain` is on. Only auto-retained transcripts need that pass before their 24h trim, so with auto-retention off, session start no longer rewrites explicit memories.
+- Explicit memories saved through `xd://retain`, `learn`, and `/memory` writes are no longer tagged `IMPORTED` and are exempt from working-memory trimming by source. Rows with a NULL source are no longer dropped by the trim predicate. Imported rows keep their guard.
+
 ## [18.10.3] - 2026-10-12
 
 ### Added

@@ -5,6 +5,7 @@ set -euo pipefail
 
 [[ $# -eq 1 ]] || { echo "usage: smoke.sh <bundle.tgz>" >&2; exit 2; }
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=lib.sh
 . "$script_dir/lib.sh"
 

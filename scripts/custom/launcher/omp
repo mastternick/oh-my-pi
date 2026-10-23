@@ -1062,8 +1062,7 @@ other_project() { # Other project: asks for a path -> open_project's code; 1 = b
     p="$raw"
     case "$p" in
       "~") p="$HOME" ;;
-      # shellcheck disable=SC2088 # literal "~/" prefix match on purpose
-      "~/"*) p="$HOME/${p#"~/"}" ;;
+      \~/*) p="$HOME/${p#"~/"}" ;;
     esac
     p="$(readlink -f -- "$p" 2>/dev/null)"
     if [[ -n "$p" && -d "$p" ]]; then open_project "$p"; return $?; fi

@@ -1,4 +1,4 @@
-// Behavioral probes for scoped model-preset state. Source under test comes from SOURCE_ROOT (required).
+// Behavioral probes for scoped model-preset state. Source under test is SOURCE_ROOT, default this package's src/.
 // Each test gets a fresh scratch root via beforeEach; the real ~/.omp/agent/config.yml is never touched.
 import { afterAll, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
@@ -6,9 +6,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Model } from "@oh-my-pi/pi-ai";
 
-// Dynamic: SOURCE_ROOT selects which source snapshot is under test, so specifiers are runtime-chosen.
-const SRC = process.env.SOURCE_ROOT;
-if (!SRC) throw new Error("SOURCE_ROOT must point at a src/ snapshot");
+// Dynamic: SOURCE_ROOT overrides which source snapshot is under test; default is this package's src/.
+const SRC = process.env.SOURCE_ROOT ?? path.resolve(import.meta.dir, "../../src");
 const {
 	applyModelPreset,
 	applySessionPinDefault,

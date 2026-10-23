@@ -6,9 +6,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Model } from "@oh-my-pi/pi-ai";
 
-// Dynamic: SOURCE_ROOT selects the source snapshot under test, so specifiers are runtime-chosen.
-const SRC = process.env.SOURCE_ROOT;
-if (!SRC) throw new Error("SOURCE_ROOT must point at a src/ snapshot");
+// Dynamic: SOURCE_ROOT overrides the source snapshot under test; default is this package's src/.
+const SRC = process.env.SOURCE_ROOT ?? path.resolve(import.meta.dir, "../../src");
 const { createAgentSession, discoverAuthStorage } = await import(`${SRC}/sdk.ts`);
 const { ModelRegistry } = await import(`${SRC}/config/model-registry.ts`);
 const { Settings } = await import(`${SRC}/config/settings.ts`);

@@ -28,7 +28,7 @@ jobs:
           bash -n scripts/custom/launcher/omp
           for f in scripts/custom/*.sh; do bash -n "$f"; done
       - name: Shellcheck
-        run: shellcheck scripts/custom/*.sh scripts/custom/launcher/omp
+        run: shellcheck -x scripts/custom/*.sh scripts/custom/launcher/omp
       - name: Upstream full check
         run: bun run ci:check:full
 
@@ -41,6 +41,13 @@ jobs:
         with:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
+      - name: Fetch host native addon for pack-time loading
+        run: |
+          set -euo pipefail
+          version="$(node -p 'require("./packages/natives/package.json").version')"
+          tarball="$(npm view "@oh-my-pi/pi-natives-linux-x64@$version" dist.tarball)"
+          curl -fsSL --retry 3 "$tarball" | tar -xz -C "$RUNNER_TEMP"
+          cp "$RUNNER_TEMP/package/pi_natives.linux-x64-baseline.node" "$RUNNER_TEMP/package/pi_natives.linux-x64-modern.node" packages/natives/native/
       - name: Pack
         run: |
           label="$(node -p 'require("./packages/coding-agent/package.json").version')-c0"

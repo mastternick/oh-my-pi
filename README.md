@@ -1,3 +1,14 @@
+> [!NOTE]
+> This is an unofficial fork of [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi), maintained by [mastternick](https://github.com/mastternick). It tracks official releases (current base: **v18.12.6**) plus custom improvements:
+> - Preset fallback-chain isolation.
+> - Mnemopi memory, experience, and project identity.
+> - Session preset isolation.
+> - Judgment and Judge view.
+> - Task isolation and stall guard.
+> - Tool-call loop guard.
+>
+> Not affiliated with or endorsed by the upstream project. MIT licensed; upstream copyright is retained. See [Custom fork](docs/CUSTOM-FORK.md), [updating](docs/UPDATING.md), and [FORK.md](FORK.md).
+
 <p align="center">
   <img src="https://github.com/can1357/oh-my-pi/blob/main/assets/hero.png?raw=true" alt="omp">
 </p>

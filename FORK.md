@@ -8,9 +8,9 @@ Releases are tags `custom-v<upstream>-c<N>` on branch `custom`. Each release is 
 
 ## Provenance
 
-- Upstream baseline: `can1357/oh-my-pi` tag `v18.10.3`, commit `81e1d8927a3c16cfaff2e9456baa8c060e1e0e9b`.
-- Snapshot: local customizations of the installed `@oh-my-pi/*` 18.10.3 packages, applied onto the upstream tag. Upstream `package.json` files are kept as-is. Publish-only rewrites from the installed packages are not carried.
-- Port target `v18.12.6`, commit `45c35e40c46166dc726ccc52f5d27f40f2449f99`. Ported in this snapshot; see "Port to upstream v18.12.6" and "Verification status".
+- Current upstream baseline: `can1357/oh-my-pi` tag `v18.12.6`, commit `45c35e40c46166dc726ccc52f5d27f40f2449f99`.
+- Snapshot history: the initial customization audit was against installed `@oh-my-pi/*` 18.10.3 packages, applied onto upstream `v18.10.3` commit `81e1d8927a3c16cfaff2e9456baa8c060e1e0e9b`. That historical snapshot is not the current baseline.
+- The `v18.12.6` port keeps upstream `package.json` files as-is; publish-only rewrites from installed packages are not carried. See "Port to upstream v18.12.6" and "Verification status".
 - License: MIT. `LICENSE` and `THIRD-PARTY-NOTICES.txt` are retained unchanged from upstream.
 
 ## Scope of this snapshot

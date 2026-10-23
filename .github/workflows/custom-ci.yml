@@ -31,6 +31,31 @@ jobs:
         run: shellcheck -x scripts/custom/*.sh scripts/custom/launcher/omp
       - name: Upstream full check
         run: bun run ci:check:full
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OMP_TEST_CONCURRENCY: "4"
+      OMP_TEST_TIMEOUT: "120"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Fetch Linux x64 native addons
+        run: |
+          set -euo pipefail
+          version="$(node -p 'require("./packages/natives/package.json").version')"
+          tarball="$(npm view "@oh-my-pi/pi-natives-linux-x64@$version" dist.tarball)"
+          curl -fsSL --retry 3 "$tarball" | tar -xz -C "$RUNNER_TEMP"
+          mkdir -p packages/natives/native
+          cp "$RUNNER_TEMP/package/pi_natives.linux-x64-baseline.node" packages/natives/native/
+          cp "$RUNNER_TEMP/package/pi_natives.linux-x64-modern.node" packages/natives/native/
+      - name: Test TypeScript suite
+        run: bun scripts/ci-test-ts.ts all
+      - name: Test release script
+        run: bun test scripts/release.test.ts
 
   package:
     needs: static

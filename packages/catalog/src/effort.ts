@@ -1,5 +1,5 @@
 /** User-facing thinking levels, ordered least to most intensive. */
-export const enum Effort {
+export enum Effort {
 	Minimal = "minimal",
 	Low = "low",
 	Medium = "medium",

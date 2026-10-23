@@ -100,6 +100,8 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 					subagentEventBus: options.subagentEventBus,
 					artifactsDir: path.dirname(sessionFileOfRef),
 					maxRuntimeMs: cfgTaskMaxRuntimeMs.get(session.settings),
+					settings: session.settings,
+					modelRegistry: session.modelRegistry,
 				});
 				const text = formatTaskResultSummary(result, { totalDurationMs: result.durationMs });
 				const structuredOutput = result.structuredOutput;

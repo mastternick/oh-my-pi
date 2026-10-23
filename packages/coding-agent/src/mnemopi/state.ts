@@ -1,5 +1,6 @@
 import { dirname } from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import type * as MnemopiNs from "@oh-my-pi/pi-mnemopi";
 import type { Mnemopi, RecallResult } from "@oh-my-pi/pi-mnemopi";
 import type * as MnemopiCoreNs from "@oh-my-pi/pi-mnemopi/core";
@@ -18,8 +19,8 @@ import {
 	findPersistedRecall,
 	type MemoryRecallChangesDetails,
 	type PersistedRecall,
-	persistRecall,
 	type RecalledMemory,
+	persistRecall,
 } from "../memory-backend/recall-entry";
 import { memoryToolRefs } from "../memory-backend/tool-names";
 import type { MemoryPromptPreparation } from "../memory-backend/types";
@@ -27,11 +28,25 @@ import { redactMemorySecrets, redactRememberWrite } from "../memory-backend/reda
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import memoryRecallChangesPrompt from "../prompts/system/memory-recall-changes.md" with { type: "text" };
 import mnemopiInstructions from "../prompts/system/mnemopi-instructions.md" with { type: "text" };
-import { type MnemopiBackendConfig, type MnemopiScoping, truncateApproxTokens } from "./config";
+import {
+	type MnemopiBackendConfig,
+	type MnemopiScoping,
+	type ProjectBankScopeOptions,
+	truncateApproxTokens,
+} from "./config";
+import {
+	captureExperience,
+	collectExperienceEvidence,
+	contentText,
+	recallExperience,
+	revalidateExperienceContext,
+	type ExperienceCompleter,
+	type ExperienceMemoryRef,
+	type ExperienceProjectContext,
+} from "./experience";
 import { mnemopiEmbedClient } from "./embed-client";
 import { cfgMnemopiInjectionTokenLimit } from "./settings";
 
-/** A rendered recall block and where each tracked memory's text starts in it. */
 interface RecallBlock {
 	text: string;
 	memories: Array<{ id: string; text: string; offset: number }>;
@@ -249,6 +264,12 @@ export interface MnemopiSessionStateOptions {
 	aliasOf?: MnemopiSessionState;
 	lastRetainedTurn?: number;
 	hasRecalledForFirstTurn?: boolean;
+	/**
+	 * One-shot completion on the configured `memory` role (chain unchanged); the backend
+	 * builds it from settings + model registry. Undefined => experience capture performs
+	 * no extraction and writes nothing. Child aliases inherit the parent's completer.
+	 */
+	completeLlm?: ExperienceCompleter;
 }
 
 export class MnemopiSessionState {
@@ -265,17 +286,37 @@ export class MnemopiSessionState {
 	unsubscribe?: () => void;
 	#retentionCursorLoaded = false;
 	#recallGeneration = 0;
+	/** Resolver for the configured memory role; inherited from the parent state by aliases. */
+	readonly completeLlm?: ExperienceCompleter;
+	#experienceGeneration = 0;
+	/** Task-context key the cached experience block was recalled for; reuse avoids repeat recalls. */
+	#experienceTaskKey?: string;
+	/** Memories the current session's experience block carries (exclusion chaining + persistence). */
+	#experienceRefs: ExperienceMemoryRef[] = [];
+	/** Whether the persisted experience recall was already restored into this session state. */
+	#experienceRestored = false;
+	/** In-flight settled-checkpoint capture; `dispose` awaits it before closing bank handles. */
+	#pendingExperienceCapture?: Promise<void>;
+	/** Index of the first agent message not yet captured as experience (MAIN and worker checkpoints). */
+	#experienceBoundary = 0;
+	/** Transcript replaced (fork, switch, /new); the next run start re-seeds the boundary. */
+	#experienceSeedPending = false;
+	/** Assignment/task text the last experience recall resolved; capture fallback when absent. */
+	#experienceTaskText?: string;
 
 	constructor(options: MnemopiSessionStateOptions) {
 		this.sessionId = options.sessionId;
 		this.config = options.config;
 		this.session = options.session;
+		// A transcript already present at attach counts as captured, except a run in flight (its messages are new).
+		this.#experienceBoundary = this.session.isStreaming ? 0 : this.session.messages.length;
 		this.aliasOf = options.aliasOf;
 		this.lastRetainedTurn = options.lastRetainedTurn ?? 0;
 		this.hasRecalledForFirstTurn = options.hasRecalledForFirstTurn ?? false;
 		this.scoped = options.aliasOf?.scoped ?? createScopedResources(options.config);
 		this.memory = this.scoped.retain.memory;
 		this.globalMemory = this.scoped.global?.memory;
+		this.completeLlm = options.completeLlm ?? options.aliasOf?.completeLlm;
 	}
 
 	setSessionId(sessionId: string): void {
@@ -288,10 +329,16 @@ export class MnemopiSessionState {
 
 	resetConversationTracking(): void {
 		this.#recallGeneration++;
+		this.#experienceGeneration++;
 		this.lastRetainedTurn = 0;
 		this.#retentionCursorLoaded = false;
 		this.hasRecalledForFirstTurn = false;
 		this.lastRecallSnippet = undefined;
+		this.#experienceTaskKey = undefined;
+		this.#experienceTaskText = undefined;
+		this.#experienceRefs = [];
+		this.#experienceRestored = false;
+		this.#experienceSeedPending = true;
 	}
 
 	getScopedRecallTargets(): readonly MnemopiScopedMemory[] {
@@ -447,12 +494,22 @@ export class MnemopiSessionState {
 			const queries =
 				target.bank === this.scoped.global?.bank && sharedFallbackQuery ? [query, sharedFallbackQuery] : [query];
 			let targetSucceeded = false;
+			const recallOptions = { includeFacts: true, channelId: target.bank };
 			try {
 				for (const recallQuery of queries) {
-					const results = await target.memory.recallEnhanced(recallQuery, this.config.recallLimit, {
-						includeFacts: true,
-						channelId: target.bank,
-					});
+					let results: RecallResult[];
+					try {
+						results = await target.memory.recallEnhanced(recallQuery, this.config.recallLimit, recallOptions);
+					} catch (error) {
+						logger.warn("Mnemopi: scoped recall enhanced search failed; retrying lexically", {
+							bank: target.bank,
+							error: toError(error).message,
+						});
+						results = await target.memory.recallEnhanced(recallQuery, this.config.recallLimit, {
+							...recallOptions,
+							queryEmbedding: null,
+						});
+					}
 					targetSucceeded = true;
 					withLoopPhase("mnemopi.recall", () => {
 						for (const result of results) {
@@ -616,11 +673,27 @@ export class MnemopiSessionState {
 	}
 
 	/**
+	 * Memory context for the winning turn: the legacy first-turn recall when
+	 * `mnemopi.autoRecall` is on and unconsumed, otherwise the experience recall
+	 * at task boundaries / worker assignments (gated by `mnemopi.experienceEnabled`,
+	 * independent of the legacy flags).
+	 */
+	async beforeAgentStartPrompt(
+		promptText: string,
+		signal?: AbortSignal,
+		budget: (block: string) => string = block => this.budgetRecallBlock(block),
+	): Promise<MemoryPromptPreparation | undefined> {
+		const legacy = await this.#firstTurnRecallPreparation(promptText, signal, budget);
+		if (legacy) return legacy;
+		return await this.#experienceRecallPreparation(promptText, signal);
+	}
+
+	/**
 	 * A fresh recall is cut by `budget` to the prefix the prompt carries next to the memory
 	 * instructions; a reused one is resent exactly as delivered. Memories the delivered block
 	 * shows, even in part, are tracked for change reports.
 	 */
-	async beforeAgentStartPrompt(
+	async #firstTurnRecallPreparation(
 		promptText: string,
 		signal?: AbortSignal,
 		budget: (block: string) => string = block => this.budgetRecallBlock(block),
@@ -672,6 +745,231 @@ export class MnemopiSessionState {
 		if (text) this.lastRecallSnippet = text;
 		if (record) persistRecall(this.session.sessionManager, getMnemopiRecallScope(this.config), record);
 		return true;
+	}
+
+	/**
+	 * Assignment-scoped contextual recall at meaningful task boundaries.
+	 *
+	 * - MAIN: the resolved actual task text (continuation prompts resolve the ongoing
+	 *   task instead of searching for "continue"). Unchanged task context reuses the
+	 *   cached block with NO repeated native recall; the cache is revalidated id-based
+	 *   (invalidation + fingerprint drift) and a corrected block is re-delivered only
+	 *   when something changed.
+	 * - Worker alias: the child's first prompt IS its assignment, so the same path
+	 *   performs an assignment-specific recall, excluding memories already injected
+	 *   into the parent context (no parent-context duplicates).
+	 */
+	async #experienceRecallPreparation(
+		promptText: string,
+		signal?: AbortSignal,
+	): Promise<MemoryPromptPreparation | undefined> {
+		if (this.config.experienceEnabled !== true) return undefined;
+		const latestPrompt = promptText.trim();
+		if (!latestPrompt) return undefined;
+		this.#restorePersistedExperienceRecall();
+		const history = withLoopPhase("mnemopi.recall", () => extractMessages(this.session.sessionManager));
+		const taskText = resolveExperienceTaskText(history, latestPrompt);
+		const key = experienceTaskKey(taskText);
+		const generation = ++this.#experienceGeneration;
+		// Unchanged task context: no repeated native recall. Revalidate the cached
+		// block id-based (cheap row lookups, no embeddings) and re-deliver only when
+		// a memory was invalidated, edited, or went stale on fingerprint drift.
+		if (key === this.#experienceTaskKey && this.#experienceRefs.length > 0) {
+			const revalidated = revalidateExperienceContext({
+				state: this,
+				memories: this.#experienceRefs,
+				project: this.experienceProject(),
+				signal,
+			});
+			if (signal?.aborted || !revalidated.changed) return undefined;
+			return {
+				context: revalidated.context || undefined,
+				commit: () => this.#commitExperienceRecall(generation, key, taskText, revalidated.memories, revalidated.context),
+			};
+		}
+		if (key === this.#experienceTaskKey) return undefined;
+		const exclude = this.#experienceExclusions();
+		const result = await recallExperience({
+			state: this,
+			assignment: taskText,
+			project: this.experienceProject(),
+			exclude,
+			signal,
+		});
+		if (signal?.aborted) return undefined;
+		return {
+			context: result.context,
+			commit: () => this.#commitExperienceRecall(generation, key, taskText, result.memories, result.context),
+		};
+	}
+
+	/**
+	 * Adopts an experience recall for the winning turn unless a newer turn or reset
+	 * superseded it. Marks the task key consumed even when nothing was injected, so
+	 * unchanged continuations neither re-search nor re-render every turn.
+	 */
+	#commitExperienceRecall(
+		generation: number,
+		key: string,
+		taskText: string,
+		memories: readonly ExperienceMemoryRef[],
+		context: string | undefined,
+	): boolean {
+		if (this.#experienceGeneration !== generation) return false;
+		this.#experienceTaskKey = key;
+		this.#experienceTaskText = taskText;
+		if (memories.length > 0) {
+			this.#experienceRefs = mergeExperienceRefs(this.#experienceRefs, memories);
+			persistRecall(this.session.sessionManager, getExperienceRecallScope(this.config), {
+				text: context ?? "",
+				memories: memories.map(memory => ({ id: memory.id, text: memory.content })),
+			});
+		} else {
+			this.#experienceRefs = [];
+		}
+		return true;
+	}
+
+	/**
+	 * Restores a persisted experience recall once per session state, so a resumed
+	 * session reuses prior context (exclusion chaining) without a fresh search.
+	 */
+	#restorePersistedExperienceRecall(): void {
+		if (this.#experienceRestored) return;
+		this.#experienceRestored = true;
+		const persisted = findPersistedRecall(this.session.sessionManager, getExperienceRecallScope(this.config));
+		if (!persisted) return;
+		const bank = this.scoped.retain.bank;
+		this.#experienceRefs = persisted.memories.map(memory => ({
+			id: memory.id,
+			bank,
+			content: memory.text,
+		}));
+	}
+
+	/** Memories a worker must not re-inject: its own plus the parent primary's. */
+	#experienceExclusions(): readonly ExperienceMemoryRef[] {
+		const parent = this.aliasOf;
+		if (!parent) return this.#experienceRefs;
+		return mergeExperienceRefs(this.#experienceRefs, parent.injectedExperienceRefs());
+	}
+
+	/** Memories this session's experience recall injected; workers exclude these. */
+	injectedExperienceRefs(): readonly ExperienceMemoryRef[] {
+		return this.#experienceRefs;
+	}
+
+	/** Logical project context for recall and capture; the identity is stable across clones and worktrees. */
+	experienceProject(): ExperienceProjectContext {
+		const identity = this.config.projectIdentity;
+		return {
+			projectKey: identity.key,
+			repoRoot: this.config.repoRoot,
+			...(identity.kind === "git-remote" ? { origin: identity.key.slice("git-remote:".length) } : {}),
+		};
+	}
+
+	/**
+	 * Captures experience from `messages`, starting at the last checkpoint. Captures chain in call
+	 * order, so windows never overlap. Never rejects.
+	 */
+	captureExperienceCheckpoint(
+		messages: readonly AgentMessage[],
+		agentKind: string,
+		assignment: string,
+	): Promise<void> {
+		const snapshot = messages.slice();
+		const run = (this.#pendingExperienceCapture ?? Promise.resolve()).then(() =>
+			this.#captureExperienceWindow(snapshot, agentKind, assignment),
+		);
+		this.#pendingExperienceCapture = run;
+		void run.finally(() => {
+			if (this.#pendingExperienceCapture === run) this.#pendingExperienceCapture = undefined;
+		});
+		return run;
+	}
+
+	/**
+	 * MAIN capture at a settled `agent_end`. Non-terminal settles and alias (worker) states are
+	 * skipped; workers capture through {@link captureSubagentExperienceOnSettle}.
+	 */
+	#maybeCaptureExperienceOnAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
+		if (this.aliasOf || this.config.experienceEnabled !== true) return;
+		if (event.isTerminal === false) return;
+		const lastUser = flattenAgentMessages(event.messages).findLast(message => message.role === "user");
+		const assignment = this.#experienceTaskText ?? lastUser?.content ?? "";
+		void this.captureExperienceCheckpoint(event.messages, "main", assignment);
+	}
+
+	async #captureExperienceWindow(
+		messages: readonly AgentMessage[],
+		agentKind: string,
+		assignment: string,
+	): Promise<void> {
+		const completer = this.completeLlm;
+		if (this.config.experienceEnabled !== true || !completer) return;
+		// A shorter transcript means compaction rewrote history; rescan it from the start.
+		const from = this.#experienceBoundary <= messages.length ? this.#experienceBoundary : 0;
+		if (from === messages.length) return;
+		const captureSignal = AbortSignal.timeout(EXPERIENCE_CAPTURE_TIMEOUT_MS);
+		try {
+			const snapshot = collectExperienceEvidence(messages, from);
+			const result = await captureExperience({
+				state: this,
+				assignment,
+				project: this.experienceProject(),
+				messages: snapshot.messages,
+				toolEvidence: snapshot.toolEvidence,
+				resultText: snapshot.resultText,
+				status: deriveExperienceStatus(messages),
+				completeLlm: (promptText, system, innerSignal) => {
+					// Outbound extraction text is obfuscated as this session's provider requests are. Replies keep their
+					// placeholders; experience.ts must reject any lesson still containing a raw secret value.
+					const obfuscator = this.session.obfuscator;
+					return completer(
+						obfuscator?.obfuscate(promptText) ?? promptText,
+						system === undefined ? undefined : (obfuscator?.obfuscate(system) ?? system),
+						innerSignal ? AbortSignal.any([captureSignal, innerSignal]) : captureSignal,
+					);
+				},
+				agentKind,
+				signal: captureSignal,
+			});
+			// An aborted run stays uncaptured so the next checkpoint re-reads its window.
+			if (result.rejected !== "aborted-run") this.#experienceBoundary = messages.length;
+			if (this.config.debug && (result.written > 0 || result.rejected)) {
+				logger.debug("Mnemopi: experience capture settled", {
+					written: result.written,
+					updated: result.updated,
+					rejected: result.rejected,
+					llmCalls: result.llmCalls,
+				});
+			}
+		} catch (error) {
+			this.#logLifecycleFailure("experience capture", [this.scoped.retain.bank], error);
+		}
+	}
+
+	/** In-flight settled-checkpoint capture, awaited by {@link dispose} before teardown. */
+	pendingExperienceCapture(): Promise<void> | undefined {
+		return this.#pendingExperienceCapture;
+	}
+
+	/** Waits for the in-flight capture at most {@link EXPERIENCE_DISPOSE_WAIT_MS}; the capture itself keeps running. */
+	async #awaitPendingExperienceCapture(): Promise<void> {
+		const pending = this.#pendingExperienceCapture;
+		if (!pending) return;
+		let budget: ReturnType<typeof setTimeout> | undefined;
+		const expired = new Promise<false>(resolve => {
+			budget = setTimeout(resolve, EXPERIENCE_DISPOSE_WAIT_MS, false);
+		});
+		const settled = await Promise.race([pending.then(() => true), expired]);
+		clearTimeout(budget);
+		if (!settled) {
+			logger.warn("Mnemopi: experience capture exceeded shutdown budget; abandoning it.", {
+				timeoutMs: EXPERIENCE_DISPOSE_WAIT_MS,
+			});
+		}
 	}
 
 	async recallForCompaction(messages: AgentMessage[]): Promise<string | undefined> {
@@ -777,6 +1075,10 @@ export class MnemopiSessionState {
 		this.unsubscribe?.();
 		this.unsubscribe = this.session.subscribe((event: AgentSessionEvent) => {
 			if (event.type === "agent_start") {
+				if (this.#experienceSeedPending) {
+					this.#experienceSeedPending = false;
+					this.#experienceBoundary = this.session.messages.length;
+				}
 				void this.maybeRecallOnAgentStart().catch(error => {
 					this.#logLifecycleFailure(
 						"agent_start recall",
@@ -788,6 +1090,7 @@ export class MnemopiSessionState {
 				void this.maybeRetainOnAgentEnd(event.messages).catch(error => {
 					this.#logLifecycleFailure("agent_end retention", [this.scoped.retain.bank], error);
 				});
+				this.#maybeCaptureExperienceOnAgentEnd(event);
 			}
 		});
 	}
@@ -869,10 +1172,10 @@ export class MnemopiSessionState {
 	}
 
 	/**
-	 * Capture the current transcript by default, drain in-flight fact extraction,
+	 * Capture the current transcript unless `retain: false`, drain in-flight fact extraction,
 	 * and optionally run beam consolidation on every owned bank.
-	 * The explicit `/memory enqueue` path
-	 * requests retention plus full cross-session consolidation; disposal composes
+	 * The explicit `/memory enqueue` path requests full cross-session consolidation, with
+	 * transcript retention gated on the configured `autoRetain` setting. Disposal composes
 	 * the lighter configured-retain-and-flush path with closing the DB handles.
 	 *
 	 * Aliased subagent states share `scoped` (and therefore the actual SQLite
@@ -894,9 +1197,9 @@ export class MnemopiSessionState {
 	 * @param options.extract - When false, any retained transcript is stored but no
 	 *  LLM fact extraction is scheduled. Used on the interactive shutdown path so
 	 *  `dispose` does not block on a fresh LLM round-trip.
-	 * @param options.retain - When false, skip transcript retention.
-	 *  Explicit consolidation retains by default; disposal passes the configured
-	 *  automatic-retention setting.
+	 * @param options.retain - When false, skip transcript retention. Both `/memory enqueue`
+	 *  and disposal pass the configured automatic-retention setting, so no raw transcript
+	 *  is captured while `autoRetain` is off.
 	 */
 	async consolidate(
 		options: { full?: boolean; extract?: boolean; sleep?: boolean; retain?: boolean } = {},
@@ -955,6 +1258,7 @@ export class MnemopiSessionState {
 		this.#recallGeneration++;
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+		await this.#awaitPendingExperienceCapture();
 		if (this.aliasOf) return;
 		const closeOwned = (): void => {
 			for (const memory of this.scoped.owned) memory.close();
@@ -1141,7 +1445,7 @@ function createMemory(config: MnemopiBackendConfig, bank: string): Mnemopi {
 	} as ConstructorParameters<typeof Mnemopi>[0]);
 }
 
-function resolveBankDbPath(config: MnemopiBackendConfig, bank: string): string {
+export function resolveBankDbPath(config: MnemopiBackendConfig, bank: string): string {
 	const sharedBank = config.globalBank ?? config.baseBank ?? "default";
 	if (bank === sharedBank) return config.dbPath;
 	const { BankManager } = requireMnemopiCore();
@@ -1235,29 +1539,92 @@ function flattenAgentMessages(messages: AgentMessage[]): Array<{ role: "user" | 
 	const out: Array<{ role: "user" | "assistant"; content: string }> = [];
 	for (const message of messages) {
 		if (!("role" in message) || (message.role !== "user" && message.role !== "assistant")) continue;
-		const content = message.role === "user" ? userText(message.content) : assistantText(message.content);
+		const content = contentText(message.content);
 		if (content.trim()) out.push({ role: message.role, content });
 	}
 	return out;
 }
 
-function userText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	const parts: string[] = [];
-	for (const block of content) {
-		if (!block || typeof block !== "object") continue;
-		const maybe = block as { type?: unknown; text?: unknown };
-		if (maybe.type === "text" && typeof maybe.text === "string") parts.push(maybe.text);
-	}
-	return parts.join("\n");
+// ------------------------------------------------------------ experience ---
+
+/** Wall-clock cap for one settled-checkpoint capture (model call included). */
+const EXPERIENCE_CAPTURE_TIMEOUT_MS = 60_000;
+
+/** Longest time dispose waits for an in-flight settled-checkpoint capture before abandoning it. */
+const EXPERIENCE_DISPOSE_WAIT_MS = 15_000;
+
+const CONTINUATION_RE =
+	/^(please |kindly )?(continue|continuing|cont|keep going|go on|proceed|resume|carry on|next|finish|finish it|do it|continue working|continue the (task|work|implementation)|keep working)( please| again)?$/;
+
+/** Identifies the banks an experience recall reads, so persisted reuse never crosses projects. */
+export function getExperienceRecallScope(config: MnemopiBackendConfig): string {
+	return `experience:${getMnemopiRecallScope(config)}`;
 }
 
-function assistantText(content: unknown): string {
-	if (!Array.isArray(content)) return "";
-	const parts: string[] = [];
-	for (const block of content) {
-		if (block.type === "text" && block.text) parts.push(block.text);
+/** A short prompt that asks to carry on rather than stating a new task. */
+function isContinuationPrompt(text: string): boolean {
+	const normalized = text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+	if (!normalized || normalized.length > 80) return false;
+	if (normalized.split(" ").length > 8) return false;
+	return CONTINUATION_RE.test(normalized);
+}
+
+/**
+ * Resolve the ACTUAL ongoing task for continuation prompts ("continue", "keep going"):
+ * the latest substantive user message, never the continuation word itself.
+ */
+function resolveExperienceTaskText(
+	history: ReadonlyArray<{ role: string; content: string }>,
+	latestPrompt: string,
+): string {
+	if (!isContinuationPrompt(latestPrompt)) return latestPrompt;
+	for (let index = history.length - 1; index >= 0; index--) {
+		const message = history[index];
+		if (message.role !== "user") continue;
+		const text = message.content.trim();
+		if (text && !isContinuationPrompt(text)) return text;
 	}
-	return parts.join("\n");
+	return latestPrompt;
+}
+
+/** Deterministic "same task context" key: sorted unique significant tokens of the task text. */
+function experienceTaskKey(taskText: string): string {
+	const normalized = taskText.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+	const tokens = [...new Set(normalized.split(" ").filter(token => token.length >= 3))].sort();
+	return Bun.hash(tokens.join(" ")).toString(36);
+}
+
+/** Union of refs by id; later entries win so updated content replaces stale text. */
+function mergeExperienceRefs(
+	existing: readonly ExperienceMemoryRef[],
+	added: readonly ExperienceMemoryRef[],
+): ExperienceMemoryRef[] {
+	const byId = new Map<string, ExperienceMemoryRef>();
+	for (const ref of [...existing, ...added]) byId.set(ref.id, ref);
+	return [...byId.values()];
+}
+
+/** Settled run outcome for capture: the final assistant message's stop reason decides. */
+function deriveExperienceStatus(messages: readonly AgentMessage[]): "success" | "failure" | "aborted" {
+	const lastAssistant = messages.findLast((message): message is AssistantMessage => message.role === "assistant");
+	if (lastAssistant?.stopReason === "aborted") return "aborted";
+	if (lastAssistant?.stopReason === "error") return "failure";
+	return "success";
+}
+
+export interface SubagentExperienceCaptureOptions {
+	session: AgentSession;
+	assignment: string;
+	agentName: string;
+}
+
+/**
+ * Captures a worker's experience from its settled transcript before the worker session is torn
+ * down. Never throws. Result-bearing callers await it; wake relays may leave it pending because
+ * `dispose` awaits the pending capture before closing bank handles.
+ */
+export async function captureSubagentExperienceOnSettle(options: SubagentExperienceCaptureOptions): Promise<void> {
+	const state = getMnemopiSessionState(options.session);
+	if (!state) return;
+	await state.captureExperienceCheckpoint(options.session.messages, `worker:${options.agentName}`, options.assignment);
 }

@@ -3546,9 +3546,42 @@ export class SessionManager {
 		return entry.id;
 	}
 
-	appendCustomEntry(customType: string, data?: unknown): string {
+	/**
+	 * `persist: true` materializes the session file and flushes synchronously before returning, so the entry survives
+	 * a reopen before any model exchange. Surfaces write errors. The default stays lazy.
+	 */
+	appendCustomEntry(customType: string, data?: unknown, options?: { persist?: boolean }): string {
 		const entry: CustomEntry = { type: "custom", customType, data, ...this.#freshEntryFields() };
+		if (options?.persist) this.#forceFileCreation = true;
 		this.#recordEntry(entry);
+		if (options?.persist) this.flushSync();
+		return entry.id;
+	}
+
+	/**
+	 * Record a custom entry on the owner's branch without moving the leaf; dropped when the session changed
+	 * since the owner was captured. Mirrors {@link appendModelUsage}.
+	 */
+	appendCustomEntryOn(
+		customType: string,
+		data: unknown,
+		owner: { sessionId: string; parentId: string | null },
+	): string | undefined {
+		if (this.#sessionId !== owner.sessionId || (owner.parentId !== null && !this.#index.has(owner.parentId))) {
+			return undefined;
+		}
+		const activeLeafId = this.#index.leafId();
+		const entry: CustomEntry = {
+			type: "custom",
+			id: generateId(this.#index),
+			parentId: owner.parentId,
+			timestamp: nowIso(),
+			customType,
+			data,
+		};
+		this.#index.detachBranchView();
+		this.#recordEntry(entry);
+		this.#index.setLeaf(activeLeafId);
 		return entry.id;
 	}
 

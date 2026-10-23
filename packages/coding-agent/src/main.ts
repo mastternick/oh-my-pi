@@ -43,7 +43,7 @@ import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
 import type { SessionPickerOptions } from "@oh-my-pi/pi-tui/apps/session-picker";
 import { fetchBuild } from "./cli/build-service";
 import { applyStartupCwd } from "./cli/startup-cwd";
-import { getLatestRelease, isSourceCheckout, managedInstallName } from "./cli/update-cli";
+import { getLatestRelease, isSourceCheckout, managedInstallName, resolveOmpPath } from "./cli/update-cli";
 import { findConfigFile } from "./config";
 import { ModelRegistry } from "./config/model-registry";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
@@ -243,7 +243,7 @@ async function checkForNewVersion(currentVersion: string): Promise<string | unde
 	try {
 		// Checkouts update through git and a manager (Tern) updates its omp itself:
 		// "run omp update" would be wrong advice for both.
-		if (isSourceCheckout() || (await managedInstallName(process.execPath))) return;
+		if (isSourceCheckout() || (await managedInstallName(resolveOmpPath() ?? process.execPath))) return;
 		const channel = cfgUpdateChannel.get(settings);
 		// A compiled binary updates from the build service; naming the running
 		// version lets the service prepare the patch `omp update` will then use.
@@ -2501,7 +2501,8 @@ export async function runRootCommand(
 					session,
 					authStorage,
 					modelRegistry,
-					settings: settingsInstance,
+					// This session's pinned view, so revived subagents resolve roles as this session does.
+					settings: session.settings,
 					enableLsp: sessionOptions.enableLsp ?? true,
 					eventBus,
 					subagentEventBus,

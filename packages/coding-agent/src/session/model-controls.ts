@@ -17,6 +17,7 @@ import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { logger } from "@oh-my-pi/pi-utils";
 import { classifyDifficulty } from "../auto-thinking/classifier";
+import { journalJudgmentDecision, journalJudgmentEffortApplied } from "../judgment";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	filterAvailableModelsByEnabledPatterns,
@@ -631,6 +632,9 @@ export class ModelControls {
 		if (getSupportedEfforts(model).length === 0) return;
 
 		let resolved: Effort | undefined;
+		// Latest successful decision of this classification; links the applied-effort event.
+		const linked: { decisionEntryId?: string } = {};
+		const sessionId = this.#host.sessionManager.getSessionId();
 		if (this.#host.magicKeywordEnabled("ultrathink") && containsMagicKeyword(promptText, "ultrathink")) {
 			// The user explicitly asked for maximum thinking; bypass the classifier
 			// (and the `providers.autoThinkingMaxEffort` ceiling) and jump straight
@@ -643,6 +647,7 @@ export class ModelControls {
 				sessionId: this.#host.sessionManager.getSessionId(),
 				parentId: this.#host.sessionManager.getLeafId(),
 			};
+			const journalDecision = journalJudgmentDecision(this.#host.sessionManager);
 			try {
 				resolved = await classifyDifficulty(
 					{ request: promptText, solutionSpace },
@@ -656,6 +661,10 @@ export class ModelControls {
 						onUsage: usage => {
 							const entryId = this.#host.sessionManager.appendModelUsage(usage, usageOwner);
 							if (entryId) usageOwner.parentId = entryId;
+						},
+						onDecision: decision => {
+							const id = journalDecision?.(decision);
+							if (decision.status === "ok" && id) linked.decisionEntryId = id;
 						},
 						telemetry: this.#host.agent.telemetry,
 					},
@@ -682,8 +691,9 @@ export class ModelControls {
 		this.#autoResolvedLevel = effort;
 		this.#thinkingLevel = effort;
 		this.#applyThinkingLevelToAgent(effort);
+		let thinkingEntryId: string | undefined;
 		if (shouldPersistResolution) {
-			this.#host.sessionManager.appendThinkingLevelChange(effort, AUTO_THINKING);
+			thinkingEntryId = this.#host.sessionManager.appendThinkingLevelChange(effort, AUTO_THINKING);
 		}
 		this.#host.emit({
 			type: "thinking_level_changed",
@@ -691,6 +701,15 @@ export class ModelControls {
 			configured: AUTO_THINKING,
 			resolved: effort,
 		});
+		const decisionEntryId = linked.decisionEntryId;
+		if (decisionEntryId) {
+			journalJudgmentEffortApplied(this.#host.sessionManager, sessionId, {
+				version: 1,
+				decisionEntryId,
+				level: effort,
+				thinkingEntryId,
+			});
+		}
 	}
 
 	/**

@@ -52,7 +52,7 @@ import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { IrcBus } from "../irc/bus";
 import type { MCPManager } from "../mcp/manager";
-import type { MnemopiSessionState } from "../mnemopi/state";
+import { captureSubagentExperienceOnSettle, type MnemopiSessionState } from "../mnemopi/state";
 import { initializeExtensions } from "../modes/runtime-init";
 import subagentAsyncPendingTemplate from "../prompts/system/subagent-async-pending.md" with { type: "text" };
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
@@ -104,6 +104,8 @@ import { generateTaskLabel } from "./label";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
+import { createStallGuard, type StallDecision, type StallEvidence, type StallVerdict } from "./stall-guard";
+import { createRoleStallJudge, type StallJudge } from "./stall-judge";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import type { WorkPoolYieldItem } from "./workpool-yield";
 import {
@@ -130,6 +132,7 @@ import {
 	cfgTaskAgentPrewalk,
 	cfgTaskMaxEffort,
 	cfgTaskSoftRequestBudgetNotice,
+	cfgTaskStallGuard,
 	cfgTaskSoftRequestBudget,
 	cfgTaskAgentSoftRequestBudget,
 	cfgTaskAgentIdleTtlMs,
@@ -156,6 +159,17 @@ import {
 
 export type { YieldItem } from "@oh-my-pi/pi-tui/tools/task";
 
+
+/**
+ * {@link SingleResult} plus the stall-stop flag. pi-tui's shared result type is a
+ * frozen byte-identical dependency (the XM tui-deps apply gate refuses any edit), so
+ * the flag is declared here; the isolation runner narrows to it with a documented
+ * unchecked cast before its capture gate.
+ */
+export type StallStoppedResult = SingleResult & {
+	/** Stopped by the stall guard: partial isolated changes are captured as a patch but never auto-applied. */
+	stallStopped?: boolean;
+};
 const TASK_ABORT_CLEANUP_GRACE_MS = 10_000;
 
 /**
@@ -202,6 +216,14 @@ export const BUDGET_STOP_GRACE_REQUESTS = 5;
 /** Steering notice injected when a subagent crosses its soft request budget. */
 export function buildBudgetNotice(requests: number, budget: number): string {
 	return `[budget notice] You have used ${requests} requests in this run (soft budget: ${budget}). Wrap up now: finish the current step and deliver your final report. At ${Math.ceil(budget * 1.5)} requests the run is force-stopped and you will be asked to report whatever you have.`;
+}
+
+/** Steering notice when a subagent's requests show no progress; a short grace precedes the stop. */
+export function buildStallNotice(requests: number, compactions: number, blocked = false): string {
+	const action = blocked
+		? "The judge reads your recent calls as a blocker you keep restating. Yield now with the exact blocker and your findings."
+		: "Stop repeating the same reads and commands. Either make the change you are blocked on now, or yield immediately with your findings and the exact blocker.";
+	return `[stall notice] You have made ${requests} requests and ${compactions} compactions with no edits, new commands, or a yield. ${action} If you keep showing no progress within the next few requests, the run is stopped and you will be asked for your report.`;
 }
 
 /** Flatten whitespace and clip salvage text for the cancelled-child summary line. */
@@ -1221,6 +1243,10 @@ interface RunMonitorArgs {
 	softRequestBudget: number;
 	/** Whether crossing the soft budget injects a wrap-up steering notice. */
 	softRequestBudgetNotice: boolean;
+	/** Whether the stall guard stops no-progress loops (`task.stallGuard`). */
+	stallGuard: boolean;
+	/** Judge settings and registry for a monitor with no parent settings (follow-up turns); labeling stays off there. */
+	stallJudge?: { settings: Settings; registry: ModelRegistry };
 	/** Wall-clock cap in ms; 0 disables the timer. */
 	maxRuntimeMs: number;
 	/** Whether to periodically ask the agent for a completion estimate; see {@link isCompletionProbeEnabled}. */
@@ -1253,6 +1279,8 @@ interface SubagentRunMonitor {
 	runtimeLimitExceeded(): boolean;
 	/** True once the soft-budget stop fired: the free-running turn was aborted and the run is being driven to a forced final yield. */
 	budgetStopRequested(): boolean;
+	/** The stall-guard stop reason once a stall stop fired; undefined for normal budget stops. */
+	stallStopReason(): string | undefined;
 	/** Resolves when the budget-stop session abort has settled (immediately when no stop fired). */
 	waitForBudgetStop(): Promise<void>;
 	/**
@@ -1285,6 +1313,8 @@ interface SubagentRunMonitor {
 	setActiveSession(session: AgentSession | null): void;
 	/** Return and clear the active session reference. */
 	takeActiveSession(): AgentSession | null;
+	/** Return the active session reference without clearing it. */
+	peekActiveSession(): AgentSession | null;
 	/** Subscribe the monitor to a session's events. Returns the unsubscribe function. */
 	attach(session: AgentSession): () => void;
 	/** Best-effort capture of the last assistant text for cancelled-run salvage. */
@@ -1322,8 +1352,12 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		onProgress,
 		softRequestBudget,
 		softRequestBudgetNotice,
+		stallGuard,
 		maxRuntimeMs,
 		completionProbe,
+		settings,
+		modelRegistry,
+		stallJudge,
 	} = args;
 	const startTime = Date.now();
 
@@ -1396,6 +1430,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	let budgetLimitExceeded = false;
 	let budgetStopRequested = false;
 	let budgetStopAbortPromise: Promise<void> | undefined;
+	// progress.requests when the budget or stall stop was requested; the hard-abort grace counts from here.
+	let budgetStopAtRequests = 0;
 	let terminalError: string | undefined;
 	let consecutiveYieldToolErrors = 0;
 	let lastAssistantSalvageText: string | undefined;
@@ -1409,6 +1445,10 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	// purpose: mid-run narration must never surface as a final result.
 	let lastReportTurnText: string | undefined;
 	let activeSessionAbortPromise: Promise<void> | undefined;
+	const stallTracker = stallGuard ? createStallGuard({ readOnly: isReadOnlyAgent(agent) }) : undefined;
+	// Full args of in-flight calls for stall fingerprints; activeTools keeps only a preview.
+	const stallCallArgs = new Map<string, unknown>();
+	let stallStopText: string | undefined;
 
 	const abortActiveSession = (): Promise<void> => {
 		const session = activeSession;
@@ -1474,6 +1514,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	const requestBudgetStop = () => {
 		if (budgetStopRequested || abortSent || resolved) return;
 		budgetStopRequested = true;
+		budgetStopAtRequests = progress.requests;
 		const session = activeSession;
 		budgetStopAbortPromise = session
 			? session.abort().catch(error => {
@@ -1482,6 +1523,70 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 					});
 				})
 			: Promise.resolve();
+	};
+
+	// Stall stop: the soft-budget stop path with a stall reason. A budget stop
+	// already requested keeps its own reason.
+	const requestStallStop = (reason: string) => {
+		if (budgetStopRequested || abortSent || resolved) return;
+		stallStopText = reason;
+		requestBudgetStop();
+	};
+	const sendStallNotice = (requests: number, compactions: number, blocked: boolean) => {
+		const steerSession = activeSession;
+		if (!steerSession) return;
+		const notice = buildStallNotice(requests, compactions, blocked);
+		void Promise.resolve()
+			.then(() => steerSession.sendUserMessage(notice, { deliverAs: "steer", attribution: "agent" }))
+			.catch(err => {
+				logger.warn("Subagent stall steer failed", {
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
+	};
+
+	// Verdict held while a tool or owner async work runs; applied when they finish.
+	let heldVerdict: { token: number; answer: StallVerdict | undefined } | undefined;
+	const flushHeldVerdict = () => {
+		if (!stallTracker || !heldVerdict || activeTools.size > 0 || sessionHasPendingAsyncWork()) return;
+		const { token, answer } = heldVerdict;
+		heldVerdict = undefined;
+		applyStallDecision(stallTracker.resolveSuspicion(token, answer));
+	};
+	// Stage 2 of the stall guard: a suspicion goes to the judge; the verdict and backoff decide the action.
+	const runStallJudge = (suspicion: Extract<StallDecision, { kind: "suspect" }>) => {
+		const source = stallJudge ?? (settings && modelRegistry ? { settings, registry: modelRegistry } : undefined);
+		const judge: StallJudge | undefined =
+			source && activeSession
+				? createRoleStallJudge({
+						settings: source.settings,
+						registry: source.registry,
+						sessionModel: activeSession.model,
+						sessionManager: activeSession.sessionManager,
+					})
+				: undefined;
+		// Moot once the window moves on, the monitor aborts, or the run finishes; the answer still settles the suspicion.
+		const cancel = AbortSignal.any([suspicion.signal, abortController.signal, listenerController.signal]);
+		const verdict = judge ? judge(suspicion.evidence, assignment ?? task, cancel) : Promise.resolve(undefined);
+		void verdict.catch(() => undefined).then(answer => {
+			if (!stallTracker) return;
+			// A tool still running or owner async work pending means the answer judges evidence that moved on. Hold it;
+			// flushHeldVerdict applies it once they finish. A non-repeat result stales it by epoch, so it is then ignored.
+			if (activeTools.size > 0 || sessionHasPendingAsyncWork()) heldVerdict = { token: suspicion.token, answer };
+			else applyStallDecision(stallTracker.resolveSuspicion(suspicion.token, answer));
+		});
+	};
+	// Applies one stall-guard decision. A yield turn is finishing the run, so its notice or stop is skipped.
+	const applyStallDecision = (decision: StallDecision) => {
+		// A stop already underway, or a finished run, makes later suspicions moot; skip their judge calls.
+		if (budgetStopRequested || abortSent || resolved) return;
+		if (decision.kind === "suspect") {
+			runStallJudge(decision);
+			return;
+		}
+		if (yieldCallPending) return;
+		if (decision.kind === "notice") sendStallNotice(decision.requests, decision.compactions, decision.blocked);
+		else if (decision.kind === "stop") requestStallStop(decision.reason);
 	};
 
 	const failWithError = (message: string) => {
@@ -1557,11 +1662,14 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		if (runtimeLimitExceeded) {
 			return `Subagent runtime limit exceeded (task.maxRuntimeMs=${maxRuntimeMs})`;
 		}
+		if (stallStopText && budgetLimitExceeded) {
+			return `${stallStopText} — agent did not yield when force-stopped`;
+		}
 		if (budgetLimitExceeded) {
 			return `Soft request budget exceeded (${progress.requests} requests; budget ${softRequestBudget}) — agent did not yield when force-stopped`;
 		}
 		if (budgetStopRequested) {
-			return `Soft request budget exceeded (${progress.requests} requests; budget ${softRequestBudget})`;
+			return stallStopText ?? `Soft request budget exceeded (${progress.requests} requests; budget ${softRequestBudget})`;
 		}
 		return resolveSignalAbortReason();
 	};
@@ -1755,17 +1863,18 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	 * the forced final yield never lands.
 	 */
 	const evaluateSoftRequestBudget = () => {
-		if (softRequestBudget <= 0 || abortSent) return;
-		const stopThreshold = softRequestBudget * 1.5;
+		if (abortSent) return;
 		if (budgetStopRequested) {
-			// Grace window after the stop: the forced yield needs a request or
-			// two; a child that keeps burning requests instead of yielding is
-			// hard-aborted.
-			if (progress.requests >= stopThreshold + BUDGET_STOP_GRACE_REQUESTS) {
+			// Grace window after the stop, counted from the stop itself: the forced
+			// yield needs a request or two; a child that keeps burning requests
+			// instead of yielding is hard-aborted. Stall stops reach this with no budget.
+			if (progress.requests >= budgetStopAtRequests + BUDGET_STOP_GRACE_REQUESTS) {
 				requestAbort("budget");
 			}
 			return;
 		}
+		if (softRequestBudget <= 0) return;
+		const stopThreshold = softRequestBudget * 1.5;
 		if (progress.requests >= stopThreshold) {
 			requestBudgetStop();
 			return;
@@ -1803,10 +1912,15 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 				// reminder ladder demands a fresh yield. Guarded on the run signal:
 				// once the run is completing, late injections must not destabilize
 				// the settled classification.
-				if (yieldCalled && !abortSignal.aborted && isAsyncResultInjection(event.message)) {
-					yieldCalled = false;
-					yieldInvalidatedByAsync = true;
-					yieldAcceptedAt = undefined;
+				if (!abortSignal.aborted && isAsyncResultInjection(event.message)) {
+					// The injected result changes what the model knows: a suspicion judged or
+					// held before it is stale, whether or not a yield preceded it.
+					stallTracker?.recordAsyncResult();
+					if (yieldCalled) {
+						yieldCalled = false;
+						yieldInvalidatedByAsync = true;
+						yieldAcceptedAt = undefined;
+					}
 				}
 				break;
 
@@ -1839,6 +1953,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 					intent,
 					startMs: now,
 				});
+				if (stallTracker) stallCallArgs.set(event.toolCallId, startArgs);
 				visibleToolCallId = event.toolCallId;
 				// A fast tool may finish before the coalesced update fires.
 				// Publish both lifecycle edges rather than dropping its start.
@@ -1858,8 +1973,18 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			}
 
 			case "tool_execution_end": {
+				if (stallTracker) {
+					stallTracker.recordToolResult({
+						name: event.toolName,
+						args: stallCallArgs.get(event.toolCallId),
+						isError: event.isError ?? false,
+						result: event.result,
+					});
+					stallCallArgs.delete(event.toolCallId);
+				}
 				const finished = activeTools.get(event.toolCallId);
 				activeTools.delete(event.toolCallId);
+				flushHeldVerdict();
 				if (finished) {
 					progress.recentTools.unshift({
 						tool: finished.tool,
@@ -2021,6 +2146,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			case "message_end": {
 				// Extract text from assistant and toolResult messages (not user prompts)
 				const role = event.message?.role;
+				let assistantText = "";
 				if (role === "assistant") {
 					progress.requests += 1;
 					const eventContent = isRecord(event) && "content" in event ? event.content : undefined;
@@ -2053,6 +2179,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 						// update alone would leave it harvestable and hand the parent
 						// stale narration as the completed result.
 						const text = turnText.join("\n");
+						assistantText = text;
 						if (startedMoreWork) lastReportTurnText = undefined;
 						else if (text.trim()) lastReportTurnText = text;
 					}
@@ -2097,6 +2224,12 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 							progress.contextTokens = perTurnTotal;
 						}
 					}
+				}
+				if (stallTracker && role === "assistant") {
+					const outputTokens = isRecord(messageUsage) ? (getNumberField(messageUsage, "output") ?? 0) : 0;
+					stallTracker.recordAssistantText(assistantText);
+					flushHeldVerdict();
+					applyStallDecision(stallTracker.startRequest(outputTokens));
 				}
 				break;
 			}
@@ -2192,6 +2325,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 				scheduleProgress(true);
 				return;
 			}
+			if (event.type === "auto_compaction_end" && !event.aborted) stallTracker?.recordCompaction();
 			if (isAgentEvent(event)) {
 				// Breadcrumb the synchronous subagent event handling so the loop
 				// watchdog can attribute any block to this in-process subagent.
@@ -2249,6 +2383,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			budgetLimitExceeded ||
 			budgetStopRequested,
 		budgetStopRequested: () => budgetStopRequested,
+		stallStopReason: () => stallStopText,
 		waitForBudgetStop: () => budgetStopAbortPromise ?? Promise.resolve(),
 		yieldInvalidatedByAsync: () => yieldInvalidatedByAsync,
 		yieldTurnStopRequested: () => yieldTurnStopRequested,
@@ -2272,7 +2407,9 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		// A soft stop that never escalated still identifies as a budget abort so
 		// the lifecycle can park the agent as resumable instead of killing it.
 		abortKind: () => abortReason ?? (budgetStopRequested ? "budget" : undefined),
+		// A stall stop ends the run as aborted even when a later terminate abort supersedes its abort reason.
 		isAbortedRun: () =>
+			stallStopText !== undefined ||
 			abortReason === "signal" ||
 			abortReason === "shutdown" ||
 			runtimeLimitExceeded ||
@@ -2302,6 +2439,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 				});
 			}
 		},
+		peekActiveSession: () => activeSession,
 		takeActiveSession: () => {
 			const session = activeSession;
 			activeSession = null;
@@ -2379,9 +2517,11 @@ async function driveSessionToResult(
 		onPromptBusy?: () => Promise<void>;
 		/** Go on with the interrupted turn instead of sending `task`, which only labels the run. */
 		restore?: boolean;
+		/** The turn already ran under this monitor and was stopped (an IRC wake turn): skip the initial prompt and drive the forced final report. */
+		alreadyDispatched?: boolean;
 	} = {},
 ): Promise<DriveOutcome> {
-	const { solutionSpace, onPromptBusy, restore } = options;
+	const { solutionSpace, onPromptBusy, restore, alreadyDispatched } = options;
 	const structured = options.structured !== false;
 	using _keepalive = new EventLoopKeepalive();
 	const abortSignal = monitor.abortSignal;
@@ -2464,6 +2604,7 @@ async function driveSessionToResult(
 			let promptAttempts = 0;
 			for (;;) {
 				try {
+					if (alreadyDispatched) break;
 					if (restore) await awaitAbortable(session.restoreInterruptedTurn());
 					else await dispatchPrompt(task, { attribution: "agent", solutionSpace }, "initial prompt");
 					break;
@@ -2705,6 +2846,15 @@ async function driveSessionToResult(
 		}
 	}
 
+	// A stall stop finalizes as aborted even when the forced report lands. This runs
+	// after finally on purpose: the forced abort surfaces as a swallowed catch, which
+	// would skip a check placed inside the try block.
+	if (monitor.stallStopReason() !== undefined) {
+		aborted = true;
+		abortReasonText ??= monitor.resolveAbortReasonText();
+		exitCode = 1;
+	}
+
 	return { exitCode, error, aborted, abortReasonText };
 }
 
@@ -2747,7 +2897,7 @@ interface FinalizeRunArgs {
  * `<id>.md` output artifact, flush final progress, and emit the lifecycle end
  * event.
  */
-async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
+async function finalizeRunResult(args: FinalizeRunArgs): Promise<StallStoppedResult> {
 	const { monitor, done, index, id, agent, task, assignment, signal, modelOverride, modelRole } = args;
 	const progress = monitor.progress;
 	let exitCode = done.exitCode;
@@ -2880,8 +3030,9 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	// while we were tearing the session down. The yield data is still surfaced
 	// to the caller via `progress.extractedToolData`, but the exit status must
 	// reflect the timeout so on-call doesn't mistake a stuck run for success.
+	// A stall stop fails the run the same way, even when its forced report landed.
 	const runtimeLimitExceeded = monitor.runtimeLimitExceeded();
-	if (runtimeLimitExceeded && exitCode === 0) {
+	if ((runtimeLimitExceeded || monitor.stallStopReason() !== undefined) && exitCode === 0) {
 		exitCode = 1;
 	}
 	const wasAborted =
@@ -2944,6 +3095,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		error: exitCode !== 0 && stderr ? stderr : undefined,
 		aborted: wasAborted,
 		abortReason: finalAbortReason,
+		stallStopped: monitor.stallStopReason() !== undefined,
 		usage: monitor.hasUsage() ? monitor.accumulatedUsage : undefined,
 		outputPath,
 		extractedToolData: progress.extractedToolData,
@@ -3221,6 +3373,8 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			sessionFile,
 			softRequestBudget: 0,
 			softRequestBudgetNotice: false,
+			stallGuard: cfgTaskStallGuard.get(session.settings),
+			stallJudge: { settings: session.settings, registry: session.modelRegistry },
 			maxRuntimeMs,
 			// Autonomous wake turns answer a peer message; too short to probe.
 			completionProbe: false,
@@ -3245,13 +3399,26 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 		const unsubscribeTurn = turnMonitor.attach(session);
 		if (wakeSources(records, id).some(source => source.from === ownerId)) registerWakeJob();
 		return async turnError => {
+			// A stalled wake turn never reached its report: drive the forced final yield
+			// under this monitor, as a first run does, before the monitor detaches.
+			const stalled = turnMonitor.stallStopReason() !== undefined;
+			const driven = stalled
+				? await driveSessionToResult(session, turnMonitor, ircTask, {
+						structured: options.structured !== false,
+						alreadyDispatched: true,
+					})
+				: undefined;
 			unsubscribeTurn();
 			const activeSession = turnMonitor.takeActiveSession();
 			if (activeSession) turnMonitor.captureSalvage(activeSession);
 			const lastAssistant = session.getLastAssistantMessage();
 			const yielded = turnMonitor.yieldCalled();
 			const runtimeLimitExceeded = turnMonitor.runtimeLimitExceeded();
-			const aborted = runtimeLimitExceeded || (lastAssistant?.stopReason === "aborted" && !yielded);
+			const aborted = runtimeLimitExceeded || stalled || (lastAssistant?.stopReason === "aborted" && !yielded);
+			// Learn from the settled wake turn without holding its relay; dispose awaits the pending capture.
+			if (!aborted) {
+				void captureSubagentExperienceOnSettle({ session, assignment: ircTask, agentName: agent.name });
+			}
 			// Two error lanes. `error` carries full diagnostics (a thrown turn
 			// error's stack) for `done.error`, logs, and lifecycle. `errorForPeer`
 			// carries only the short, attributed message: a stack trace injected
@@ -3260,9 +3427,9 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 				lastAssistant?.stopReason === "error"
 					? attributeSubagentError(lastAssistant.errorMessage, lastAssistant)
 					: undefined;
-			const thrown = providerError === undefined && turnError !== undefined && !yielded ? turnError : undefined;
+			const thrown = providerError === undefined && turnError !== undefined && !yielded && !stalled ? turnError : undefined;
 			const error =
-				providerError ??
+				providerError ?? driven?.error ??
 				(thrown instanceof Error
 					? thrown.stack || thrown.message
 					: thrown === undefined
@@ -3540,6 +3707,10 @@ export interface FollowUpTurnOptions {
 	completionProbe?: boolean;
 	/** Workpool items accepted by the child yield tool during this turn. */
 	workPoolYieldItems?: WorkPoolYieldItem[];
+	/** Parent settings for the stall guard flag and judge; without them the guard stays off for this turn. */
+	settings?: Settings;
+	/** Parent model registry for the stall judge; without it the judge fails open. */
+	modelRegistry?: ModelRegistry;
 }
 
 /**
@@ -3624,6 +3795,11 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		sessionFile,
 		softRequestBudget: 0,
 		softRequestBudgetNotice: false,
+		stallGuard: options.settings !== undefined && cfgTaskStallGuard.get(options.settings),
+		stallJudge:
+			options.settings && options.modelRegistry
+				? { settings: options.settings, registry: options.modelRegistry }
+				: undefined,
 		maxRuntimeMs: options.maxRuntimeMs ?? 0,
 		completionProbe: options.completionProbe ?? false,
 	});
@@ -3678,6 +3854,15 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 			AgentRegistry.global().markResultAccepted(id, session, monitor.yieldAcceptedAt());
 		}
 	} finally {
+		// Learn from the settled continuation before teardown; cancelled or limit-stopped runs are skipped.
+		const settledSession = monitor.peekActiveSession();
+		if (settledSession && !(signal?.aborted && monitor.isAbortedRun())) {
+			await captureSubagentExperienceOnSettle({
+				session: settledSession,
+				assignment: message,
+				agentName: agent.name,
+			});
+		}
 		try {
 			await untilAborted(AbortSignal.timeout(5000), () => monitor.waitForActiveSessionAbort());
 		} catch {
@@ -4034,6 +4219,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		cfgTaskAgentSoftRequestBudget.get(settings),
 	);
 	const softRequestBudgetNotice = cfgTaskSoftRequestBudgetNotice.get(settings);
+	const stallGuard = cfgTaskStallGuard.get(settings);
 	const parentDepth = options.taskDepth ?? 0;
 	const childDepth = parentDepth + 1;
 	const atMaxDepth = maxRecursionDepth >= 0 && childDepth >= maxRecursionDepth;
@@ -4111,6 +4297,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		sessionFile: subtaskSessionFile,
 		softRequestBudget,
 		softRequestBudgetNotice,
+		stallGuard,
 		maxRuntimeMs,
 		completionProbe: isCompletionProbeEnabled(settings, parentDepth),
 	});
@@ -4686,6 +4873,16 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				error = err instanceof Error ? err.stack || err.message : String(err);
 			}
 		} finally {
+			// Learn from the settled transcript before teardown starts the cleanup clock. Cancelled or
+			// limit-stopped runs are skipped; a normal yield aborts with "terminate" and is captured.
+			const settledSession = monitor.peekActiveSession();
+			if (settledSession && !(abortSignal.aborted && monitor.isAbortedRun())) {
+				await captureSubagentExperienceOnSettle({
+					session: settledSession,
+					assignment: assignment ?? task,
+					agentName: agent.name,
+				});
+			}
 			const cleanupDeadlineAt = Date.now() + cleanupGraceMs;
 			const cleanupChangeStatus =
 				worktree === undefined

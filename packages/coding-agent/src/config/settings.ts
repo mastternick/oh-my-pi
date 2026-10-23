@@ -29,6 +29,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { isLightTheme } from "@oh-my-pi/pi-tui/theme/theme";
+import { type ConfiguredThinkingLevel, parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { JSONC, YAML } from "bun";
 import { invalidate as invalidateCapabilityFsCache } from "../capability/fs";
 import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
@@ -294,6 +295,73 @@ function projectLayerForMerge(project: RawSettings): RawSettings {
 		delete filteredRoles[role];
 	}
 	return filteredRoles ? { ...project, modelRoles: filteredRoles } : project;
+}
+
+/** A session's snapshot of the preset values it runs with: model roles, default thinking level, and fallback chains. */
+export interface SessionPresetPin {
+	modelRoles: Record<string, string>;
+	defaultThinkingLevel?: ConfiguredThinkingLevel;
+	fallbackChains: Record<string, string[]>;
+}
+
+/** The {@link SessionPresetPin} field that the setting at `segments` takes, or `undefined` when it is not pinned. */
+function pinFieldOf(segments: readonly string[]): keyof SessionPresetPin | undefined {
+	const id = segments.join(".");
+	if (id === "modelRoles") return "modelRoles";
+	if (id === "defaultThinkingLevel") return "defaultThinkingLevel";
+	if (id === "retry.fallbackChains") return "fallbackChains";
+	return undefined;
+}
+
+/** `global` without the model roles and fallback chains a marked project owns. Copies `retry`; never mutates it. */
+function withoutPresetDefaultKeys(global: RawSettings): RawSettings {
+	const next: RawSettings = { ...global };
+	delete next.modelRoles;
+	if (isRecord(next.retry)) {
+		const retry = { ...next.retry };
+		delete retry.fallbackChains;
+		next.retry = retry;
+	}
+	return next;
+}
+
+/** `merged` with the pinned values replacing the inherited ones whole, never key by key. */
+function applySessionPin(merged: RawSettings, pin: SessionPresetPin): RawSettings {
+	const retry = isRecord(merged.retry) ? merged.retry : {};
+	// Always assigned, so an unset pinned thinking level cannot inherit a later parent value.
+	return {
+		...merged,
+		modelRoles: structuredClone(pin.modelRoles),
+		defaultThinkingLevel: pin.defaultThinkingLevel,
+		retry: { ...retry, fallbackChains: structuredClone(pin.fallbackChains) },
+	};
+}
+
+/** Replaces the pinned `field` with `value` (a whole record, or the thinking level). Returns whether it changed. */
+function setPinField(pin: SessionPresetPin, field: keyof SessionPresetPin, value: unknown): boolean {
+	if (field === "defaultThinkingLevel") {
+		const level = typeof value === "string" ? parseConfiguredThinkingLevel(value) : undefined;
+		if (pin.defaultThinkingLevel === level) return false;
+		pin.defaultThinkingLevel = level;
+		return true;
+	}
+	const next: Record<string, unknown> = isRecord(value) ? structuredClone(value) : {};
+	if (settingValuesEqual(pin[field], next)) return false;
+	if (field === "modelRoles") pin.modelRoles = next as Record<string, string>;
+	else pin.fallbackChains = next as Record<string, string[]>;
+	return true;
+}
+
+/** Sets `key` of a pinned record to `value` (`undefined` removes it). Returns whether it changed. */
+function setPinEntry(record: Record<string, unknown>, key: string, value: unknown): boolean {
+	if (value === undefined) {
+		if (!Object.hasOwn(record, key)) return false;
+		delete record[key];
+		return true;
+	}
+	if (Object.hasOwn(record, key) && settingValuesEqual(record[key], value)) return false;
+	record[key] = structuredClone(value);
+	return true;
 }
 
 /** One instance's own layers, lowest precedence first. */
@@ -631,6 +699,15 @@ export class Settings {
 	#modified = new Map<string, readonly string[]>();
 	/** Individual project model roles modified during this session */
 	#modifiedProjectModelRoles = new Set<string>();
+
+	/** Session view: this session's snapshot of model roles, default thinking level, and fallback chains. */
+	#pin: SessionPresetPin | undefined;
+	/** Session view: runs after each snapshot change made through this view, so the session records it. */
+	#onPinWrite: (() => void) | undefined;
+	/** Root: model role overrides given at launch (CLI/env). A restored snapshot yields to them per key. */
+	#launchModelRoles: Record<string, string> = {};
+	/** Project-layer paths written this session (a marked project's own values), keyed like {@link #modified}. */
+	#modifiedProjectPaths = new Map<string, readonly string[]>();
 	/** Individual global model roles modified during this session (for partial save) */
 	#modifiedGlobalModelRoles = new Set<string>();
 	/** On-disk generations and prior values observed before each pending global mutation, keyed like {@link #modified}. */
@@ -811,9 +888,107 @@ export class Settings {
 		return child;
 	}
 
+	/** Whether this instance can host a session preset: the root, or a session view. */
+	get pinnable(): boolean {
+		return !this.#parent || this.#pin !== undefined;
+	}
+
+	/** Whether this instance is a session view, whose model roles, thinking level, and fallback chains are its snapshot. */
+	get isSessionView(): boolean {
+		return this.#pin !== undefined;
+	}
+
+	/** The root settings instance: where session views read launch overrides and the project/global layers. */
+	get root(): Settings {
+		return this.#rootSettings();
+	}
+
+	/**
+	 * A session view of this instance (an {@link overlay}) whose model roles, default thinking level, and fallback chains
+	 * come from `pin` (default: this instance's effective values). Global writes to those settings persist through this
+	 * instance and update the snapshot, and `onPinWrite` runs after each such change. Everything else reads through.
+	 */
+	sessionView(pin?: SessionPresetPin, { onPinWrite }: { onPinWrite?: () => void } = {}): Settings {
+		const child = this.overlay();
+		child.#pin = structuredClone(pin ?? this.#pinFromMerged());
+		child.#onPinWrite = onPinWrite;
+		child.#rebuildMerged();
+		return child;
+	}
+
+	/** Copy of this session view's snapshot; `undefined` for other instances. */
+	sessionPin(): SessionPresetPin | undefined {
+		return this.#pin ? structuredClone(this.#pin) : undefined;
+	}
+
+	/** Deep copy of the pin a new session from this view starts from (the parent's effective values). Read-only. */
+	projectSessionPin(): SessionPresetPin {
+		return structuredClone(this.#parentBaseline());
+	}
+
+	/** Replaces this session view's snapshot with `pin` in full and notifies what changed. Does not record it. */
+	setSessionPin(pin: SessionPresetPin): void {
+		if (!this.#pin) throw new Error("setSessionPin requires a session view");
+		const previous = this.#snapshot();
+		this.#pin = structuredClone(pin);
+		this.#rebuildMerged();
+		this.#fireChangesSince(previous);
+	}
+
+	/**
+	 * Restores a recorded snapshot into this session view. Branch and resume restore it exactly, so an explicit switch
+	 * made in this process survives. `launch` re-applies the root's CLI/env role overrides per key, and only at startup.
+	 */
+	restoreSessionPin(pin: SessionPresetPin, { launch = false }: { launch?: boolean } = {}): void {
+		if (!this.#pin) return;
+		const overrides = launch ? this.#rootSettings().#launchModelRoles : {};
+		this.setSessionPin({ ...pin, modelRoles: { ...pin.modelRoles, ...overrides } });
+	}
+
+	/** Re-pins this session view to what a new session inherits: its parent's effective values. */
+	resetSessionPin(): void {
+		if (!this.#pin) return;
+		this.setSessionPin(this.#parentBaseline());
+	}
+
+	/**
+	 * Saves `pin` and the preset `name` as this project's default for new sessions. The marked project then owns its
+	 * model roles, fallback chains, and thinking level. A session view persists through its parent.
+	 */
+	async persistSessionPresetDefault(name: string, pin: SessionPresetPin): Promise<void> {
+		if (this.#parent) return this.#parent.persistSessionPresetDefault(name, pin);
+		const previous = this.#snapshot();
+		const before = {
+			project: structuredClone(this.#project),
+			paths: new Map(this.#modifiedProjectPaths),
+			roles: new Set(this.#modifiedProjectModelRoles),
+		};
+		this.#writeProjectPaths([
+			[["modelRoles"], pin.modelRoles],
+			[["retry", "fallbackChains"], pin.fallbackChains],
+			[["defaultThinkingLevel"], pin.defaultThinkingLevel],
+			[["modelPresetDefault"], name],
+		]);
+		try {
+			await this.#saveProjectNow();
+		} catch (error) {
+			// Nothing persisted: restore the project layer and pending writes exactly as they were before this call.
+			clearTimeout(this.#projectSaveTimer);
+			this.#projectSaveTimer = undefined;
+			this.#project = before.project;
+			this.#modifiedProjectPaths = before.paths;
+			this.#modifiedProjectModelRoles = before.roles;
+			this.#rebuildMerged();
+			if (before.paths.size > 0 || before.roles.size > 0) this.#queueProjectSave();
+			throw error;
+		}
+		this.#fireChangesSince(previous);
+	}
+
 	/** Re-merges after a parent change and forwards it unless the child's own layers pin the value. */
 	#applyParentChange(setting: AnySetting): void {
 		this.#syncParent();
+		if (this.#pin && pinFieldOf(setting.segments)) return;
 		const own = getByPath(this.#mergeOwnLayers(this.#ownLayers()), setting.segments);
 		if (own !== undefined && (typeof own !== "object" || own === null || Array.isArray(own))) return;
 		this.#notifyChange(setting);
@@ -828,6 +1003,45 @@ export class Settings {
 	#mergedView(): RawSettings {
 		this.#syncParent();
 		return this.#merged;
+	}
+
+	/** This instance's effective model roles, default thinking level, and fallback chains, as a session snapshot. */
+	#pinFromMerged(): SessionPresetPin {
+		const level: unknown = lookupSetting("defaultThinkingLevel")?.get(this);
+		return {
+			modelRoles: this.getModelRoles(),
+			defaultThinkingLevel: typeof level === "string" ? parseConfiguredThinkingLevel(level) : undefined,
+			fallbackChains: { ...(lookupSetting("retry.fallbackChains")?.get(this) as Record<string, string[]> | undefined) },
+		};
+	}
+
+	/** What a session view resets to: its parent's effective values (this instance's own when it has no parent). */
+	#parentBaseline(): SessionPresetPin {
+		return this.#parent ? this.#parent.#pinFromMerged() : this.#pinFromMerged();
+	}
+
+	#rootSettings(): Settings {
+		let root: Settings = this;
+		while (root.#parent) root = root.#parent;
+		return root;
+	}
+
+	/** Whether this root's project layer marks a preset default, which then owns the pinned settings. */
+	#marksProjectDefault(): boolean {
+		return !this.#parent && typeof this.#project.modelPresetDefault === "string";
+	}
+
+	/**
+	 * Applies `mutate` to this session view's snapshot. On change, re-merges and notifies `setting`. Returns whether
+	 * the snapshot changed (false for instances without a snapshot).
+	 */
+	#mutatePin(setting: AnySetting, mutate: (pin: SessionPresetPin) => boolean): boolean {
+		if (!this.#pin) return false;
+		const prev = setting.get(this);
+		if (!mutate(this.#pin)) return false;
+		this.#rebuildMerged();
+		this.#fireIfChanged(setting, prev);
+		return true;
 	}
 
 	/**
@@ -881,6 +1095,7 @@ export class Settings {
 	 */
 	getProvenance(setting: AnySetting): SettingProvenance {
 		if (!this.isConfigured(setting)) return "default";
+		if (this.#pin && pinFieldOf(setting.segments)) return "runtime";
 		const segments = setting.segments;
 		if (getByPath(this.#overrides, segments) !== undefined) return "runtime";
 		if (getByPath(this.#configOverlay, segments) !== undefined) return "overlay";
@@ -899,6 +1114,25 @@ export class Settings {
 	 */
 	writeValue(setting: AnySetting, value: unknown, layer: "global" | "override"): void {
 		setting.assertWritable(value);
+		const field = pinFieldOf(setting.segments);
+		if (this.#pin && layer === "global") {
+			// Global writes persist through the parent; a pinned value also updates this session's snapshot.
+			this.#parent?.writeValue(setting, value, "global");
+			if (field && this.#mutatePin(setting, pin => setPinField(pin, field, value))) this.#onPinWrite?.();
+			return;
+		}
+		if (this.#pin && field) {
+			// A runtime override of a pinned value lives in the snapshot; the next recording write persists it.
+			this.#mutatePin(setting, pin => setPinField(pin, field, value));
+			return;
+		}
+		if (layer === "global" && field && this.#marksProjectDefault()) {
+			const prev = setting.get(this);
+			this.#releaseSoftPin(setting);
+			this.#writeProjectPaths([[setting.segments, value]]);
+			this.#fireIfChanged(setting, prev);
+			return;
+		}
 		if (layer === "override" && setting === cfgModelRoles) {
 			this.#savedRuntimeModelRoleOverrides.clear();
 		}
@@ -924,6 +1158,23 @@ export class Settings {
 	 * the default — supply the value.
 	 */
 	unsetGlobalValue(setting: AnySetting): void {
+		const field = pinFieldOf(setting.segments);
+		if (this.#pin) {
+			// Global changes persist through the parent; a pinned value then takes the parent's current value.
+			this.#parent?.unsetGlobalValue(setting);
+			if (field && this.#mutatePin(setting, pin => setPinField(pin, field, this.#parentBaseline()[field]))) {
+				this.#onPinWrite?.();
+			}
+			return;
+		}
+		if (field && this.#marksProjectDefault()) {
+			if (getByPath(this.#project, setting.segments) === undefined && !this.#softPins.has(setting)) return;
+			const prev = setting.get(this);
+			this.#releaseSoftPin(setting);
+			this.#writeProjectPaths([[setting.segments, undefined]]);
+			this.#fireIfChanged(setting, prev);
+			return;
+		}
 		const current = getByPath(this.#global, setting.segments);
 		if (current === undefined && !this.#softPins.has(setting)) return;
 		const prev = setting.get(this);
@@ -945,6 +1196,22 @@ export class Settings {
 	writeEntry(setting: AnySetting, key: string, value: unknown): void {
 		if (setting.type !== "record") throw new Error(`Setting ${setting.id} is not a record`);
 		if (value !== undefined) setting.assertWritable({ [key]: value });
+		const field = pinFieldOf(setting.segments);
+		if (this.#pin) {
+			// Global entry writes persist through the parent; a pinned record also updates this session's snapshot.
+			this.#parent?.writeEntry(setting, key, value);
+			if (field && field !== "defaultThinkingLevel" && this.#mutatePin(setting, pin => setPinEntry(pin[field], key, value))) {
+				this.#onPinWrite?.();
+			}
+			return;
+		}
+		if (field && this.#marksProjectDefault()) {
+			const prev = setting.get(this);
+			this.#releaseSoftPin(setting);
+			this.#writeProjectPaths([[[...setting.segments, key], value]]);
+			this.#fireIfChanged(setting, prev);
+			return;
+		}
 		const record = getByPath(this.#global, setting.segments);
 		// An entry re-set to its persisted value stages nothing (no config.yml rewrite).
 		const staged =
@@ -972,6 +1239,10 @@ export class Settings {
 	 * @throws Error when `setting` is not a list or the resulting list fails its `items`/`validate` check.
 	 */
 	writeMember(setting: AnySetting, item: string, { member }: { member: boolean }): void {
+		if (this.#pin) {
+			this.#parent?.writeMember(setting, item, { member });
+			return;
+		}
 		if (setting.type !== "array") throw new Error(`Setting ${setting.id} is not a list`);
 		const list = getByPath(this.#global, setting.segments);
 		const base: readonly unknown[] = Array.isArray(list) ? list : (setting.default as readonly unknown[]);
@@ -1033,6 +1304,7 @@ export class Settings {
 
 	/** Registry plumbing behind `Setting.clearOverride`: drops the runtime override of `setting`. */
 	clearOverrideValue(setting: AnySetting): void {
+		if (this.#pin && pinFieldOf(setting.segments)) return;
 		if (setting === cfgModelRoles) {
 			this.#savedRuntimeModelRoleOverrides.clear();
 		}
@@ -1270,9 +1542,11 @@ export class Settings {
 		if (this.#modified.size > 0 || this.#modifiedGlobalModelRoles.size > 0) {
 			await this.#chainSave();
 		}
-		if (this.#modifiedProjectModelRoles.size > 0) {
+		if (this.#modifiedProjectModelRoles.size > 0 || this.#modifiedProjectPaths.size > 0) {
 			await this.#saveProjectNow();
 		}
+		// A session view's global writes persist through its parent, so the flush must await that root too.
+		if (this.#parent) await this.#parent.flush();
 	}
 
 	/**
@@ -1287,6 +1561,7 @@ export class Settings {
 		if (this.#parent) {
 			cloned = (await this.#parent.cloneForCwd(cwd)).overlay();
 			cloned.#project = structuredClone(this.#project);
+			if (this.#pin) cloned.#pin = structuredClone(this.#pin);
 		} else {
 			cloned = new Settings({
 				cwd,
@@ -1299,6 +1574,7 @@ export class Settings {
 			if (!this.#persist) cloned.#projectShellPathSource = this.#projectShellPathSource;
 			cloned.#configFiles = [...this.#configFiles];
 			cloned.#overlayShellPathSource = this.#overlayShellPathSource;
+			cloned.#launchModelRoles = { ...this.#launchModelRoles };
 		}
 		cloned.#global = structuredClone(this.#global);
 		cloned.#configOverlay = structuredClone(this.#configOverlay);
@@ -1479,6 +1755,14 @@ export class Settings {
 	 * `validate` check; the instance then stays on its previous scope.
 	 */
 	async reloadForCwd(cwd: string): Promise<void> {
+		if (this.#parent) {
+			// A session view has no disk layer of its own: rescope the writable root, then re-derive this view from it.
+			// Its pin is left as is, since a rescope does not change what the session switched to.
+			await this.#parent.reloadForCwd(cwd);
+			this.#cwd = this.#parent.#cwd;
+			this.#rebuildMerged();
+			return;
+		}
 		const normalized = path.normalize(cwd);
 		for (let active = this.#activeReload; active; active = this.#activeReload) {
 			await active.promise.catch(() => {});
@@ -1724,6 +2008,23 @@ export class Settings {
 	}
 
 	/**
+	 * Writes project-layer paths (a marked project's preset-owned values) and queues them for the project file.
+	 * Callers notify change listeners for what they touched.
+	 */
+	#writeProjectPaths(writes: readonly (readonly [readonly string[], unknown])[]): void {
+		const project = structuredClone(this.#project);
+		for (const [segments, value] of writes) {
+			if (value === undefined) deleteByPath(project, segments);
+			else setByPath(project, segments, structuredClone(value));
+			this.#modifiedProjectPaths.set(JSON.stringify(segments), [...segments]);
+		}
+		this.#project = project;
+		this.#persistedMutationGeneration++;
+		this.#rebuildMerged();
+		this.#queueProjectSave();
+	}
+
+	/**
 	 * Set a model role (helper for modelRoles record). Passing `undefined`
 	 * clears the role from the persisted record and any runtime override.
 	 *
@@ -1738,10 +2039,19 @@ export class Settings {
 	 * stale skip in place.
 	 */
 	setModelRole(role: ModelRole | string, modelId: string | undefined): void {
+		if (this.#pin) {
+			this.#parent?.setModelRole(role, modelId);
+			if (this.#mutatePin(cfgModelRoles, pin => setPinEntry(pin.modelRoles, role, modelId))) {
+				this.#onPinWrite?.();
+			}
+			return;
+		}
 		const prev = cfgModelRoles.get(this);
 		// Re-setting the persisted role (or clearing an absent one) stages no config.yml rewrite;
 		// the runtime-override sync below still applies.
-		if (!this.#globalWriteIsNoop(["modelRoles", role], modelId)) {
+		if (this.#marksProjectDefault()) {
+			this.#writeProjectPaths([[["modelRoles", role], modelId]]);
+		} else if (!this.#globalWriteIsNoop(["modelRoles", role], modelId)) {
 			const current = this.#modelRolesFromLayer(this.#global);
 			this.#captureGlobalMutation(role, this.#modifiedGlobalModelRoleMutations, current[role]);
 			if (modelId === undefined) {
@@ -1783,6 +2093,13 @@ export class Settings {
 	 * Set a model role in the current project's settings layer.
 	 */
 	setProjectModelRole(role: ModelRole | string, modelId: string): void {
+		if (this.#pin) {
+			this.#parent?.setProjectModelRole(role, modelId);
+			if (this.#mutatePin(cfgModelRoles, pin => setPinEntry(pin.modelRoles, role, modelId))) {
+				this.#onPinWrite?.();
+			}
+			return;
+		}
 		this.#setProjectModelRoleValue(role, modelId);
 		this.#captureRuntimeModelRoleOverride(role);
 		this.#updateRuntimeModelRoleOverride(role, modelId);
@@ -1791,6 +2108,14 @@ export class Settings {
 	 * Clear a model role from the current project's settings layer.
 	 */
 	clearProjectModelRole(role: ModelRole | string): void {
+		if (this.#pin) {
+			this.#parent?.clearProjectModelRole(role);
+			const baseline = this.#parentBaseline().modelRoles[role];
+			if (this.#mutatePin(cfgModelRoles, pin => setPinEntry(pin.modelRoles, role, baseline))) {
+				this.#onPinWrite?.();
+			}
+			return;
+		}
 		this.#setProjectModelRoleValue(role, null);
 		this.#captureRuntimeModelRoleOverride(role);
 		this.#updateRuntimeModelRoleOverride(role, undefined);
@@ -1808,6 +2133,7 @@ export class Settings {
 	 * Get a model role from only the global settings layer (an {@link overlay}'s own, else its parent's).
 	 */
 	getGlobalModelRole(role: ModelRole | string): string | undefined {
+		if (this.#marksProjectDefault()) return undefined;
 		const modelId = this.#modelRolesFromLayer(this.#global)[role];
 		return modelId || this.#parent?.getGlobalModelRole(role);
 	}
@@ -1832,10 +2158,11 @@ export class Settings {
 	 * tombstone.
 	 */
 	getModelRoleProvenance(role: ModelRole | string): SettingProvenance {
+		if (this.#pin) return Object.hasOwn(this.#pin.modelRoles, role) ? "runtime" : "default";
 		if (this.#modelRoleLayerOwns(this.#overrides, role)) return "runtime";
 		if (this.#modelRoleLayerOwns(this.#configOverlay, role)) return "overlay";
 		if (this.#modelRoleLayerOwns(projectLayerForMerge(this.#project), role)) return "project";
-		if (this.#modelRoleLayerOwns(this.#global, role)) return "global";
+		if (!this.#marksProjectDefault() && this.#modelRoleLayerOwns(this.#global, role)) return "global";
 		return this.#parent?.getModelRoleProvenance(role) ?? "default";
 	}
 
@@ -1881,7 +2208,7 @@ export class Settings {
 	/**
 	 * Get all model roles (helper for modelRoles record).
 	 */
-	getModelRoles(): ReadOnlyDict<string> {
+	getModelRoles(): Readonly<Record<string, string>> {
 		const roles: unknown = cfgModelRoles.get(this);
 		if (!isRecord(roles)) return {};
 
@@ -1900,6 +2227,21 @@ export class Settings {
 	 * Override model roles (helper for modelRoles record).
 	 */
 	overrideModelRoles(roles: ReadOnlyDict<string>): void {
+		if (this.#pin) {
+			this.#mutatePin(cfgModelRoles, pin => {
+				let changed = false;
+				for (const [role, modelId] of Object.entries(roles)) {
+					if (modelId && setPinEntry(pin.modelRoles, role, modelId)) changed = true;
+				}
+				return changed;
+			});
+			return;
+		}
+		if (!this.#parent) {
+			for (const [role, modelId] of Object.entries(roles)) {
+				if (modelId) this.#launchModelRoles[role] = modelId;
+			}
+		}
 		const next = this.#modelRolesFromLayer(this.#overrides);
 		for (const [role, modelId] of Object.entries(roles)) {
 			if (modelId) {
@@ -3813,11 +4155,19 @@ export class Settings {
 		}
 	}
 
-	/** Re-applies every project model role still pending a save onto `target`, a project layer read from disk. */
+	/**
+	 * Re-applies every project write still pending a save (model roles and preset-default paths) onto `target`,
+	 * a project layer read from disk.
+	 */
 	#applyPendingProjectWrites(target: RawSettings): void {
 		const liveRoles = getByPath(this.#project, ["modelRoles"]);
 		for (const role of this.#modifiedProjectModelRoles) {
 			setByPath(target, ["modelRoles", role], isRecord(liveRoles) ? liveRoles[role] : undefined);
+		}
+		for (const segments of this.#modifiedProjectPaths.values()) {
+			const value = getByPath(this.#project, segments);
+			if (value === undefined) deleteByPath(target, segments);
+			else setByPath(target, segments, structuredClone(value));
 		}
 	}
 
@@ -3842,11 +4192,14 @@ export class Settings {
 	}
 
 	async #saveProjectNow(): Promise<void> {
-		if (this.#savesCancelled || !this.#persist || this.#modifiedProjectModelRoles.size === 0) return;
+		if (this.#savesCancelled || !this.#persist) return;
+		if (this.#modifiedProjectModelRoles.size === 0 && this.#modifiedProjectPaths.size === 0) return;
 
 		const projectConfigPath = path.join(getProjectAgentDir(this.#cwd), "config.yml");
 		const modifiedModelRoles = [...this.#modifiedProjectModelRoles];
+		const modifiedPaths = [...this.#modifiedProjectPaths.values()];
 		this.#modifiedProjectModelRoles.clear();
+		this.#modifiedProjectPaths.clear();
 
 		try {
 			await fs.promises.mkdir(path.dirname(projectConfigPath), { recursive: true });
@@ -3861,6 +4214,11 @@ export class Settings {
 					const value = isRecord(projectRoles) ? projectRoles[role] : undefined;
 					setByPath(projectSettings, ["modelRoles", role], value);
 				}
+				for (const segments of modifiedPaths) {
+					const value = getByPath(this.#project, segments);
+					if (value === undefined) deleteByPath(projectSettings, segments);
+					else setByPath(projectSettings, segments, structuredClone(value));
+				}
 
 				await this.#writeYamlAtomically(writePath, stringifyYamlConfig(projectSettings));
 				this.#projectFileSettings = structuredClone(projectSettings);
@@ -3870,6 +4228,9 @@ export class Settings {
 		} catch (error) {
 			for (const role of modifiedModelRoles) {
 				this.#modifiedProjectModelRoles.add(role);
+			}
+			for (const segments of modifiedPaths) {
+				this.#modifiedProjectPaths.set(JSON.stringify(segments), segments);
 			}
 			throw error;
 		}
@@ -3896,16 +4257,25 @@ export class Settings {
 		};
 	}
 
-	/** `layers` (global, project, `--config` overlay, runtime) merged in precedence order. */
+	/**
+	 * `layers` (global, project, `--config` overlay, runtime) merged in precedence order. A project that marks
+	 * a preset default owns its model roles and fallback chains, so the global layer's are left out.
+	 */
 	#mergeOwnLayers(layers: OwnLayers): RawSettings {
-		let merged = this.#deepMerge(this.#deepMerge({}, layers.global), projectLayerForMerge(layers.project));
+		const global = typeof layers.project.modelPresetDefault === "string" ? withoutPresetDefaultKeys(layers.global) : layers.global;
+		let merged = this.#deepMerge(this.#deepMerge({}, global), projectLayerForMerge(layers.project));
 		merged = this.#deepMerge(merged, layers.configOverlay);
 		return this.#deepMerge(merged, layers.overrides);
 	}
 
-	/** `own` merged over an overlay parent's current view (itself for a root instance). */
+	/**
+	 * `own` merged over an overlay parent's current view (itself for a root instance). A session view then
+	 * takes its pinned keys from the snapshot instead of the parent.
+	 */
 	#mergeOverParent(own: RawSettings): RawSettings {
-		return this.#parent ? this.#deepMerge(this.#parent.#mergedView(), own) : own;
+		if (!this.#parent) return own;
+		const merged = this.#deepMerge(this.#parent.#mergedView(), own);
+		return this.#pin ? applySessionPin(merged, this.#pin) : merged;
 	}
 
 	/**

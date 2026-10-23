@@ -6,6 +6,16 @@ import { getMemoriesDir, logger, withLoopPhase } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 
 import {
+	limitBankName,
+	PROJECT_IDENTITY_METADATA_KEY,
+	projectIdentityBankSegment,
+	resolveProjectIdentity,
+	resolveProjectRepoRoot,
+	sanitizeBankName,
+	type ProjectIdentity,
+} from "./project-identity";
+
+import {
 	cfgMnemopiAutoRecall,
 	cfgMnemopiAutoRetain,
 	cfgMnemopiBank,
@@ -16,6 +26,7 @@ import {
 	cfgMnemopiEmbeddingModel,
 	cfgMnemopiEmbeddingVariant,
 	cfgMnemopiEnhancedRecall,
+	cfgMnemopiExperienceEnabled,
 	cfgMnemopiInjectionTokenLimit,
 	cfgMnemopiLlmApiKey,
 	cfgMnemopiLlmBaseUrl,
@@ -48,8 +59,15 @@ export interface MnemopiBackendConfig {
 	retainBank?: string;
 	recallBanks?: readonly string[];
 	scoping?: MnemopiScoping;
+	/** Legacy first-turn transcript recall switch; semantics unchanged, value from settings. */
 	autoRecall: boolean;
 	autoRetain: boolean;
+	/** Experience-memory switch: assignment recall + verified lesson capture, independent of autoRecall/autoRetain. */
+	experienceEnabled: boolean;
+	/** Logical project identity for the session cwd (clone/worktree stable; see project-identity.ts). */
+	projectIdentity: ProjectIdentity;
+	/** Root for repo-relative lesson fingerprints: git worktree root, else canonical cwd. */
+	repoRoot: string;
 	polyphonicRecall: boolean;
 	enhancedRecall: boolean;
 	proactiveLinking: boolean;
@@ -73,7 +91,12 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 	const dbPath = configuredDbPath?.trim()
 		? configuredDbPath
 		: path.join(getMemoriesDir(agentDir), "mnemopi", "mnemopi.db");
-	const scope = computeMnemopiBankScope(cfgMnemopiBank.get(settings), cwd, scoping);
+	const projectIdentity = resolveProjectIdentity(cwd);
+	const repoRoot = resolveProjectRepoRoot(cwd);
+	const scope = computeMnemopiBankScope(cfgMnemopiBank.get(settings), cwd, scoping, {
+		identity: projectIdentity,
+		dbPath,
+	});
 	const recallBanks =
 		scoping === "global" ? scope.recallBanks : extendRecallWithLegacyBanks(scope.recallBanks, dbPath, cwd);
 	const llmMode = cfgMnemopiLlmMode.get(settings);
@@ -94,6 +117,9 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		recallBanks,
 		scoping,
 		autoRecall: cfgMnemopiAutoRecall.get(settings),
+		experienceEnabled: cfgMnemopiExperienceEnabled.get(settings),
+		projectIdentity,
+		repoRoot,
 		autoRetain: cfgMnemopiAutoRetain.get(settings),
 		polyphonicRecall: cfgMnemopiPolyphonicRecall.get(settings),
 		enhancedRecall: cfgMnemopiEnhancedRecall.get(settings),
@@ -152,8 +178,9 @@ export function computeMnemopiBankScope(
 	configured: string | undefined,
 	cwd: string,
 	scoping: MnemopiScoping,
+	options?: ProjectBankScopeOptions,
 ): MnemopiBankScope {
-	const project = projectBank(configured, cwd);
+	const project = projectBank(configured, cwd, options);
 	const globalBank = sharedBank(configured);
 	switch (scoping) {
 		case "global":
@@ -187,27 +214,145 @@ function sharedBank(configured: string | undefined): string {
 	return sanitizeBankName(configured) ?? DEFAULT_SHARED_BANK;
 }
 
-/**
- * Derive the per-project bank id from `cwd` alone.
- *
- * Earlier versions resolved the enclosing git root before hashing, which
- * made the bank id unstable: removing or adding a `.git` anywhere above the
- * cwd repointed the same conversation directory to a different bank and
- * fragmented memories (#2412). The git lookup is gone here; the rescue path
- * for already-fragmented installs lives in {@link extendRecallWithLegacyBanks}.
- */
-function projectBank(configured: string | undefined, cwd: string): string {
-	const projectRoot = path.resolve(cwd || ".");
-	const project = projectBankSegment(projectRoot);
-	const base = sanitizeBankName(configured);
-	return limitBankName(base ? `${base}-${project}` : project);
+/** Identity + storage inputs for {@link computeMnemopiBankScope}. */
+export interface ProjectBankScopeOptions {
+	/** Pre-resolved logical identity; derived from cwd when omitted. */
+	identity?: ProjectIdentity;
+	/** Mnemopi db path; activates the primary-bank registry under `<dbDir>/project-banks.json`. */
+	dbPath?: string;
 }
 
 /**
- * Stable project-identity segment derived from an absolute project root:
- * `<sanitized-basename>-<Bun.hash(projectRoot).toString(36)>`, clamped to the
- * bank-name limit. Shared by mnemopi bank scoping and the sharpshooter
- * project store so both subsystems key the same directory identically.
+ * Per-project bank id from the canonical logical-project identity (see project-identity.ts):
+ * clones sharing a normalized remote and linked worktrees resolve to the same bank.
+ *
+ * `options.dbPath` activates the deterministic primary-bank registry, which preserves
+ * pre-existing banks as the primary write target — no migration, no duplicate silo.
+ * The first resolution for an identity registers the existing bank (the legacy
+ * cwd-keyed bank for this exact cwd when one exists on disk, otherwise the
+ * identity-named bank), and every later clone or worktree of the same logical
+ * project resolves to that registered primary. All resolvers compute the same
+ * value from stable on-disk state, so concurrent writers store the same mapping.
+ */
+function projectBank(configured: string | undefined, cwd: string, options?: ProjectBankScopeOptions): string {
+	const identity = options?.identity ?? resolveProjectIdentity(cwd);
+	const base = sanitizeBankName(configured);
+	const segment = projectIdentityBankSegment(identity);
+	const identityBank = limitBankName(base ? `${base}-${segment}` : segment);
+	if (options?.dbPath === undefined) return identityBank;
+	return resolvePrimaryProjectBank(options.dbPath, identity.key, {
+		identityBank,
+		legacyBank: legacyCwdBank(base, cwd),
+	});
+}
+
+/** Pre-identity naming: the cwd-hash segment `projectBankSegment(path.resolve(cwd))`. */
+function legacyCwdBank(base: string | undefined, cwd: string): string {
+	const segment = projectBankSegment(path.resolve(cwd || "."));
+	return limitBankName(base ? `${base}-${segment}` : segment);
+}
+
+/** Registry cap: entries beyond this are dropped (oldest first) on rewrite. */
+const PROJECT_BANK_REGISTRY_LIMIT = 512;
+
+function projectBankRegistryPath(dbPath: string): string {
+	return path.join(path.dirname(dbPath), "project-banks.json");
+}
+
+interface ProjectBankRegistryEntry {
+	bank: string;
+	/** Directory whose legacy bank became the primary; the identity bank otherwise. */
+	primaryFrom: string;
+}
+
+type ProjectBankRegistryFile = Record<string, ProjectBankRegistryEntry>;
+
+/**
+ * Deterministic, concurrency-safe primary-bank resolution: identity key → primary bank in
+ * `<dbDir>/project-banks.json`. Deterministic order: a registered bank wins; else the legacy
+ * cwd-keyed bank when it exists on disk (backward primary-bank preservation — cleaned banks
+ * keep receiving writes); else the identity-named bank. Concurrent resolvers compute the
+ * same value from stable on-disk state, so last-writer-wins writes store the same mapping
+ * and the atomic tmp+rename write never interleaves. Any I/O error falls back to the
+ * deterministic identity bank.
+ */
+function resolvePrimaryProjectBank(
+	dbPath: string,
+	identityKey: string,
+	candidates: { identityBank: string; legacyBank: string },
+): string {
+	const registryPath = projectBankRegistryPath(dbPath);
+	let registry: ProjectBankRegistryFile;
+	try {
+		registry = readProjectBankRegistry(registryPath);
+	} catch {
+		return candidates.identityBank;
+	}
+	const registered = registry[identityKey];
+	if (typeof registered?.bank === "string" && registered.bank.length > 0) {
+		return limitBankName(registered.bank);
+	}
+	const preserveLegacy =
+		candidates.legacyBank !== candidates.identityBank && bankFileExists(dbPath, candidates.legacyBank);
+	const primary = preserveLegacy ? limitBankName(candidates.legacyBank) : candidates.identityBank;
+	if (preserveLegacy || bankFileExists(dbPath, candidates.identityBank)) {
+		writeProjectBankRegistry(registryPath, {
+			...registry,
+			[identityKey]: { bank: primary, primaryFrom: bankDbPath(dbPath, primary) },
+		});
+	}
+	return primary;
+}
+
+/** A per-project bank lives at `<dbDir>/banks/<bank>/mnemopi.db`; the shared bank is `dbPath` itself. */
+function bankDbPath(dbPath: string, bank: string): string {
+	return bank === DEFAULT_SHARED_BANK ? dbPath : path.join(path.dirname(dbPath), "banks", bank, "mnemopi.db");
+}
+
+function bankFileExists(dbPath: string, bank: string): boolean {
+	try {
+		return fs.statSync(bankDbPath(dbPath, bank)).isFile();
+	} catch {
+		return false;
+	}
+}
+
+function readProjectBankRegistry(registryPath: string): ProjectBankRegistryFile {
+	if (!fs.existsSync(registryPath)) return {};
+	const parsed: unknown = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+	const out: ProjectBankRegistryFile = {};
+	for (const [key, entry] of Object.entries(parsed as Record<string, unknown>)) {
+		if (typeof entry !== "object" || entry === null) continue;
+		const { bank, primaryFrom }: Partial<Record<keyof ProjectBankRegistryEntry, unknown>> = entry;
+		if (typeof bank !== "string" || bank.length === 0) continue;
+		out[key] = {
+			bank,
+			primaryFrom: typeof primaryFrom === "string" ? primaryFrom : "",
+		};
+	}
+	return out;
+}
+
+function writeProjectBankRegistry(registryPath: string, registry: ProjectBankRegistryFile): void {
+	try {
+		const entries = Object.entries(registry);
+		const bounded =
+			entries.length > PROJECT_BANK_REGISTRY_LIMIT
+				? Object.fromEntries(entries.slice(entries.length - PROJECT_BANK_REGISTRY_LIMIT))
+				: registry;
+		const tmp = `${registryPath}.tmp-${process.pid}-${Date.now()}`;
+		fs.mkdirSync(path.dirname(registryPath), { recursive: true });
+		fs.writeFileSync(tmp, `${JSON.stringify(bounded, null, 2)}\n`);
+		fs.renameSync(tmp, registryPath);
+	} catch (error) {
+		logger.debug("Mnemopi: project-bank registry write failed", { registryPath, error: String(error) });
+	}
+}
+
+/**
+ * Path-keyed segment for the sharpshooter project store: `<sanitized-basename>-<Bun.hash(projectRoot)>`.
+ * Mnemopi banks do not use this; they key on the logical identity in project-identity.ts.
  */
 export function projectBankSegment(projectRoot: string): string {
 	const project = sanitizeBankName(path.basename(projectRoot)) ?? "default";
@@ -215,15 +360,12 @@ export function projectBankSegment(projectRoot: string): string {
 }
 
 /**
- * Discover sibling banks under `<dbDir>/banks/` whose `working_memory` rows
- * all carry the active `cwd` in `metadata_json.$.cwd`, and add those safe
- * single-cwd banks to the recall set. This rescues memories stranded by a
- * previous, less-stable bank derivation (#2412) without recalling mixed-cwd
- * legacy banks wholesale under per-project isolation.
+ * Discover sibling banks under `<dbDir>/banks/` whose rows verifiably belong to the active logical
+ * project (see {@link bankBelongsToProject}) and add them to the recall set. Banks are matched by row
+ * metadata, never by name, so unrelated projects are never combined.
  *
- * Robust by design: a missing banks directory, unreadable bank dir, or
- * corrupt SQLite file is silently skipped. Scanning is capped at
- * {@link LEGACY_BANK_SCAN_LIMIT} to bound startup cost.
+ * Robust by design: a missing banks directory, unreadable bank dir, or corrupt SQLite file is
+ * silently skipped. Scanning is capped at {@link LEGACY_BANK_SCAN_LIMIT} to bound startup cost.
  */
 export function extendRecallWithLegacyBanks(
 	resolved: readonly string[],
@@ -232,13 +374,22 @@ export function extendRecallWithLegacyBanks(
 ): readonly string[] {
 	return withLoopPhase("mnemopi.open", () => {
 		const banksDir = path.join(path.dirname(dbPath), "banks");
-		const cwdAbs = path.resolve(cwd || ".");
+		const activeKey = resolveProjectIdentity(cwd).key;
 		let entries: fs.Dirent[];
 		try {
 			entries = fs.readdirSync(banksDir, { withFileTypes: true });
 		} catch {
 			return resolved;
 		}
+		const keyByCwd = new Map<string, string>();
+		const keyOfCwd = (dir: string): string => {
+			let key = keyByCwd.get(dir);
+			if (key === undefined) {
+				key = resolveProjectIdentity(dir).key;
+				keyByCwd.set(dir, key);
+			}
+			return key;
+		};
 		const have = new Set(resolved);
 		const extras: string[] = [];
 		let scanned = 0;
@@ -247,27 +398,36 @@ export function extendRecallWithLegacyBanks(
 			if (scanned >= LEGACY_BANK_SCAN_LIMIT) break;
 			scanned++;
 			const candidate = path.join(banksDir, entry.name, "mnemopi.db");
-			if (bankOnlyHasCwd(candidate, cwdAbs)) extras.push(entry.name);
+			if (bankBelongsToProject(candidate, activeKey, keyOfCwd)) extras.push(entry.name);
 		}
 		return extras.length === 0 ? resolved : [...resolved, ...extras];
 	});
 }
 
-function bankOnlyHasCwd(dbPath: string, cwd: string): boolean {
+/** Maximum distinct (project_identity, cwd) groups a legacy bank may hold and still be verified. */
+const MAX_LEGACY_IDENTITY_GROUPS = 32;
+
+/**
+ * A legacy bank belongs to the active project only when every distinct row group verifies for it:
+ * rows carrying `project_identity` must equal the active key, and rows without it must have a `cwd`
+ * whose identity resolves to the active key. Empty banks and any unverifiable group reject the bank.
+ */
+function bankBelongsToProject(dbPath: string, activeKey: string, keyOfCwd: (cwd: string) => string): boolean {
 	let db: Database | undefined;
 	try {
 		db = new Database(dbPath, { readonly: true });
-		// "Safe" = no row with a different/missing cwd AND at least one matching row. Both probes stop at
-		// the first hit, and CASE skips the matching probe once an unsafe row disqualifies the bank.
-		const row = db
-			.prepare<{ safe: number }, [string]>(`
-				SELECT CASE
-					WHEN EXISTS(SELECT 1 FROM working_memory WHERE json_extract(metadata_json, '$.cwd') IS NOT ?1) THEN 0
-					ELSE EXISTS(SELECT 1 FROM working_memory WHERE json_extract(metadata_json, '$.cwd') = ?1)
-				END AS safe
+		const rows = db
+			.prepare<{ pid: unknown; cwd: unknown }, [string, string, number]>(`
+				SELECT DISTINCT json_extract(metadata_json, ?1) AS pid, json_extract(metadata_json, ?2) AS cwd
+				FROM working_memory
+				LIMIT ?3
 			`)
-			.get(cwd);
-		return row?.safe === 1;
+			.all(`$.${PROJECT_IDENTITY_METADATA_KEY}`, "$.cwd", MAX_LEGACY_IDENTITY_GROUPS + 1);
+		if (rows.length === 0 || rows.length > MAX_LEGACY_IDENTITY_GROUPS) return false;
+		return rows.every(row => {
+			if (typeof row.pid === "string") return row.pid === activeKey;
+			return typeof row.cwd === "string" && keyOfCwd(row.cwd) === activeKey;
+		});
 	} catch (error) {
 		logger.debug("Mnemopi: legacy bank probe failed", { dbPath, error: String(error) });
 		return false;
@@ -278,21 +438,6 @@ function bankOnlyHasCwd(dbPath: string, cwd: string): boolean {
 			// nothing to do — read-only handle.
 		}
 	}
-}
-
-function sanitizeBankName(value: string | undefined): string | undefined {
-	const raw = value?.trim();
-	if (!raw) return undefined;
-	const sanitized = raw.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
-	return sanitized ? limitBankName(sanitized) : undefined;
-}
-
-function limitBankName(name: string): string {
-	if (name.length <= 64) return name;
-	const hash = Bun.hash(name).toString(36);
-	const prefixLength = Math.max(1, 63 - hash.length);
-	const prefix = name.slice(0, prefixLength).replace(/-+$/g, "") || "bank";
-	return `${prefix}-${hash}`;
 }
 
 export function truncateApproxTokens(text: string, tokenLimit: number): string {

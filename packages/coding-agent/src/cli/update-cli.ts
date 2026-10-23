@@ -1054,7 +1054,7 @@ async function pruneBunCacheAfterGlobalInstall(): Promise<BunInstallCachePruneRe
 /**
  * Resolve the path that `omp` maps to in the user's PATH.
  */
-function resolveOmpPath(): string | undefined {
+export function resolveOmpPath(): string | undefined {
 	return $which(APP_NAME) ?? undefined;
 }
 

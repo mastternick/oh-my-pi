@@ -53,6 +53,11 @@ import {
 	signalListLabel,
 } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { isDsmlLeakRecoveryTarget, removeDsmlToolMarkupLeak } from "@oh-my-pi/pi-ai/utils/dsml-leak";
+import {
+	type UnresolvedToolLoopDetection,
+	type UnresolvedToolTurn,
+	ToolCallLoopGuard,
+} from "@oh-my-pi/pi-ai/utils/tool-call-loop-guard";
 import { cloneJsonTree, logger, sanitizeText, structuredCloneJSON } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { LiveSteeringChannel } from "./live-steering";
@@ -795,6 +800,35 @@ function createGateStopMessage(model: Model, reason: string | undefined): Assist
 	};
 }
 
+function createUnresolvedToolStopMessage(
+	message: AssistantMessage,
+	detection: UnresolvedToolLoopDetection,
+): AssistantMessage {
+	const names = [...new Set(detection.toolNames)].join(", ");
+	return {
+		role: "assistant",
+		content: [
+			{
+				type: "text",
+				text: `Stopped after ${detection.count} consecutive tool turns in which every call named an unregistered tool (${names}). The run ended without further model calls.`,
+			},
+		],
+		api: message.api,
+		provider: message.provider,
+		model: message.model,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "aborted",
+		timestamp: Date.now(),
+	};
+}
+
 /**
  * Detailed-result handle returned by {@link agentLoopDetailed}. Adds the
  * run-level telemetry/coverage rollup to the existing `AgentMessage[]`
@@ -1206,6 +1240,8 @@ async function runLoopBody(
 
 	const softRequirementState = config.softToolRequirementState ?? { escalations: 0 };
 	let preserveSoftRequirementState = false;
+	// Per run; fixed bound, so identical-call settings cannot disable it. Threshold is unused by recordUnresolvedTurn.
+	const unresolvedToolLoop = new ToolCallLoopGuard({ threshold: 3, exemptTools: [] });
 
 	let pendingMessages: AgentMessage[] = [];
 	// Steering the provider took from the queue during the last response:
@@ -1606,6 +1642,7 @@ async function runLoopBody(
 
 				const toolResults: ToolResultMessage[] = [];
 				const additionalMessages: AgentMessage[] = [];
+				let runnableTurn: UnresolvedToolTurn | undefined;
 				if (softNonCompliant && softRequiredTool !== undefined) {
 					SpeculativeOperationCoordinator.discardForMessage(message, "soft tool requirement deferred execution");
 					if (softRequirementState.escalations >= MAX_SOFT_TOOL_ESCALATIONS) {
@@ -1650,6 +1687,7 @@ async function runLoopBody(
 						[...liveAccepted, ...liveDeferred],
 					);
 					toolResults.push(...executionResult.toolResults);
+					runnableTurn = { toolCalls, unresolvedToolCallIds: executionResult.unresolvedToolCallIds };
 
 					for (const result of toolResults) {
 						currentContext.messages.push(result);
@@ -1694,6 +1732,12 @@ async function runLoopBody(
 					hasMoreToolCalls = false;
 				}
 
+				// Only an executed batch whose every call failed registry lookup counts; any other turn resets.
+				const unresolvedStop = unresolvedToolLoop.recordUnresolvedTurn(runnableTurn);
+				if (unresolvedStop) {
+					hasMoreToolCalls = false;
+				}
+
 				if (toolCalls.length > 0) {
 					pausedTurnContinuations = 0;
 					dsmlLeakNudges = 0;
@@ -1731,11 +1775,31 @@ async function runLoopBody(
 					hasMoreToolCalls = true;
 				}
 
-				await emitTurnEnd(stream, currentContext, message, toolResults, config, signal, {
-					additionalMessages,
-					willContinue: hasMoreToolCalls && !isDeadlineExceeded(config.deadline),
-				});
+				if (unresolvedStop) {
+					// Terminal turn: publish turn_end without onTurnEnd, so no advisor, guard, or steering hook
+					// can requeue the run.
+					stream.push({ type: "turn_end", message, toolResults });
+				} else {
+					await emitTurnEnd(stream, currentContext, message, toolResults, config, signal, {
+						additionalMessages,
+						willContinue: hasMoreToolCalls && !isDeadlineExceeded(config.deadline),
+					});
+				}
 				turnOpen = false;
+				if (unresolvedStop) {
+					// Visible terminal turn: non-empty text and no error fields, so it is neither
+					// reasonless-retried nor dropped from history, and no provider call follows.
+					stream.push({ type: "turn_start" });
+					const stopMessage = createUnresolvedToolStopMessage(message, unresolvedStop);
+					currentContext.messages.push(stopMessage);
+					newMessages.push(stopMessage);
+					stream.push({ type: "message_start", message: stopMessage });
+					stream.push({ type: "message_end", message: stopMessage });
+					await emitTurnEnd(stream, currentContext, stopMessage, [], config, signal, { willContinue: false });
+					preserveSoftRequirementState = !signal?.aborted;
+					endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+					return;
+				}
 
 				if (isDeadlineExceeded(config.deadline)) {
 					endAgentStream(stream, newMessages, telemetry, stepCounter.count);
@@ -2887,6 +2951,9 @@ function suggestToolNames(
 	return matches;
 }
 
+/** Cap on tool names listed in a not-found error; the remainder is summarized by count. */
+const MAX_LISTED_TOOL_NAMES = 40;
+
 /**
  * `Tool <name> not found`, plus a suggestion when the session holds a plausible
  * intended target. Exact wording is not a contract; the model reads it.
@@ -2897,9 +2964,16 @@ function formatToolNotFoundMessage(
 	fallbackNames?: Iterable<string>,
 ): string {
 	const suggestions = suggestToolNames(name, tools, fallbackNames);
-	if (suggestions.length === 0) return `Tool ${name} not found`;
-	if (suggestions.length === 1) return `Tool ${name} not found. Did you mean ${suggestions[0]}?`;
-	return `Tool ${name} not found. Closest available: ${suggestions.slice(0, MAX_TOOL_NAME_SUGGESTIONS).join(", ")}`;
+	const offered = (tools ?? []).map(tool => tool.customWireName ?? tool.name);
+	const listed = offered.slice(0, MAX_LISTED_TOOL_NAMES);
+	const omitted = offered.length - listed.length;
+	const inRun =
+		offered.length === 0
+			? "This run has no tools."
+			: `Tools in this run: ${listed.join(", ")}${omitted > 0 ? `, and ${omitted} more` : ""}.`;
+	if (suggestions.length === 0) return `Tool ${name} not found. ${inRun}`;
+	if (suggestions.length === 1) return `Tool ${name} not found. Did you mean ${suggestions[0]}? ${inRun}`;
+	return `Tool ${name} not found. Closest match: ${suggestions.slice(0, MAX_TOOL_NAME_SUGGESTIONS).join(", ")}. ${inRun}`;
 }
 
 /**
@@ -3198,7 +3272,11 @@ async function executeToolCalls(
 	// Steering the provider took off the queue during the response that emitted
 	// this batch; it injects at this batch's boundary like queued steering.
 	liveSteering: readonly AgentMessage[],
-): Promise<{ toolResults: ToolResultMessage[]; additionalContext?: string }> {
+): Promise<{
+	toolResults: ToolResultMessage[];
+	additionalContext?: string;
+	unresolvedToolCallIds: ReadonlySet<string> | undefined;
+}> {
 	const tools = currentContext.tools;
 	const {
 		hasSteeringMessages,
@@ -3818,6 +3896,15 @@ async function executeToolCalls(
 	}
 	await speculationCoordinator?.discardAll("candidate was not dispatched");
 
+	// Only a real registry miss counts: the call got an error result and was neither skipped nor blocked.
+	let unresolvedToolCallIds: Set<string> | undefined;
+	for (const record of records) {
+		if (record.tool === undefined && record.toolResultMessage !== undefined && !record.skipped && !record.blocked) {
+			unresolvedToolCallIds ??= new Set<string>();
+			unresolvedToolCallIds.add(record.toolCall.id);
+		}
+	}
+
 	// Skipped calls never ran. Hook-prepared context also requires a non-error
 	// final result; context the tool itself reported during execution stands.
 	// Within a call, tool-reported context (including nested `xd://` dispatch)
@@ -3834,6 +3921,7 @@ async function executeToolCalls(
 	return {
 		toolResults: emittedToolResults,
 		...(additionalContext !== undefined ? { additionalContext } : {}),
+		unresolvedToolCallIds,
 	};
 }
 

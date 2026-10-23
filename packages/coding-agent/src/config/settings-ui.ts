@@ -1,7 +1,7 @@
 import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { isNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { SETTING_TABS, type SettingsDisplayEntry, type SettingsHost } from "@oh-my-pi/pi-tui/overlays/settings-defs";
-import { isSettingsInitialized, Settings, settings } from "./settings";
+import { isSettingsInitialized, type Settings, settings } from "./settings";
 import { orderedSettings } from "./all-settings";
 import { type AnySetting, lookup } from "./registry";
 
@@ -18,12 +18,12 @@ import { cfgTuiVimMode } from "../modes/settings";
 import { cfgAdvisorEnabled } from "../advisor/settings";
 import { cfgContextFilesExtra } from "../session/context-settings";
 
-/** Condition over the global settings; hidden (false) until they are initialized. */
-function whenSettings(test: (settings: Settings) => boolean): () => boolean {
-	return () => isSettingsInitialized() && test(Settings.instance);
+/** Condition over the session's settings view; hidden (false) until the global settings are initialized. */
+function whenSettings(test: (settings: Settings) => boolean): (view: Settings) => boolean {
+	return view => isSettingsInitialized() && test(view);
 }
 
-const CONDITIONS: Record<string, () => boolean> = {
+const CONDITIONS: Record<string, (view: Settings) => boolean> = {
 	macOS: () => process.platform === "darwin",
 	hasImageProtocol: () => !!TERMINAL.imageProtocol,
 	nativeRendering: () => isNativeRendering(),
@@ -53,13 +53,14 @@ function envNote(setting: AnySetting): string {
  * edits the value of the settings layers, never an environment-supplied one (so an env credential
  * is never pre-filled or written to config); descriptions note an active environment variable.
  */
-export function createSettingsHost(): SettingsHost {
+export function createSettingsHost(view: Settings): SettingsHost {
 	const entries: SettingsDisplayEntry[] = [];
 	for (const tab of SETTING_TABS) {
 		for (const setting of orderedSettings()) {
 			const ui = setting.ui;
 			if (ui?.tab !== tab) continue;
 			const note = envNote(setting);
+			const condition = ui.condition ? CONDITIONS[ui.condition] : undefined;
 			entries.push({
 				path: setting.id,
 				type: setting.type,
@@ -67,7 +68,7 @@ export function createSettingsHost(): SettingsHost {
 				ui: note ? { ...ui, description: `${ui.description}${note}` } : ui,
 				enumValues: setting.enumValues,
 				credential: setting.isCredential,
-				condition: ui.condition ? CONDITIONS[ui.condition] : undefined,
+				condition: condition ? () => condition(view) : undefined,
 			});
 		}
 	}

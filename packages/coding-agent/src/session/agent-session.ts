@@ -41,7 +41,7 @@ import {
 	resolveTelemetry,
 	type StreamFn,
 	TERMINAL_TOOL_RESULT_ABORT_REASON,
-	type ThinkingLevel,
+	ThinkingLevel,
 	type ToolChoiceDirective,
 } from "@oh-my-pi/pi-agent-core";
 import {
@@ -117,6 +117,13 @@ import { reset as resetCapabilities } from "../capability";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import type { SessionAccountPoolScope } from "../config/account-pools";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
+import {
+	applyResolvedSessionDefault,
+	applySessionPinDefault,
+	attachSessionPreset,
+	recordSessionPreset,
+	resolveSessionDefault,
+} from "../config/model-presets";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	DEFAULT_PREWALK_TARGET,
@@ -169,7 +176,14 @@ import { GoalRuntime } from "../goals/runtime";
 import type { GoalModeState, GoalTokenUsage } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { InternalUrlRouter, type LocalProtocolOptions } from "../internal-urls";
-import { type ChainJudge, hasNativeJudge, journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
+import {
+	type ChainJudge,
+	hasNativeJudge,
+	journalJudgmentDecision,
+	journalJudgmentUsage,
+	resolveJudge,
+	sharedJudgmentCache,
+} from "../judgment";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { DaemonCompletionNotification } from "../launch/protocol";
 import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "../memory-backend/recall-entry";
@@ -3087,6 +3101,7 @@ export class AgentSession implements SettingsScope {
 			metadataResolver: provider => this.agent.metadataForProvider(provider),
 			purpose: "ttsr",
 			onUsage: journalJudgmentUsage(this.sessionManager),
+			onDecision: journalJudgmentDecision(this.sessionManager),
 			telemetry: this.agent.telemetry,
 			cache: sharedJudgmentCache(),
 		});
@@ -3106,6 +3121,7 @@ export class AgentSession implements SettingsScope {
 			metadataResolver: provider => this.agent.metadataForProvider(provider),
 			purpose: "auto-graph",
 			onUsage: journalJudgmentUsage(this.sessionManager),
+			onDecision: journalJudgmentDecision(this.sessionManager),
 			telemetry: this.agent.telemetry,
 			cache: sharedJudgmentCache(),
 		});
@@ -9813,6 +9829,13 @@ export class AgentSession implements SettingsScope {
 	 * @returns true if completed, false if cancelled by hook
 	 */
 	async newSession(options?: NewSessionOptions): Promise<boolean> {
+		// One pin is captured before any await and used for both the resolved default and the new session's snapshot,
+		// so a project default changed by a hook or another session during the transition cannot split the two.
+		const nextPin = this.settings.isSessionView ? this.settings.projectSessionPin() : undefined;
+		const nextDefault = nextPin ? resolveSessionDefault(this, nextPin) : undefined;
+		if (typeof nextDefault === "string") {
+			throw new Error(`New session not started: project default model unavailable (${nextDefault})`);
+		}
 		using _transition = this.#beginSessionTransition();
 		this.#assertVibeSessionTransitionAllowed("start a new session");
 		const previousSessionFile = this.sessionFile;
@@ -9866,6 +9889,14 @@ export class AgentSession implements SettingsScope {
 			} finally {
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
+			// The pin captured before the transition is the one this session starts with, even if the project default
+			// changed while the transition awaited. Non-view settings have no pin, so attach is a no-op for them.
+			if (nextPin) {
+				this.settings.setSessionPin(nextPin);
+				recordSessionPreset(this.sessionManager, nextPin);
+			} else {
+				attachSessionPreset(this.settings, this.sessionManager, { record: true });
+			}
 
 			this.#clearSessionScopedToolState();
 			this.#clearCheckpointRuntimeState();
@@ -9874,10 +9905,13 @@ export class AgentSession implements SettingsScope {
 			this.#clearInheritedProviderPromptCacheKey();
 			this.#syncAgentSessionId();
 			await this.#prewalk.resetForNewSession(this.#agentKind === "main" && cfgPrewalkEnabled.get(this.settings));
-			// Re-apply the configured selector so the new session does not inherit
-			// the previous session's auto-classified effort: auto stays auto but
-			// restarts at the provisional level; a pinned level re-resolves to itself.
-			this.#models.restoreThinkingLevel(this.configuredThinkingLevel());
+			// The default was resolved before the transition, so applying it cannot leave the outgoing model in place.
+			if (this.settings.isSessionView) {
+				if (nextDefault) await applyResolvedSessionDefault(this, nextDefault);
+			} else {
+				// Re-apply the configured selector so the new session does not inherit the previous session's auto-classified effort.
+				this.#models.restoreThinkingLevel(this.configuredThinkingLevel());
+			}
 			// Drop the frozen system-prompt/tool snapshot and synced message bytes
 			// (mirrors freshSession()/resetSessionContext()): without this the first
 			// post-/new turns keep sending the previous session's StablePrefix, and
@@ -10592,6 +10626,9 @@ export class AgentSession implements SettingsScope {
 				this.sessionManager.branchWithSummary(null, report, { startedAt: checkpointState.startedAt });
 			}
 		});
+		// Re-derive the pin for the rewound leaf; a rewind records no snapshot.
+		attachSessionPreset(this.settings, this.sessionManager, { record: false });
+		await this.#restoreBranchSelection();
 
 		const rewoundAt = new Date().toISOString();
 		const details = { report, startedAt: checkpointState.startedAt, rewoundAt };
@@ -11487,6 +11524,7 @@ export class AgentSession implements SettingsScope {
 		const previousBaseSystemPromptBeforeMemoryPromotion = this.#memory.promotionSnapshot;
 		const previousFreshProviderSessionId = this.#freshProviderSessionId;
 		const previousInheritedProviderPromptCacheKey = this.#inheritedProviderPromptCacheKey;
+		const prevPin = this.settings.sessionPin();
 
 		// Snapshot the full checkpoint runtime state: the success path calls
 		// #rehydrateCheckpointRewindState(), which clears and rebuilds all four
@@ -11553,6 +11591,8 @@ export class AgentSession implements SettingsScope {
 			}
 			this.#syncAgentSessionId(undefined, false);
 			this.#memory.rekeyForCurrentSessionId();
+			// Target pin: its snapshot if present, else the project default. A baseline is recorded only after success.
+			const targetPinRestored = attachSessionPreset(this.settings, this.sessionManager, { record: false });
 
 			let sessionContext = this.buildDisplaySessionContext();
 			// Resolve the target's model before announcing the switch, so an
@@ -11723,9 +11763,16 @@ export class AgentSession implements SettingsScope {
 				if (options?.onModelFallback) options.onModelFallback(modelFallbackWarning);
 				else this.emitNotice("warning", modelFallbackWarning);
 			}
+			if (!targetPinRestored) {
+				const targetPin = this.settings.sessionPin();
+				if (targetPin) recordSessionPreset(this.sessionManager, targetPin);
+			}
 			return true;
 		} catch (error) {
 			this.sessionManager.restoreState(previousSessionState);
+			if (prevPin !== undefined) {
+				this.settings.setSessionPin(prevPin);
+			}
 			this.#freshProviderSessionId = previousFreshProviderSessionId;
 			this.#syncAgentSessionId(previousSessionState.sessionId, false);
 			this.#memory.rekeyForCurrentSessionId();
@@ -11834,6 +11881,45 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/**
+	 * Restores the active model and thinking selector for the current branch, with the same precedence as
+	 * `switchSession`: the branch's own model and thinking events win; otherwise the session's pinned default applies.
+	 * Only live state changes: no transcript entry is appended and no snapshot is recorded. An unrestorable model
+	 * throws instead of leaving the outgoing model active under the new branch.
+	 */
+	async #restoreBranchSelection(): Promise<void> {
+		if (!this.settings.isSessionView) return;
+		const sessionContext = this.buildDisplaySessionContext();
+		const selectors = getRestorableSessionModels(sessionContext.models, this.sessionManager.getLastModelChangeRole());
+		let pinnedThinkingLevel: ConfiguredThinkingLevel | undefined;
+		if (selectors.length > 0) {
+			const target = await this.#resolveSessionModel(selectors);
+			if (!target) throw new Error(`Could not restore model ${selectors[0]}`);
+			if (!this.model || !modelsAreEqual(this.model, target)) await this.#setModelWithProviderSessionReset(target);
+		} else {
+			const pin = this.settings.sessionPin();
+			if (pin) {
+				const resolved = resolveSessionDefault(this, pin);
+				if (typeof resolved === "string") throw new Error(`Could not apply the project default model: ${resolved}`);
+				if (!this.model || !modelsAreEqual(this.model, resolved.model)) {
+					await this.#setModelWithProviderSessionReset(resolved.model);
+				}
+				pinnedThinkingLevel = resolved.thinkingLevel !== ThinkingLevel.Inherit ? resolved.thinkingLevel : undefined;
+			}
+		}
+		const hasThinkingEntry = this.sessionManager.getBranch().some(entry => entry.type === "thinking_level_change");
+		const defaultThinkingLevel =
+			pinnedThinkingLevel ?? parseConfiguredThinkingLevel(cfgDefaultThinkingLevel.get(this.settings));
+		const restoredConfigured = sessionContext.configuredThinkingLevel;
+		const restoredThinkingLevel: ConfiguredThinkingLevel | undefined =
+			hasThinkingEntry || (defaultThinkingLevel === AUTO_THINKING && sessionContext.thinkingLevel !== "off")
+				? restoredConfigured === AUTO_THINKING
+					? AUTO_THINKING
+					: (sessionContext.thinkingLevel as ThinkingLevel | undefined)
+				: defaultThinkingLevel;
+		this.#models.restoreThinkingLevel(restoredThinkingLevel);
+	}
+
+	/**
 	 * Create a branch from a specific entry.
 	 * Emits before_branch/branch session events to hooks.
 	 *
@@ -11938,6 +12024,9 @@ export class AgentSession implements SettingsScope {
 			} finally {
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
+			// The new or branched session starts from its own pin, baselined if it has no snapshot yet.
+			attachSessionPreset(this.settings, this.sessionManager, { record: true });
+			await this.#restoreBranchSelection();
 			this.#clearSessionScopedToolState();
 			this.#rehydrateCheckpointRewindState();
 			this.#todo.syncFromBranch();
@@ -12052,6 +12141,9 @@ export class AgentSession implements SettingsScope {
 			} finally {
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
+			// The branch starts from its own pin, baselined if it has no snapshot yet.
+			attachSessionPreset(this.settings, this.sessionManager, { record: true });
+			await this.#restoreBranchSelection();
 
 			this.#clearSessionScopedToolState();
 
@@ -12400,6 +12492,9 @@ export class AgentSession implements SettingsScope {
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, branchTransitioned);
 		}
+		// Re-derive the pin for the moved leaf; navigation itself records no snapshot.
+		attachSessionPreset(this.settings, this.sessionManager, { record: false });
+		await this.#restoreBranchSelection();
 
 		// Update agent state — build display context to populate agent messages.
 		const stateContext = this.sessionManager.buildSessionContext({

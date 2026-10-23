@@ -8,7 +8,7 @@ import { type AssistantMessage, judgeQuestions, type Model } from "@oh-my-pi/pi-
 import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
-import { type JudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
+import { type JudgmentDecision, type JudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import questionFile from "../prompts/judge/unexpected-stop.json" with { type: "json" };
 
 /**
@@ -34,6 +34,8 @@ export interface ClassifyUnexpectedStopDeps {
 	metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
 	/** Session ledger for the classification's billed attempts. */
 	onUsage?: (usage: JudgmentUsage) => void;
+	/** Decision trace sink for this classification; never billed. */
+	onDecision?: (decision: JudgmentDecision) => void;
 	telemetry?: AgentTelemetryConfig;
 	signal?: AbortSignal;
 }
@@ -74,6 +76,7 @@ export async function classifyUnexpectedStop(
 			metadataResolver: deps.metadataResolver,
 			purpose: "unexpected-stop",
 			onUsage: deps.onUsage,
+			onDecision: deps.onDecision,
 			telemetry: deps.telemetry,
 			cache: sharedJudgmentCache(),
 		});

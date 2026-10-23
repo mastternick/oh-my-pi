@@ -836,7 +836,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		subcommands: [
 			{ name: "list", description: "List saved presets" },
 			{ name: "save", description: "Save the current role models and thinking level", usage: "<name>" },
-			{ name: "switch", description: "Apply a saved preset", usage: "<name>" },
+			{ name: "switch", description: "Apply a saved preset", usage: "<name> [--session]" },
 			{ name: "delete", description: "Delete a saved preset", usage: "<name>" },
 		],
 		allowArgs: true,
@@ -845,7 +845,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			return count > 0 ? `Presets: ${count} saved` : "Presets: none saved";
 		},
 		handle: async (command, runtime) => {
-			const outcome = await runPresetsCommand(command.args, runtime.settings, runtime.session);
+			const outcome = await runPresetsCommand(command.args, runtime.session);
 			if (outcome.usage) return usage(outcome.message, runtime);
 			await runtime.output(outcome.message);
 			if (outcome.switched) await runtime.notifyTitleChanged?.();
@@ -866,7 +866,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				if (picked === undefined) return;
 				args = `switch ${picked}`;
 			}
-			const outcome = await runPresetsCommand(args, ctx.settings, ctx.session);
+			const outcome = await runPresetsCommand(args, ctx.session);
 			if (outcome.switched) {
 				ctx.statusLine.invalidate();
 				ctx.updateEditorBorderColor();
@@ -931,7 +931,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 	},
 ];
 
-const PRESETS_USAGE = "Usage: /modelpreset [list | save <name> | switch <name> | delete <name>]";
+const PRESETS_USAGE = "Usage: /modelpreset [list | save <name> | switch <name> [--session] | delete <name>]";
 const NO_PRESETS_MESSAGE = "No model presets saved. Use /modelpreset save <name> to create one.";
 
 interface PresetsCommandOutcome {
@@ -943,13 +943,11 @@ interface PresetsCommandOutcome {
 }
 
 /** Shared by the ACP and TUI handlers of `/modelpreset`; `args` is everything after the command name. */
-async function runPresetsCommand(
-	args: string,
-	settings: Settings,
-	session: ModelPresetSession,
-): Promise<PresetsCommandOutcome> {
+async function runPresetsCommand(args: string, session: ModelPresetSession): Promise<PresetsCommandOutcome> {
+	const { settings } = session;
 	const [sub = "list", ...rest] = args.trim().split(/\s+/).filter(Boolean);
-	const name = rest.join(" ");
+	const sessionOnly = rest.includes("--session");
+	const name = rest.filter(word => word !== "--session").join(" ");
 	switch (sub) {
 		case "list": {
 			const names = getModelPresetNames(settings);
@@ -967,15 +965,14 @@ async function runPresetsCommand(
 			return { message: modelPresetSavedMessage(settings, name), changedConfig: true };
 		}
 		case "switch": {
-			if (!name) return { message: "Usage: /modelpreset switch <name>", usage: true };
-			const result = await applyModelPreset(settings, session, name);
+			if (!name) return { message: "Usage: /modelpreset switch <name> [--session]", usage: true };
+			const result = await applyModelPreset(session, name, { scope: sessionOnly ? "session" : "project" });
 			const message = formatModelPresetSwitch(name, result);
-			const wroteRoles = result.kind === "switched" || result.kind === "failed";
 			return {
 				message,
 				failed: !isCleanModelPresetSwitch(result),
 				switched: result.kind === "switched",
-				changedConfig: wroteRoles,
+				changedConfig: result.kind === "switched",
 			};
 		}
 		case "delete": {

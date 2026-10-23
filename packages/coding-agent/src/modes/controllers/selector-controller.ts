@@ -105,6 +105,8 @@ import { collapseSharedUsageReports } from "@oh-my-pi/pi-tui/overlays/usage-disp
 import { limitMatchesActiveAccount } from "../../slash-commands/helpers/active-oauth-account";
 import { AgentHubOverlayComponent } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import { createAgentHubRuntime } from "../agent-hub-runtime";
+import { AgentRegistry } from "../../registry/agent-registry";
+import { createJudgeActivitySource } from "../agent-hub-judge-source";
 import { AgentsHubComponent } from "@oh-my-pi/pi-tui/overlays/agents-hub";
 import { CopySelectorComponent } from "@oh-my-pi/pi-tui/overlays/copy-selector";
 import { ExtensionDashboard } from "@oh-my-pi/pi-tui/overlays/extensions/extension-dashboard";
@@ -348,7 +350,7 @@ export class SelectorController {
 						providers: [...new Set(this.ctx.session.getAvailableModels().map(model => model.provider))].sort(
 							(a, b) => a.localeCompare(b),
 						),
-						settings: createSettingsHost(),
+						settings: createSettingsHost(this.ctx.settings),
 						plugins: createPluginSettingsHost(getProjectDir()),
 						model: this.ctx.session.model,
 						imageBudget: this.ctx.ui.imageBudget,
@@ -1144,7 +1146,7 @@ export class SelectorController {
 				},
 				onSwitchPreset: async name => {
 					try {
-						const result = await applyModelPreset(this.ctx.settings, this.ctx.session, name);
+						const result = await applyModelPreset(this.ctx.session, name, { scope: "project" });
 						const message = formatModelPresetSwitch(name, result);
 						if (result.kind === "switched") {
 							this.ctx.statusLine.invalidate();
@@ -2440,13 +2442,15 @@ export class SelectorController {
 			this.ctx.ui.requestRender();
 		};
 
+		const registry = this.ctx.collabGuest?.agentRegistry ?? AgentRegistry.global();
 		const hub = new AgentHubOverlayComponent({
 			...createAgentHubRuntime({
 				settings: this.ctx.settings,
-				registry: this.ctx.collabGuest?.agentRegistry,
+				registry,
 				remote: this.ctx.collabGuest?.hubRemote,
 				sessionFile: this.ctx.sessionManager.getSessionFile() ?? null,
 			}),
+			judge: createJudgeActivitySource({ registry, observers, sessionManager: this.ctx.sessionManager }),
 			observers,
 			hubKeys,
 			expandKeys: this.ctx.keybindings.getKeys("app.tools.expand"),

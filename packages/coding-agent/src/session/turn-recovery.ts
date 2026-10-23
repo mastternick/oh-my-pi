@@ -75,7 +75,7 @@ import { getLatestCompactionEntry } from "./session-context";
 import { EPHEMERAL_MODEL_CHANGE_ROLE, type SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 import { sameMessageContent, sessionMessagePersistenceKey } from "./turn-persistence";
-import { journalJudgmentUsage } from "../judgment";
+import { journalJudgmentDecision, journalJudgmentUsage } from "../judgment";
 import { classifyUnexpectedStop, isUnexpectedStopCandidate } from "./unexpected-stop-classifier";
 
 import {
@@ -1154,6 +1154,7 @@ export class TurnRecovery {
 					model: this.#host.model() ?? undefined,
 					metadataResolver: (provider: string) => this.#host.agent.metadataForProvider(provider),
 					onUsage: journalJudgmentUsage(this.#host.sessionManager),
+					onDecision: journalJudgmentDecision(this.#host.sessionManager),
 					telemetry: this.#host.agent.telemetry,
 					signal: controller.signal,
 				});

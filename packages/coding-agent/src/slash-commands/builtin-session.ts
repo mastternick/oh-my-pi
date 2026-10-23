@@ -1,6 +1,6 @@
 import { clearSubmittedText } from "./helpers/draft";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
-import { journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
+import { journalJudgmentDecision, journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionOAuthAccountList } from "../session/agent-session-types";
 import {
@@ -194,6 +194,7 @@ function launchSessionStatsDashboard(
 		sessionId: owner.session.sessionId,
 		purpose: "stats_frustration",
 		onUsage: journalJudgmentUsage(owner.sessionManager),
+		onDecision: journalJudgmentDecision(owner.sessionManager),
 		telemetry: owner.session.agent.telemetry,
 		cache: sharedJudgmentCache(),
 	});

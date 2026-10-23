@@ -125,6 +125,29 @@ export const cfgMnemopiAutoRetain = register({
 	},
 });
 
+/**
+ * Independent experience-memory switch: assignment-scoped contextual recall at
+ * task boundaries and worker assignments, plus verified lesson capture at
+ * settled completion checkpoints using the configured `memory` role.
+ * Deliberately separate from `mnemopi.autoRecall` (first-turn transcript recall)
+ * and `mnemopi.autoRetain` (raw transcript retention): those stay off while
+ * this enables recall+learning of compact, evidence-gated lessons. `false`
+ * restores the pre-experience behavior exactly.
+ */
+export const cfgMnemopiExperienceEnabled = register({
+	id: "mnemopi.experienceEnabled",
+	type: "boolean",
+	default: true,
+	ui: {
+		tab: "memory",
+		group: "Mnemopi",
+		label: "Mnemopi Experience Learning",
+		description:
+			"Automatically recall verified project lessons at task boundaries and extract concise lessons at completion checkpoints (memory-role extraction; nothing retained without verified tool evidence)",
+		condition: "mnemopiActive",
+	},
+});
+
 export const cfgMnemopiPolyphonicRecall = register({
 	id: "mnemopi.polyphonicRecall",
 	type: "boolean",

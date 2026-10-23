@@ -55,6 +55,18 @@ import {
 	STATUS_ORDER,
 } from "./agent-hub-projection";
 import {
+	formatJudgeClock,
+	formatJudgeCost,
+	formatJudgeTokens,
+	JUDGE_OUTCOME_LABEL,
+	JUDGE_SAVINGS_TEXT,
+	type JudgeOutcome,
+	type JudgeProjection,
+	type JudgeRow,
+	type JudgeSourceInput,
+	projectJudgeActivity,
+} from "./agent-hub-judge";
+import {
 	clampHubLine,
 	contextGauge,
 	formatChildIds,
@@ -110,7 +122,7 @@ const SPLIT_MIN_WIDTH = 96;
 const DETAIL_MIN_WIDTH = 34;
 const ROSTER_MIN_WIDTH = 48;
 
-export type AgentHubSection = "agents" | "activity";
+export type AgentHubSection = "agents" | "activity" | "judge";
 type ActivityFilter = "all" | "errors" | "responses" | "tools";
 type ActivityScope = "all" | "agent" | "subtree";
 
@@ -119,6 +131,7 @@ type HubViewMode = "roster" | "tree";
 const SECTION_TABS = [
 	{ id: "agents", label: "1 Agents" },
 	{ id: "activity", label: "2 Activity" },
+	{ id: "judge", label: "3 Judge" },
 ] as const satisfies ReadonlyArray<{ id: AgentHubSection; label: string }>;
 const VIEW_TABS = [
 	{ id: "roster", label: "Flat" },
@@ -137,6 +150,37 @@ const ACTIVITY_HINTS: readonly NativeHint[] = [
 	{ keys: ["/"], label: "search" },
 	{ keys: ["escape"], label: "close" },
 ];
+const JUDGE_HINTS: readonly NativeHint[] = [
+	{ keys: ["j", "k"], label: "select" },
+	{ keys: ["enter"], label: "transcript" },
+	{ keys: ["space"], label: "follow" },
+	{ keys: ["left"], label: "agents" },
+	{ keys: ["escape"], label: "close" },
+];
+/** Shown when no judge decision or usage exists. */
+const JUDGE_EMPTY_TEXT = "No judge decisions recorded yet";
+/** Judge decision columns; higher priorities stay visible on narrow sheets. */
+const JUDGE_COLUMNS: readonly TspPickerColumn[] = [
+	{ id: "outcome", head: "Outcome", format: "text", priority: 3 },
+	{ id: "cost", head: "Cost", format: "text", priority: 2 },
+	{ id: "at", head: "Time", format: "dim", priority: 1 },
+];
+const JUDGE_OUTCOME_TONE: Readonly<Record<JudgeOutcome, "success" | "accent" | "error" | "muted">> = {
+	ok: "success",
+	cache: "accent",
+	error: "error",
+	unavailable: "muted",
+};
+/** A historical call with no judge trace reads as unavailable, never as a guessed decision. */
+function judgeOutcomeText(outcome: JudgeOutcome): string {
+	return outcome === "unavailable" ? "decision unavailable" : JUDGE_OUTCOME_LABEL[outcome];
+}
+/** "no bill" only for a proven cache-only decision; a failed or unlinked call is never shown as free. */
+function judgeCostText(judge: JudgeRow): string {
+	if (judge.calls > 0) return formatJudgeCost(judge.cost);
+	if (judge.outcome === "cache") return "no bill";
+	return judge.outcome === "error" ? "cost unknown" : "cost not linked";
+}
 /** Recent-activity entries the native inspector lists for the selected agent. */
 const NATIVE_RECENT_ACTIVITY = 20;
 /** Child ids the native inspector names before summarizing the rest. */
@@ -146,6 +190,7 @@ const NATIVE_CHILD_IDS = 12;
 const PICKER_TABS = [
 	{ id: "agents", label: "Agents" },
 	{ id: "activity", label: "Activity" },
+	{ id: "judge", label: "Judge" },
 ] as const satisfies ReadonlyArray<{ id: AgentHubSection; label: string }>;
 /** Roster fact columns; lower priorities hide first on narrow sheets. */
 const AGENT_COLUMNS: readonly TspPickerColumn[] = [
@@ -274,6 +319,11 @@ export interface AgentHubRemote {
 	readTranscript(id: string, fromByte: number): Promise<AgentHubRemoteTranscript | null>;
 }
 
+/** Loads Judge decisions for the session tree (root plus descendants, deduplicated by the host). */
+export interface JudgeActivitySource {
+	load(): Promise<readonly JudgeSourceInput[]>;
+}
+
 export interface AgentHubDeps<TRecord extends AgentRecordLike = AgentRecordLike> {
 	/** Progress/status snapshot source (task lifecycle + progress channels). */
 	observers: SessionObserverRegistry;
@@ -319,6 +369,8 @@ export interface AgentHubDeps<TRecord extends AgentRecordLike = AgentRecordLike>
 	activity: AgentActivitySource;
 	/** Whether observer progress should update live activity rows. */
 	manageActivityLive?: boolean;
+	/** Judge decisions across this session tree; omitted when the host has no judge source. */
+	judge?: JudgeActivitySource;
 
 	/** Collab guest: route actions/transcripts to the host instead of local sessions. */
 	remote?: AgentHubRemote;
@@ -359,6 +411,14 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 	#activityFollow = true;
 	#activitySyncGeneration = 0;
 	#activitySyncStamp = new Map<string, string>();
+
+	// Judge tab: decisions projected from the session tree. Loads are async and never block paint.
+	#judge: JudgeActivitySource | undefined;
+	#judgeProjection: JudgeProjection = projectJudgeActivity([]);
+	#judgeSelected = 0;
+	#judgeFollow = true;
+	#judgeLoading = false;
+	#judgeStale = false;
 
 	// Table state
 	#rows: TRecord[] = [];
@@ -472,6 +532,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 		this.#activity = deps.activity;
 		this.#manageActivityLive = deps.manageActivityLive ?? true;
 		this.#registry = deps.registry;
+		this.#judge = deps.judge;
 		this.#observers = deps.observers;
 		this.#getRoleInfo = deps.getRoleInfo;
 		this.#transcript = deps.transcript;
@@ -507,6 +568,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			if (this.#hasFallbackLiveSessions) {
 				this.#refreshAggregate(true);
 			}
+			if (this.#section === "judge") this.#refreshJudge();
 			this.#requestRender();
 		}, AGE_TICK_MS);
 		this.#ageTimer.unref?.();
@@ -528,6 +590,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 						}
 					});
 		this.#refreshRows();
+		if (this.#section === "judge") this.#refreshJudge();
 	}
 
 	/**
@@ -560,7 +623,9 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 		const frame = (
 			this.#section === "activity"
 				? this.#renderActivityTable(width, termHeight)
-				: this.#renderTable(width, termHeight)
+				: this.#section === "judge"
+					? this.#renderJudgeTable(width, termHeight)
+					: this.#renderTable(width, termHeight)
 		).map(line => clampHubLine(line, width));
 		if (frame.length <= termHeight) return frame;
 
@@ -604,7 +669,12 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			this.#switchSection("activity");
 			return;
 		}
+		if (keyData === "3") {
+			this.#switchSection("judge");
+			return;
+		}
 		if (this.#section === "activity") this.#handleActivityInput(keyData);
+		else if (this.#section === "judge") this.#handleJudgeInput(keyData);
 		else this.#handleTableInput(keyData);
 	}
 
@@ -706,7 +776,12 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			return this.#native;
 		}
 		const tabs = node("tabs", { items: SECTION_TABS, active: this.#section }, undefined, "section");
-		const body = this.#section === "activity" ? this.#describeActivity() : this.#describeAgents(nativeTree);
+		const body =
+			this.#section === "activity"
+				? this.#describeActivity()
+				: this.#section === "judge"
+					? this.#describeJudge()
+					: this.#describeAgents(nativeTree);
 		this.#native = overlayCard("omp.overlay.agentHub", "Agent Hub", [tabs, ...body]);
 		return this.#native;
 	}
@@ -731,7 +806,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 		const item = event.item;
 		switch (target) {
 			case "section":
-				if (item === "agents" || item === "activity") this.#switchSection(item);
+				if (item === "agents" || item === "activity" || item === "judge") this.#switchSection(item);
 				return;
 			case "view":
 				if ((item === "roster" || item === "tree") && item !== this.#viewMode) {
@@ -771,12 +846,30 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 				if (activity) this.openChat(activity.agentId, activity.entryId);
 				return;
 			}
+			case "judge": {
+				const index = this.#judgeProjection.rows.findIndex(row => row.id === item);
+				if (!this.#judgeProjection.rows[index]) return;
+				this.#judgeFollow = false;
+				this.#judgeSelected = index;
+				if (event.type === "activate") this.#openJudgeActor();
+				else this.#requestRender();
+				return;
+			}
 		}
 	}
 
 	/** Picker events (the sheet is this component's root): same paths as the keys. */
 	#handlePickerEvent(event: NativeUiEvent): void {
 		const activity = this.#section === "activity";
+		if (this.#section === "judge" && (event.type === "select" || event.type === "activate")) {
+			const index = this.#judgeProjection.rows.findIndex(row => row.id === event.item);
+			if (index < 0) return;
+			this.#judgeFollow = false;
+			this.#judgeSelected = index;
+			if (event.type === "activate") this.#openJudgeActor();
+			else this.#requestRender();
+			return;
+		}
 		if (event.type === "select" || event.type === "activate") {
 			if (activity) {
 				const index = this.#activityRows.findIndex(row => row.id === event.item);
@@ -803,7 +896,9 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 		if (event.type !== "action") return;
 		switch (event.act) {
 			case "tab":
-				if (event.value === "agents" || event.value === "activity") this.#switchSection(event.value);
+				if (event.value === "agents" || event.value === "activity" || event.value === "judge") {
+					this.#switchSection(event.value);
+				}
 				return;
 			case "scope":
 				if (activity && ACTIVITY_FILTERS.includes(event.value as ActivityFilter)) {
@@ -818,6 +913,11 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 				else this.#agentFilterEditing = true;
 				this.#requestRender();
 				return;
+		}
+		if (this.#section === "judge") {
+			if (event.act === "open") this.#openJudgeActor();
+			else if (event.act === "follow") this.#toggleJudgeFollow();
+			return;
 		}
 		if (activity) {
 			switch (event.act) {
@@ -858,14 +958,23 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 		const activity = this.#section === "activity";
 		const props: TspPickerProps = {
 			title: "Agents",
-			subtitle: this.#pickerSubtitle(),
+			subtitle: this.#section === "judge" ? this.#judgeHeadLine() : this.#pickerSubtitle(),
 			icon: "users",
 			size: "lg",
 			tabs: PICKER_TABS,
 			tab: this.#section,
-			...(activity ? this.#activityPickerProps() : this.#agentPickerProps()),
+			...(activity
+				? this.#activityPickerProps()
+				: this.#section === "judge"
+					? this.#judgePickerProps()
+					: this.#agentPickerProps()),
 		};
-		const preview = activity ? [] : this.#describePreview(this.#rows[this.#selectedRow], meter);
+		const preview =
+			this.#section === "agents"
+				? this.#describePreview(this.#rows[this.#selectedRow], meter)
+				: this.#section === "judge"
+					? this.#judgePreview()
+					: [];
 		return picker(props, preview);
 	}
 
@@ -1510,6 +1619,153 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 		];
 	}
 
+	#describeJudge(): NativeChild[] {
+		const { rows } = this.#judgeProjection;
+		const selected = rows[this.#judgeSelectedIndex()];
+		const children: NativeChild[] = this.#judgeSummaryLines().map(line => text([span(line, "dim")]));
+		children.push(
+			node(
+				"list",
+				{
+					selected: selected?.id ?? null,
+					virtual: true,
+					grow: 1,
+					empty: [span(JUDGE_EMPTY_TEXT, "muted")],
+				},
+				rows.map(judge => this.#describeJudgeItem(judge)),
+				"judge",
+			),
+		);
+		if (selected) children.push(...this.#judgeDetailLines().map(line => text([span(line, "muted")])));
+		children.push(hintsRow(JUDGE_HINTS));
+		return children;
+	}
+
+	#describeJudgeItem(judge: JudgeRow): NativeNode {
+		return node(
+			"item",
+			{
+				label: [
+					span(judgeOutcomeText(judge.outcome), JUDGE_OUTCOME_TONE[judge.outcome]),
+					span(" "),
+					span(sanitizeDisplaySingleLine(judge.actor), "strong"),
+					span(" "),
+					span(sanitizeDisplaySingleLine(judge.purpose), "muted"),
+				],
+				detail: sanitizeDisplaySingleLine(judge.summary),
+				value: [span(`${formatJudgeClock(judge.timestamp)} ${judgeCostText(judge)}`, "dim")],
+			},
+			undefined,
+			judge.id,
+		);
+	}
+
+	#judgeSummaryLines(): string[] {
+		const t = this.#judgeProjection.totals;
+		const dot = theme.sep.dot;
+		const lines = [
+			`${t.decisions} decisions${dot}${t.ok} ok${dot}${t.cache} cache${dot}${t.error} error${dot}${t.unavailable} decision unavailable`,
+			`Billed: ${t.billedCalls} calls${dot}${formatJudgeTokens(t.tokens)} tokens${dot}${formatJudgeCost(t.cost)}`,
+			`Cache: ${t.cachedQuestions} of ${t.totalQuestions} answers reused (measured)`,
+			JUDGE_SAVINGS_TEXT,
+		];
+		if (t.excludedCalls > 0) lines.push(`${t.excludedCalls} calls from other purposes not counted`);
+		return lines;
+	}
+
+	/** Picker subtitle: the totals on one line; the savings verdict is always stated. */
+	#judgeHeadLine(): string {
+		const t = this.#judgeProjection.totals;
+		return [
+			`${t.decisions} decisions`,
+			`Billed ${formatJudgeCost(t.cost)}`,
+			`${t.cachedQuestions} of ${t.totalQuestions} answers reused (measured)`,
+			JUDGE_SAVINGS_TEXT,
+		].join(theme.sep.dot);
+	}
+
+	/** Selected decision: identity, outcome, cost, reuse, then one line per answer (value first, question after). */
+	#judgeDetailLines(): string[] {
+		const judge = this.#judgeProjection.rows[this.#judgeSelectedIndex()];
+		if (!judge) return [];
+		const model = judge.provider && judge.model ? `${judge.provider}/${judge.model}` : "model not recorded";
+		const role = judge.role ? ` · role ${judge.role}` : "";
+		const thinking = judge.thinking
+			? ` · applied thinking ${judge.thinking.level}${judge.thinking.linked ? "" : " (decision not linked)"}`
+			: "";
+		let outcome: string;
+		if (judge.outcome === "unavailable") outcome = "decision unavailable: no judge trace recorded for this call";
+		else if (judge.outcome === "error") outcome = `error: ${judge.errorMessage ?? "unknown error"}`;
+		else outcome = `summary: ${judge.summary || "none recorded"}`;
+		const billed = judge.calls > 0 ? ` · ${judge.calls} billed · ${formatJudgeTokens(judge.tokens)} tokens` : "";
+		const reuse =
+			judge.questionCount !== undefined && judge.cachedQuestions !== undefined
+				? [`${judge.cachedQuestions} of ${judge.questionCount} answers reused from cache (measured)`]
+				: [];
+		const answers =
+			judge.answers.length > 0
+				? judge.answers.map(answer => {
+						const confidence = answer.confidence === undefined ? "" : ` (confidence ${answer.confidence})`;
+						return `answer: ${answer.value}${confidence} — ${answer.question}`;
+					})
+				: ["answers: none recorded"];
+		return [
+			`${judge.purpose} · ${judge.actor} · ${model}${role}${thinking}`,
+			outcome,
+			`cost ${judgeCostText(judge)}${billed}`,
+			...reuse,
+			...answers,
+		];
+	}
+
+	/** Side preview: the selected decision's detail, then the savings verdict. */
+	#judgePreview(): NativeChild[] {
+		const lines = this.#judgeDetailLines();
+		if (lines.length === 0) return [];
+		return [...lines.map(line => text([span(line, "muted")])), text([span(JUDGE_SAVINGS_TEXT, "dim")])];
+	}
+
+	#judgePickerProps(): PickerBody {
+		const selected = this.#judgeProjection.rows[this.#judgeSelectedIndex()];
+		return {
+			noun: "decisions",
+			layout: "rows",
+			preview: "side",
+			columns: JUDGE_COLUMNS,
+			items: this.#judgeProjection.rows.map(judge => this.#pickerJudgeItem(judge)),
+			selected: selected?.id ?? null,
+			empty: JUDGE_EMPTY_TEXT,
+			actions: [
+				{
+					id: "open",
+					label: "Open transcript",
+					keys: ["enter"],
+					primary: true,
+					disabled: selected && selected.actor !== MAIN_AGENT_ID ? undefined : true,
+				},
+				{ id: "follow", label: "Follow", keys: ["space"], on: this.#judgeFollow },
+				CLOSE_ACTION,
+			],
+			focus: "list",
+		};
+	}
+
+	#pickerJudgeItem(judge: JudgeRow): TspPickerItem {
+		return {
+			id: judge.id,
+			label: sanitizeDisplaySingleLine(`${judge.actor} · ${judge.purpose}`),
+			detail: sanitizeDisplaySingleLine(judge.summary || judgeOutcomeText(judge.outcome)),
+			icon: "message",
+			tone: judge.outcome === "error" ? "error" : judge.outcome === "unavailable" ? "warning" : undefined,
+			facts: {
+				outcome: judgeOutcomeText(judge.outcome),
+				cost: judgeCostText(judge),
+				at: formatJudgeClock(judge.timestamp),
+			},
+			title: formatLocalDateTimeWithOffset(new Date(judge.timestamp)),
+		};
+	}
+
 	// ========================================================================
 	// Live data plumbing
 	// ========================================================================
@@ -1525,6 +1781,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 
 	#onDataChange(): void {
 		this.#refreshRows();
+		if (this.#section === "judge") this.#refreshJudge();
 		this.#requestRender();
 	}
 
@@ -1693,7 +1950,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			this.#section === section
 				? theme.bg("selectedBg", theme.bold(theme.fg("accent", ` ${label} `)))
 				: theme.fg("muted", ` ${label} `);
-		return `${tab("agents", "1 Agents")}${theme.fg("dim", theme.sep.dot)}${tab("activity", "2 Activity")}`;
+		return `${tab("agents", "1 Agents")}${theme.fg("dim", theme.sep.dot)}${tab("activity", "2 Activity")}${theme.fg("dim", theme.sep.dot)}${tab("judge", "3 Judge")}`;
 	}
 
 	#renderActivityTable(width: number, termHeight: number): string[] {
@@ -1752,7 +2009,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			row(
 				theme.fg(
 					"dim",
-					`1:agents  ${formatKeyHints(["j", "k"])}:select  ${formatKeyHint("enter")}:transcript  ${formatKeyHint("space")}:follow  ${formatKeyHint("f")}:filter  ${formatKeyHint("s")}:scope  /:search  ${formatKeyHint("escape")}:close`,
+					`1:agents  3:judge  ${formatKeyHints(["j", "k"])}:select  ${formatKeyHint("enter")}:transcript  ${formatKeyHint("space")}:follow  ${formatKeyHint("f")}:filter  ${formatKeyHint("s")}:scope  /:search  ${formatKeyHint("escape")}:close`,
 				),
 				width,
 			),
@@ -1778,6 +2035,75 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 		const available = Math.max(1, width - visibleWidth(prefix) - visibleWidth(theme.sep.dot));
 		return `${prefix}${theme.fg("dim", theme.sep.dot)}${sanitizeLine(activity.summary, available)}`;
 	}
+
+	#renderJudgeTable(width: number, termHeight: number): string[] {
+		this.#hitRows.length = 0;
+		const innerWidth = Math.max(1, width - 4);
+		const contentRows = Math.max(1, termHeight - 4);
+		const { rows } = this.#judgeProjection;
+		const header = [
+			this.#sectionTabs(),
+			...this.#judgeSummaryLines()
+				.flatMap(line => wrapTextWithAnsi(line, Math.max(1, width)))
+				.map(line => theme.fg("dim", line)),
+		];
+		const spacer = contentRows >= 8 ? 1 : 0;
+		const detail =
+			rows.length > 0
+				? this.#judgeDetailLines()
+						.flatMap(line => wrapTextWithAnsi(sanitizeDisplaySingleLine(line), innerWidth))
+						.map(line => theme.fg("muted", line))
+				: [];
+		const budget = Math.max(0, contentRows - header.length - spacer - (detail.length > 0 ? detail.length + 1 : 0));
+		const body = [...header, ...(spacer ? [""] : [])];
+		const listLines: string[] = [];
+		if (rows.length === 0) {
+			listLines.push(theme.fg("muted", JUDGE_EMPTY_TEXT));
+		} else {
+			const selected = this.#judgeSelectedIndex();
+			const start = Math.max(0, Math.min(selected - Math.floor(budget / 2), rows.length - budget));
+			const end = Math.min(rows.length, start + budget);
+			for (let index = start; index < end; index++) {
+				listLines.push(this.#formatJudgeRow(rows[index]!, index === selected, innerWidth));
+			}
+		}
+		body.push(...listLines.slice(0, budget));
+		while (body.length < header.length + spacer + budget) body.push("");
+		if (detail.length > 0) body.push("", ...detail);
+		while (body.length < contentRows) body.push("");
+
+		const lines = [topBorder(width, "Agent Hub")];
+		for (const line of body.slice(0, contentRows)) lines.push(row(line, width));
+		lines.push(divider(width));
+		lines.push(
+			row(
+				theme.fg(
+					"dim",
+					`1:agents  2:activity  3:judge  ${formatKeyHints(["j", "k"])}:select  ${formatKeyHint("space")}:follow  ${formatKeyHint("enter")}:transcript  ${formatKeyHint("escape")}:close`,
+				),
+				width,
+			),
+		);
+		lines.push(bottomBorder(width));
+		return lines;
+	}
+
+	#formatJudgeRow(judge: JudgeRow, selected: boolean, width: number): string {
+		const cursor = selected ? theme.fg("accent", theme.nav.cursor) : " ";
+		const actor = sanitizeLine(judge.actor, Math.max(8, Math.min(18, Math.floor(width * 0.18))));
+		const cost = judgeCostText(judge);
+		const prefix =
+			`${cursor} ${theme.fg(JUDGE_OUTCOME_TONE[judge.outcome], judgeOutcomeText(judge.outcome))} ` +
+			`${theme.fg("dim", formatJudgeClock(judge.timestamp))} ${theme.bold(actor)} ` +
+			`${theme.fg("muted", sanitizeLine(judge.purpose, 24))} ${theme.fg("dim", cost)}`;
+		const detail = [judge.thinking ? `thinking ${judge.thinking.level}${judge.thinking.linked ? "" : " (unlinked)"}` : "", judge.summary]
+			.filter(Boolean)
+			.join(" · ");
+		if (!detail) return prefix;
+		const available = Math.max(1, width - visibleWidth(prefix) - visibleWidth(theme.sep.dot));
+		return `${prefix}${theme.fg("dim", theme.sep.dot)}${sanitizeLine(detail, available)}`;
+	}
+
 	#renderTable(width: number, termHeight: number): string[] {
 		this.#hitRows.length = 0;
 		const contentRows = Math.max(1, termHeight - 4);
@@ -1822,18 +2148,18 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 		if (showingNarrowDetails) {
 			return theme.fg(
 				"dim",
-				`${filter}1:agents  2:activity  ${formatKeyHint("tab")}:roster  ${formatKeyHints(["pageUp", "pageDown"])}:scroll  ${formatKeyHint("enter")}:open  ${formatKeyHint("t")}:${nextView}  ${formatKeyHint("escape")}:roster`,
+				`${filter}1:agents  2:activity  3:judge  ${formatKeyHint("tab")}:roster  ${formatKeyHints(["pageUp", "pageDown"])}:scroll  ${formatKeyHint("enter")}:open  ${formatKeyHint("t")}:${nextView}  ${formatKeyHint("escape")}:roster`,
 			);
 		}
 		if (availableWidth < 96) {
 			return theme.fg(
 				"dim",
-				`${filter}${formatKeyHints(["j", "k"])}:select  ${formatKeyHint("enter")}:open  ${formatKeyHint("t")}:${nextView}  ${formatKeyHint("tab")}:details  ${formatKeyHints(["r", "x"])}:manage  ${formatKeyHint("escape")}:close`,
+				`${filter}3:judge  ${formatKeyHints(["j", "k"])}:select  ${formatKeyHint("enter")}:open  ${formatKeyHint("t")}:${nextView}  ${formatKeyHint("tab")}:details  ${formatKeyHints(["r", "x"])}:manage  ${formatKeyHint("escape")}:close`,
 			);
 		}
 		return theme.fg(
 			"dim",
-			`${filter}1:agents  2:activity  ${formatKeyHints(["j", "k"])}/wheel:select  ${formatKeyHints(["pageUp", "pageDown"])}:details  ${formatKeyHint("enter")}/click:open  ${formatKeyHint("t")}:${nextView}  ${formatKeyHint("r")}:revive  ${formatKeyHint("x")}:kill  ${formatKeyHint("escape")}:close`,
+			`${filter}1:agents  2:activity  3:judge  ${formatKeyHints(["j", "k"])}/wheel:select  ${formatKeyHints(["pageUp", "pageDown"])}:details  ${formatKeyHint("enter")}/click:open  ${formatKeyHint("t")}:${nextView}  ${formatKeyHint("r")}:revive  ${formatKeyHint("x")}:kill  ${formatKeyHint("escape")}:close`,
 		);
 	}
 
@@ -2284,6 +2610,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 		this.#hoveredRow = null;
 		this.#narrowDetailsOpen = false;
 		if (section === "activity") this.#refreshActivityRows();
+		if (section === "judge") this.#refreshJudge();
 		this.#requestRender();
 	}
 
@@ -2356,6 +2683,87 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			const activity = this.#activityRows[this.#selectedActivityRow];
 			if (activity) this.openChat(activity.agentId, activity.entryId);
 		}
+	}
+
+	#handleJudgeInput(keyData: string): void {
+		if (matchesKey(keyData, "escape")) {
+			this.#onDone();
+			return;
+		}
+		if (matchesKey(keyData, "left")) {
+			this.#switchSection("agents");
+			return;
+		}
+		if (keyData === " ") {
+			this.#toggleJudgeFollow();
+			return;
+		}
+		if (matchesKey(keyData, "j") || matchesSelectDown(keyData)) {
+			this.#moveJudgeSelection(1);
+			return;
+		}
+		if (matchesKey(keyData, "k") || matchesSelectUp(keyData)) {
+			this.#moveJudgeSelection(-1);
+			return;
+		}
+		if (matchesKey(keyData, "enter") || keyData === "\r" || keyData === "\n") this.#openJudgeActor();
+	}
+
+	#moveJudgeSelection(delta: number): void {
+		const count = this.#judgeProjection.rows.length;
+		if (count > 0) {
+			this.#judgeFollow = false;
+			this.#judgeSelected = Math.max(0, Math.min(this.#judgeSelectedIndex() + delta, count - 1));
+		}
+		this.#requestRender();
+	}
+
+	#toggleJudgeFollow(): void {
+		this.#judgeFollow = !this.#judgeFollow;
+		if (this.#judgeFollow) this.#judgeSelected = Math.max(0, this.#judgeProjection.rows.length - 1);
+		this.#requestRender();
+	}
+
+	/** Enter opens the row's actor transcript; the ambient main session is the hub itself. */
+	#openJudgeActor(): void {
+		const row = this.#judgeProjection.rows[this.#judgeSelectedIndex()];
+		if (row && row.actor !== MAIN_AGENT_ID) this.openChat(row.actor);
+	}
+
+	/**
+	 * Reload Judge traces. One load runs at a time; a request that arrives
+	 * mid-load is replayed once it settles so the newest data always lands.
+	 */
+	#refreshJudge(): void {
+		const source = this.#judge;
+		if (!source || this.#disposed) return;
+		if (this.#judgeLoading) {
+			this.#judgeStale = true;
+			return;
+		}
+		this.#judgeLoading = true;
+		source
+			.load()
+			.then(sources => {
+				if (this.#disposed) return;
+				this.#judgeProjection = projectJudgeActivity(sources);
+				this.#judgeSelected = this.#judgeFollow ? Math.max(0, this.#judgeProjection.rows.length - 1) : this.#judgeSelectedIndex();
+				this.#requestRender();
+			})
+			.catch((error: unknown) => {
+				logger.warn("Failed to load judge decisions", { error });
+			})
+			.finally(() => {
+				this.#judgeLoading = false;
+				if (this.#judgeStale) {
+					this.#judgeStale = false;
+					this.#refreshJudge();
+				}
+			});
+	}
+
+	#judgeSelectedIndex(): number {
+		return Math.min(this.#judgeSelected, Math.max(0, this.#judgeProjection.rows.length - 1));
 	}
 
 	/** Space on the activity log: follow the newest row, or hold the selection. */

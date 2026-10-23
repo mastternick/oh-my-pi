@@ -6,6 +6,7 @@
  * it. `omp worktree clear` consults the marker so it can distinguish a live
  * subagent's sandbox from a crashed run's leftover instead of deleting both.
  */
+import * as fs from "node:fs";
 import * as path from "node:path";
 import * as natives from "@oh-my-pi/pi-natives";
 import { $ } from "bun";
@@ -27,6 +28,12 @@ export interface IsolationOwner {
 	 * inherits a recycled pid, so a crashed sandbox is never pinned live.
 	 */
 	startToken?: string;
+	/**
+	 * Absolute root of the source checkout the sandbox was cut from. Lets Mnemopi resolve the
+	 * parent's logical project for an isolated worker whose own git metadata is detached.
+	 * Absent on sandboxes created before this field existed.
+	 */
+	sourceRoot?: string;
 }
 
 /**
@@ -66,10 +73,33 @@ async function processStartToken(pid: number): Promise<string | null> {
  * Written before the isolation backend materialises `m` so a concurrent
  * `omp worktree clear` never sees an owner-less sandbox mid-creation.
  */
-export async function writeIsolationOwner(baseDir: string, id: string): Promise<void> {
+export async function writeIsolationOwner(baseDir: string, id: string, sourceRoot?: string): Promise<void> {
 	const startToken = await processStartToken(process.pid);
-	const owner: IsolationOwner = { pid: process.pid, id, ...(startToken ? { startToken } : {}) };
+	const owner: IsolationOwner = {
+		pid: process.pid,
+		id,
+		...(startToken ? { startToken } : {}),
+		...(sourceRoot ? { sourceRoot } : {}),
+	};
 	await Bun.write(path.join(baseDir, ISOLATION_OWNER_FILE), JSON.stringify(owner));
+}
+
+/**
+ * Synchronous read of a sandbox owner marker. Returns `undefined` when the marker is missing,
+ * unreadable, or not a well-formed owner record (object with string `id`).
+ */
+export function readIsolationOwnerSync(baseDir: string): { id: string; sourceRoot?: string } | undefined {
+	let decoded: unknown;
+	try {
+		decoded = JSON.parse(fs.readFileSync(path.join(baseDir, ISOLATION_OWNER_FILE), "utf8"));
+	} catch {
+		return undefined;
+	}
+	if (typeof decoded !== "object" || decoded === null || !("id" in decoded) || typeof decoded.id !== "string") {
+		return undefined;
+	}
+	const sourceRoot = "sourceRoot" in decoded && typeof decoded.sourceRoot === "string" ? decoded.sourceRoot : undefined;
+	return sourceRoot ? { id: decoded.id, sourceRoot } : { id: decoded.id };
 }
 
 /**

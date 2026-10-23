@@ -30,7 +30,7 @@ import { AgentRegistry } from "../registry/agent-registry";
 import type { ToolSession } from "../tools";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import { trackLateCleanup } from "../utils/late-cleanup";
-import type { ExecutorOptions } from "./executor";
+import type { ExecutorOptions, StallStoppedResult } from "./executor";
 import { runSubprocess } from "./executor";
 import { needsNativeTeardown, writeRetainedBackend } from "./isolation-ownership";
 import type { NestedRepoPatch, SingleResult } from "@oh-my-pi/pi-tui/tools/task";
@@ -390,6 +390,14 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 	let baseReleasePromise: Promise<void> | undefined;
 	let cleanupPromise: Promise<void> | undefined;
 	let releasePromise: Promise<void> | undefined;
+	/** Release-time capture, reused for the stalled return when release already removed the workspace. */
+	let releasedCapture: IsolationPatchCapture | undefined;
+	/**
+	 * Release-time capture-failure recovery error. When kept-alive release already
+	 * retained (and moved) the workspace, the stalled return reports this error and
+	 * its retained directory instead of re-capturing the now-missing original path.
+	 */
+	let releasedCaptureError: string | undefined;
 	const releaseBase = (): Promise<void> => {
 		baseReleasePromise ??= opts.baseOptions.onRelease?.() ?? Promise.resolve();
 		return baseReleasePromise;
@@ -410,18 +418,23 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 			try {
 				let capture: IsolationPatchCapture;
 				try {
+					// Deferred owner-job/shutdown cleanup may still be writing the
+					// worktree when release fires: settle it before capturing so the
+					// release-time patch is complete. A failed wait must not lose the
+					// workspace — the capture below still runs against the live tree.
+					if (deferredCleanup) await deferredCleanup.catch(() => undefined);
 					capture = await writeIsolationPatch(handle.mergedDir, taskBaseline, opts.artifactsDir, opts.agentId);
+					releasedCapture = capture;
 				} catch (captureErr) {
 					retainWorkspace = true;
 					const retained = await retainIsolationWorkspace(handle.mergedDir, handle.backend);
-					throw new Error(
-						renderIsolationError({
-							kind: "patch-capture-failed",
-							message: captureErr instanceof Error ? captureErr.message : String(captureErr),
-							retainedDir: retained.dir,
-							sidecarMissing: !retained.sidecarOk,
-						}),
-					);
+					releasedCaptureError = renderIsolationError({
+						kind: "patch-capture-failed",
+						message: captureErr instanceof Error ? captureErr.message : String(captureErr),
+						retainedDir: retained.dir,
+						sidecarMissing: !retained.sidecarOk,
+					});
+					throw new Error(releasedCaptureError);
 				}
 				const patchResult = capture.artifacts;
 				AgentRegistry.global().setHistory(opts.agentId, {
@@ -455,9 +468,20 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		const isolationBackend = handle.backend;
 		const baseline = await captureIsolationBaseline(isolationDir, opts.context.repoRoot);
 		taskBaseline = baseline;
+		// Capture/apply stay rooted at the isolation; the child runs in the same relative
+		// subdirectory the task was launched from, so nested-package tasks keep their cwd.
+		const relativeCwd = path.relative(
+			await fs.realpath(opts.context.repoRoot),
+			await fs.realpath(opts.baseOptions.cwd),
+		);
+		if (relativeCwd === ".." || relativeCwd.startsWith(`..${path.sep}`) || path.isAbsolute(relativeCwd)) {
+			throw new Error(`Task cwd ${opts.baseOptions.cwd} is outside repository ${opts.context.repoRoot}`);
+		}
+		const childCwd = path.join(isolationDir, relativeCwd);
+		await fs.mkdir(childCwd, { recursive: true });
 		const result = await runSubprocess({
 			...opts.baseOptions,
-			worktree: isolationDir,
+			worktree: childCwd,
 			preloadedExtensionPaths: undefined,
 			preloadedPreparedExtensions: undefined,
 			preloadedCustomToolPaths: undefined,
@@ -560,8 +584,28 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 				});
 			}
 		}
-		if (result.exitCode === 0) {
+		// Narrow to the local executor result type: pi-tui's frozen baseline omits the stall flag.
+		const stallStopped = (result as StallStoppedResult).stallStopped === true;
+		if (result.exitCode === 0 || stallStopped) {
 			try {
+				// A kept-alive stall can release (capture + cleanup) while the run
+				// result is still settling: the workspace is already gone, so the
+				// release-time capture is the stalled run's patch — reuse it rather
+				// than re-capturing a deleted worktree.
+				if (releasedCapture) {
+					handedOff = releasedCapture.fingerprint;
+					return rememberAgentArtifacts({ ...result, ...releasedCapture.artifacts });
+				}
+				// Release-time capture failed and the workspace was already retained
+				// (and moved): report that recovery error and its actual retained
+				// directory instead of recapturing the now-missing original path.
+				if (releasedCaptureError) {
+					return rememberAgentArtifacts({ ...result, error: releasedCaptureError });
+				}
+				// A stalled result cannot be captured while deferred owner jobs or
+				// shutdown hooks may still write the worktree — same barrier as
+				// success, extended to the stall-stop exit path.
+				if (deferredCleanup && stallStopped) await deferredCleanup;
 				const capture = await writeIsolationPatch(isolationDir, baseline, opts.artifactsDir, opts.agentId);
 				handedOff = capture.fingerprint;
 				return rememberAgentArtifacts({ ...result, ...capture.artifacts });

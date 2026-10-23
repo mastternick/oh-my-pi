@@ -64,12 +64,28 @@ function summarizeToolResult(toolResults: readonly ToolResultMessage[], toolCall
 	return summarizeText(textParts.join("\n"), RESULT_SUMMARY_LIMIT);
 }
 
+/** Consecutive all-unresolved tool turns that end the run; fixed, not configurable. */
+const UNRESOLVED_TOOL_TURN_LIMIT = 3;
+
+/** One completed tool turn: the calls the loop was to run, and the ids whose registry lookup failed (undefined when none did). */
+export interface UnresolvedToolTurn {
+	readonly toolCalls: readonly { readonly id: string; readonly name: string }[];
+	readonly unresolvedToolCallIds: ReadonlySet<string> | undefined;
+}
+
+export interface UnresolvedToolLoopDetection {
+	kind: "unresolved_tool_loop";
+	count: number;
+	toolNames: string[];
+}
+
 /** Detects consecutive identical assistant tool calls across model turns. */
 export class ToolCallLoopGuard {
 	#threshold: number;
 	#exemptTools: ReadonlySet<string>;
 	#lastHash: string | undefined;
 	#count = 0;
+	#unresolvedCount = 0;
 
 	constructor(options: ToolCallLoopGuardOptions) {
 		this.#threshold = Math.max(1, Math.trunc(options.threshold));
@@ -114,4 +130,29 @@ export class ToolCallLoopGuard {
 			),
 		};
 	}
+
+	/**
+	 * Counts consecutive completed tool turns in which every runnable call failed registry lookup.
+	 * A turn without `unresolvedToolCallIds` (no runnable batch, or no lookup miss) resets the count.
+	 * Independent of `threshold`, `exemptTools`, and the identical-call streak.
+	 */
+	recordUnresolvedTurn(turn: UnresolvedToolTurn | undefined): UnresolvedToolLoopDetection | null {
+		const unresolved = turn?.unresolvedToolCallIds;
+		if (turn === undefined || unresolved === undefined || turn.toolCalls.length === 0) {
+			this.#unresolvedCount = 0;
+			return null;
+		}
+		if (!turn.toolCalls.every(toolCall => unresolved.has(toolCall.id))) {
+			this.#unresolvedCount = 0;
+			return null;
+		}
+		this.#unresolvedCount++;
+		if (this.#unresolvedCount < UNRESOLVED_TOOL_TURN_LIMIT) return null;
+		return {
+			kind: "unresolved_tool_loop",
+			count: this.#unresolvedCount,
+			toolNames: turn.toolCalls.map(toolCall => toolCall.name),
+		};
+	}
 }
+

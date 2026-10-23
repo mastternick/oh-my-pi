@@ -412,6 +412,8 @@ export class WorkPool {
 							artifactsDir: this.session.getSessionFile()?.slice(0, -6),
 							maxRuntimeMs: cfgTaskMaxRuntimeMs.get(this.session.settings),
 							completionProbe: isCompletionProbeEnabled(this.session.settings, this.session.taskDepth ?? 0),
+							settings: this.session.settings,
+							modelRegistry: this.session.modelRegistry,
 						});
 					}
 				} catch (error) {

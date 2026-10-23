@@ -1,0 +1,10 @@
+{
+	"stall": {
+		"instructions": "A delegated coding subagent has gone many requests without an edit, a new command, or a yield. The state gives its assignment, counters since its last progress, its most recent tool calls (REPEAT: identical to an earlier call; new: first time; error: the call failed), and whether its last two texts restate the same blocker. Judge its trajectory, not its wording: is it advancing its assignment?",
+		"criteria": {
+			"progressing": "Recent calls reach new files, commands, or results that change what it does next, and the assignment is moving toward completion.",
+			"looping": "It repeats the same reads or commands without acting on their results, or circles without converging, while the assignment remains unfinished.",
+			"blocked": "It has hit a blocker its tools cannot clear, such as missing access, a failing environment, or a contradictory requirement, and keeps retrying or restating it instead of yielding with the blocker."
+		}
+	}
+}

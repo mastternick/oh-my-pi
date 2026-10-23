@@ -26,6 +26,7 @@ import { isRecord } from "@oh-my-pi/pi-utils";
 import {
 	type ChainJudge,
 	type JudgmentUsage,
+	journalJudgmentDecision,
 	journalJudgmentUsage,
 	resolveJudge,
 	sharedJudgmentCache,
@@ -186,6 +187,7 @@ export function sessionJudge(
 		sessionId: session.getSessionId?.() ?? undefined,
 		purpose,
 		telemetry: session.getTelemetry?.(),
+		onDecision: journalJudgmentDecision(session.sessionManager),
 		cache: sharedJudgmentCache(),
 		onUsage:
 			onUsage && journal

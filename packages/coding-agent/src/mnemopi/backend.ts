@@ -9,7 +9,7 @@ import type { DiagnosticSummary } from "@oh-my-pi/pi-mnemopi/diagnose";
 import { logger, prompt, withLoopPhase } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { roleCandidatePool } from "../config/model-roles";
-import { resolveRoleChain } from "../config/model-resolver";
+import { type RoleChainCandidate, resolveRoleChain } from "../config/model-resolver";
 import { type JudgmentUsageLedger, journalJudgmentUsage } from "../judgment";
 import type {
 	MemoryBackend,
@@ -32,6 +32,8 @@ import {
 	type MnemopiProviderOptions,
 	truncateApproxTokens,
 } from "./config";
+import type { ExperienceCompleter } from "./experience";
+import { resolveProjectRepoRoot } from "./project-identity";
 import {
 	getMnemopiScopedBanks,
 	getMnemopiScopedDbPaths,
@@ -41,6 +43,7 @@ import {
 	MnemopiSessionState,
 	requireMnemopi,
 	requireMnemopiCore,
+	resolveBankDbPath,
 	setMnemopiSessionState,
 } from "./state";
 
@@ -80,14 +83,18 @@ export function resolveMemoryCompletionInput(
 }
 
 async function installMnemopiState(session: AgentSession, config: MnemopiBackendConfig): Promise<MnemopiSessionState> {
-	const state = new MnemopiSessionState({ sessionId: session.sessionId, config, session });
+	const completeLlm = config.experienceEnabled
+		? resolveExperienceCompleter(session.settings, session.modelRegistry, session.sessionId, session.sessionManager)
+		: undefined;
+	const state = new MnemopiSessionState({ sessionId: session.sessionId, config, session, completeLlm });
 	const previous = setMnemopiSessionState(session, state);
 	await previous?.dispose();
 	try {
 		state.attachSessionListeners();
-		// Promote age-eligible working memory to episodic before the session's
-		// first write can TTL-trim unconsolidated retain/learn rows (#10770).
-		state.promoteEligibleWorkingMemory();
+		// Startup promotion rewrites age-eligible working rows as lossy regex episodes; only auto-retained
+		// transcripts need it, before their 24h trim. Explicit retain/learn rows are trim-exempt by source
+		// (pi-mnemopi trimWorkingMemory) and stay verbatim until explicit consolidation.
+		if (config.autoRetain) state.promoteEligibleWorkingMemory();
 		return state;
 	} catch (error) {
 		setMnemopiSessionState(session, undefined);
@@ -107,11 +114,12 @@ export const mnemopiBackend: MemoryBackend = {
 		if (options.taskDepth > 0) {
 			const parent = getMnemopiSessionStateFromParent(options);
 			if (!parent) return;
+			// Logical identity and bank stay the parent's; only repo-relative fingerprints follow this child's checkout.
 			const previous = setMnemopiSessionState(
 				session,
 				new MnemopiSessionState({
 					sessionId,
-					config: parent.config,
+					config: { ...parent.config, repoRoot: resolveProjectRepoRoot(session.sessionManager.getCwd()) },
 					session,
 					aliasOf: parent,
 					hasRecalledForFirstTurn: true,
@@ -199,7 +207,7 @@ export const mnemopiBackend: MemoryBackend = {
 				await Promise.all([loadMnemopi(), loadMnemopiCore()]);
 				state = await installMnemopiState(session, config);
 			}
-			await state?.consolidate({ full: true, retain: true });
+			if (state) await state.consolidate({ full: true, retain: state.config.autoRetain });
 		} catch (error) {
 			logger.warn("Mnemopi: enqueue failed.", { error: String(error) });
 		}
@@ -376,13 +384,6 @@ function createStatsMemory(config: MnemopiBackendConfig, bank: string): Mnemopi 
 	} as ConstructorParameters<typeof Mnemopi>[0]);
 }
 
-function resolveBankDbPath(config: MnemopiBackendConfig, bank: string): string {
-	const sharedBank = config.globalBank ?? config.baseBank ?? "default";
-	if (bank === sharedBank) return config.dbPath;
-	const { BankManager } = requireMnemopiCore();
-	return new BankManager(path.dirname(config.dbPath)).getBankDbPath(bank);
-}
-
 function dedupeStatsTargets(targets: readonly MnemopiStatsTarget[]): MnemopiStatsTarget[] {
 	const seen = new Set<string>();
 	const unique: MnemopiStatsTarget[] = [];
@@ -528,6 +529,131 @@ async function openrouterKeyResolver(
 	return modelRegistry.resolver("openrouter", { sessionId });
 }
 
+/** One MEMORY-role completion down the resolved fallback chain; `null` when no candidate answers. */
+async function completeMemoryRole(
+	candidates: RoleChainCandidate[],
+	modelRegistry: ModelRegistry,
+	sessionId: string,
+	usageLedger: Partial<JudgmentUsageLedger>,
+	request: MemoryCompletionInput,
+	call: { phase: string; maxTokens?: number; temperature?: number; signal?: AbortSignal },
+): Promise<string | null> {
+	// journalJudgmentUsage snapshots the session id. /new, fork, and session
+	// switch keep the caller's completer, so bind inside each call. An in-flight call
+	// keeps the callback it already created and still journals to its start.
+	const onUsage = journalJudgmentUsage(usageLedger);
+	const { signal } = call;
+	for (const { model } of candidates) {
+		if (signal?.aborted) return null;
+		try {
+			if (model.api === "local-inference") {
+				const result = await tinyModelClient.complete(model.id, request.prompt, {
+					maxTokens: call.maxTokens,
+					systemPrompt: request.systemPrompt,
+					signal,
+				});
+				if (result !== null) return result;
+				if (signal?.aborted) return null;
+				logger.warn("Mnemopi: local memory completion failed; trying the next configured fallback.", {
+					provider: model.provider,
+					model: model.id,
+				});
+				continue;
+			}
+
+			const hasApiKey = await modelRegistry.getApiKey(model, sessionId);
+			if (!hasApiKey) {
+				logger.warn("Mnemopi: memory completion model has no current API key; trying the next fallback.", {
+					provider: model.provider,
+					model: model.id,
+				});
+				continue;
+			}
+			const message = await retryTransientCompletion(
+				() =>
+					withLoopPhase(call.phase, () =>
+						completeSimple(
+							model,
+							{
+								...(request.systemPrompt ? { systemPrompt: [request.systemPrompt] } : {}),
+								messages: [{ role: "user", content: request.prompt, timestamp: Date.now() }],
+							},
+							{
+								apiKey: modelRegistry.resolver(model, sessionId),
+								sessionId,
+								maxTokens: call.maxTokens,
+								temperature: call.temperature,
+								signal,
+								onAttempt: message =>
+									onUsage?.({
+										purpose: "memory",
+										role: "memory",
+										api: model.api,
+										provider: model.provider,
+										model: model.id,
+										usage: message.usage,
+										stopReason: message.stopReason,
+										errorMessage: message.errorMessage,
+									}),
+							},
+						),
+					),
+				{ provider: model.provider, signal },
+			);
+			if (message.stopReason === "aborted" || signal?.aborted) return null;
+			if (message.stopReason === "error") {
+				logger.warn("Mnemopi: memory completion model failed; trying the next configured fallback.", {
+					provider: model.provider,
+					model: model.id,
+					error: message.errorMessage,
+				});
+				continue;
+			}
+			return message.content
+				.filter(
+					(block): block is Extract<(typeof message.content)[number], { type: "text" }> =>
+						block.type === "text",
+				)
+				.map(block => block.text)
+				.join("\n")
+				.trim();
+		} catch (error) {
+			if (signal?.aborted) return null;
+			logger.warn("Mnemopi: memory completion model threw; trying the next configured fallback.", {
+				provider: model.provider,
+				model: model.id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	return null;
+}
+
+/**
+ * Experience-lesson completer on the MEMORY role. It ignores mnemopi's `llmMode`, so lesson capture
+ * works while transcript retention and mnemopi's own LLM stay off.
+ */
+function resolveExperienceCompleter(
+	settings: MemoryBackendStartOptions["settings"],
+	modelRegistry: ModelRegistry,
+	sessionId: string,
+	usageLedger: Partial<JudgmentUsageLedger>,
+): ExperienceCompleter | undefined {
+	const candidates = resolveRoleChain("memory", settings, roleCandidatePool("memory", settings, modelRegistry));
+	if (candidates.length === 0) return undefined;
+	return async (prompt, system, signal) => {
+		const text = await completeMemoryRole(
+			candidates,
+			modelRegistry,
+			sessionId,
+			usageLedger,
+			{ prompt, systemPrompt: system },
+			{ phase: "experience.extract", signal },
+		);
+		return text ?? undefined;
+	};
+}
+
 async function resolveMnemopiProviderOptions(
 	config: MnemopiBackendConfig,
 	settings: MemoryBackendStartOptions["settings"],
@@ -572,104 +698,16 @@ async function resolveMnemopiProviderOptions(
 			return base;
 		}
 
-		const complete = async (prompt: string, opts?: MnemopiLlmCompleteOptions): Promise<string | null> => {
-			// journalJudgmentUsage snapshots the session id. /new, fork, and session
-			// switch keep this function, so bind inside each call. An in-flight call
-			// keeps the callback it already created and still journals to its start.
-			const { onUsage, request, signal } = {
-				onUsage: journalJudgmentUsage(usageLedger),
-				request: resolveMemoryCompletionInput(prompt, opts),
+		const complete = (prompt: string, opts?: MnemopiLlmCompleteOptions): Promise<string | null> =>
+			completeMemoryRole(candidates, modelRegistry, sessionId, usageLedger, resolveMemoryCompletionInput(prompt, opts), {
+				phase: "mnemopi.extract",
+				maxTokens: opts?.maxTokens,
+				temperature: opts?.temperature,
 				signal:
 					typeof opts?.timeout === "number" && Number.isFinite(opts.timeout) && opts.timeout > 0
 						? AbortSignal.timeout(opts.timeout)
 						: undefined,
-			};
-
-			for (const { model } of candidates) {
-				if (signal?.aborted) return null;
-				try {
-					if (model.api === "local-inference") {
-						const result = await tinyModelClient.complete(model.id, request.prompt, {
-							maxTokens: opts?.maxTokens,
-							systemPrompt: request.systemPrompt,
-							signal,
-						});
-						if (result !== null) return result;
-						if (signal?.aborted) return null;
-						logger.warn("Mnemopi: local memory completion failed; trying the next configured fallback.", {
-							provider: model.provider,
-							model: model.id,
-						});
-						continue;
-					}
-
-					const hasApiKey = await modelRegistry.getApiKey(model, sessionId);
-					if (!hasApiKey) {
-						logger.warn("Mnemopi: memory completion model has no current API key; trying the next fallback.", {
-							provider: model.provider,
-							model: model.id,
-						});
-						continue;
-					}
-					const message = await retryTransientCompletion(
-						() =>
-							withLoopPhase("mnemopi.extract", () =>
-								completeSimple(
-									model,
-									{
-										...(request.systemPrompt ? { systemPrompt: [request.systemPrompt] } : {}),
-										messages: [{ role: "user", content: request.prompt, timestamp: Date.now() }],
-									},
-									{
-										apiKey: modelRegistry.resolver(model, sessionId),
-										sessionId,
-										maxTokens: opts?.maxTokens,
-										temperature: opts?.temperature,
-										signal,
-										onAttempt: message =>
-											onUsage?.({
-												purpose: "memory",
-												role: "memory",
-												api: model.api,
-												provider: model.provider,
-												model: model.id,
-												usage: message.usage,
-												stopReason: message.stopReason,
-												errorMessage: message.errorMessage,
-											}),
-									},
-								),
-							),
-						{ provider: model.provider, signal },
-					);
-					if (message.stopReason === "aborted" || signal?.aborted) return null;
-					if (message.stopReason === "error") {
-						logger.warn("Mnemopi: memory completion model failed; trying the next configured fallback.", {
-							provider: model.provider,
-							model: model.id,
-							error: message.errorMessage,
-						});
-						continue;
-					}
-					return message.content
-						.filter(
-							(block): block is Extract<(typeof message.content)[number], { type: "text" }> =>
-								block.type === "text",
-						)
-						.map(block => block.text)
-						.join("\n")
-						.trim();
-				} catch (error) {
-					if (signal?.aborted) return null;
-					logger.warn("Mnemopi: memory completion model threw; trying the next configured fallback.", {
-						provider: model.provider,
-						model: model.id,
-						error: error instanceof Error ? error.message : String(error),
-					});
-				}
-			}
-			return null;
-		};
+			});
 
 		return {
 			...base,

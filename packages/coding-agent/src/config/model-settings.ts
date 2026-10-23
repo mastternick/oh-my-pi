@@ -25,6 +25,12 @@ export interface ModelPreset {
 	modelRoles: Record<string, string>;
 	/** `defaultThinkingLevel` at save time; absent in hand-written presets that leave it alone. */
 	defaultThinkingLevel?: SettingValueOf<typeof cfgDefaultThinkingLevel>;
+	/**
+	 * `retry.fallbackChains` at save time; absent in presets saved before fallback
+	 * isolation (and in hand-written presets that leave chains alone). When present,
+	 * applying the preset replaces the live chains with exactly this record.
+	 */
+	fallbackChains?: Record<string, string[]>;
 }
 
 const EMPTY_STRING_ARRAY: string[] = [];
@@ -114,6 +120,9 @@ export const cfgModelPresets = register({
 	type: "record",
 	default: EMPTY_MODEL_PRESETS_RECORD,
 });
+
+/** Name of the preset saved as this project's default for new sessions; set by `/modelpreset switch`. */
+export const cfgModelPresetDefault = register({ id: "modelPresetDefault", type: "string", default: undefined });
 
 export const cfgModelTags = register({ id: "modelTags", type: "record", default: EMPTY_MODEL_TAGS_RECORD });
 

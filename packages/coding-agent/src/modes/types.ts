@@ -112,7 +112,7 @@ export interface ShowStatusOptions {
 export interface AgentHubOpenOptions {
 	requireContent?: boolean;
 	armCloseTap?: boolean;
-	initialSection?: "agents" | "activity";
+	initialSection?: "agents" | "activity" | "judge";
 }
 
 export interface InteractiveModeContext {

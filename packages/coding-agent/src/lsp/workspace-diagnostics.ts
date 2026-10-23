@@ -141,11 +141,11 @@ export async function detectProjectTypes(cwd: string, signal?: AbortSignal): Pro
 /** Interpret an empty checker result without mistaking a crash for a clean workspace. */
 export function interpretEmptyDiagnosticsResult(
 	exitCode: number,
-	signalCode: string | null,
+	signalCode: NodeJS.Signals | number | null,
 	command: readonly string[],
 ): string {
 	if (exitCode === 0) return "No issues found";
-	const detail = signalCode ? `was killed by ${signalCode}` : `exited with code ${exitCode}`;
+	const detail = signalCode !== null ? `was killed by ${signalCode}` : `exited with code ${exitCode}`;
 	return `Failed to run ${command.join(" ")}: the checker ${detail} without reporting anything, so the workspace was not verified`;
 }
 

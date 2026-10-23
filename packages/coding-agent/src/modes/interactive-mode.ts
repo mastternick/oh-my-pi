@@ -1740,8 +1740,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.sessionManager = session.sessionManager;
 		this.settings = session.settings;
 		const preferences = {
-			quiet: cfgStartupQuiet.get(settings),
-			composerShape: cfgComposerShape.get(settings),
+			quiet: cfgStartupQuiet.get(this.settings),
+			composerShape: cfgComposerShape.get(this.settings),
 			...this.#liveComposerPreferences(),
 		};
 		const wasStarted = composer?.started ?? false;
@@ -7772,25 +7772,38 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	/**
 	 * Apply `worktree.onStart` to a fresh launch: optionally move the session into
-	 * a new worktree forked from clean `HEAD`. Silent no-op outside git checkouts;
-	 * failures become a warning so startup continues.
+	 * a new worktree forked from clean `HEAD`. Silent no-op outside git checkouts.
+	 * Under `create`, eligibility errors and failed creates throw so startup aborts
+	 * instead of continuing in the shared checkout; under `ask` such errors only warn.
 	 */
 	async maybeAutoCreateWorktree(): Promise<void> {
+		const policy = cfgWorktreeOnStart.get(this.settings);
+		if (policy === "off") return;
+		let create: boolean;
 		try {
-			const policy = cfgWorktreeOnStart.get(this.settings);
-			if (policy === "off" || !(await canAutoCreateWorktree(this.sessionManager.getCwd()))) return;
-			if (
-				policy === "ask" &&
-				!(await this.showHookConfirm(
+			create = await canAutoCreateWorktree(this.sessionManager.getCwd());
+			if (create && policy === "ask") {
+				create = await this.showHookConfirm(
 					"Create a worktree for this session?",
 					"Work happens on a new wt/* branch; this checkout stays untouched.",
-				))
-			) {
-				return;
+				);
 			}
-			await this.handleWorktreeCommand(undefined, { keepChanges: false });
 		} catch (err) {
-			this.showWarning(`Worktree not created: ${err instanceof Error ? err.message : String(err)}`);
+			const message = err instanceof Error ? err.message : String(err);
+			if (policy === "create") {
+				throw new Error(`worktree.onStart=create failed: ${message}; not starting in the shared checkout.`);
+			}
+			this.showWarning(`Worktree not created: ${message}`);
+			return;
+		}
+		if (!create) return;
+
+		const ownedBefore = this.#ownedWorktrees.length;
+		await this.handleWorktreeCommand(undefined, { keepChanges: true });
+		// `/wt` shows its own error and returns without a worktree; continuing here
+		// would run the session in the shared checkout.
+		if (this.#ownedWorktrees.length === ownedBefore) {
+			throw new Error("worktree.onStart=create failed; not starting in the shared checkout.");
 		}
 	}
 

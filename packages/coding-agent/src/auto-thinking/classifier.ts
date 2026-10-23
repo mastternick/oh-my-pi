@@ -17,7 +17,7 @@ import { type ChoiceQuestion, Effort, judgeQuestions, type Model, renderQuestion
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
-import { type JudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
+import { type JudgmentDecision, type JudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import questionFile from "../prompts/judge/auto-thinking.json" with { type: "json" };
 import { clampAutoThinkingEffort } from "@oh-my-pi/pi-tui/thinking";
 import { preprocessTinyMessage } from "../tiny/message-preproc";
@@ -95,6 +95,7 @@ export interface ClassifyDifficultyDeps {
 	signal?: AbortSignal;
 	metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
 	onUsage?: (usage: JudgmentUsage) => void;
+	onDecision?: (decision: JudgmentDecision) => void;
 	telemetry?: AgentTelemetryConfig;
 }
 
@@ -127,6 +128,7 @@ export async function classifyDifficulty(
 		metadataResolver: deps.metadataResolver,
 		purpose: "auto-thinking",
 		onUsage: deps.onUsage,
+		onDecision: deps.onDecision,
 		telemetry: deps.telemetry,
 		cache: sharedJudgmentCache(),
 	});

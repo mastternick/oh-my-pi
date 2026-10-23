@@ -7,7 +7,8 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
-import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
+import { $env, logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { resolveAgentModelSelection, resolveConfiguredModelPatterns } from "../config/model-resolver";
 import { type OAuthAccountPools, validateAgentAccountPools } from "../config/account-pools";
@@ -57,6 +58,7 @@ import type {
 	StructuredSubagentSchemaSource,
 } from "@oh-my-pi/pi-tui/tools/task";
 import type { WorkPoolYieldItem } from "./workpool-yield";
+import { isReadOnlyAgent } from "./read-only-policy";
 import { parseIsolationBackend } from "./worktree";
 
 import {
@@ -182,6 +184,8 @@ export interface EffectiveSubagentPolicy {
 	applyChanges: boolean;
 	enableLsp: boolean;
 	enableIrc: boolean;
+	/** Actionable reason why an unisolated task spawn fell back to running directly in the parent tree. */
+	isolationSkipReason?: string;
 }
 
 /** Settled child execution plus data needed by the frontends' own rendering. */
@@ -408,7 +412,24 @@ export async function resolveEffectiveSubagentPolicy(
 	// child's inherited retry-fallback chain is keyed off the role.
 	const { patterns: modelOverride, role: modelRole } = resolveAgentModelSelection(modelResolution);
 	const isolationEnabled = cfgTaskIsolationEnabled.get(request.session.settings);
-	const isIsolated = request.isolation?.requested === true;
+	let isolationSkipReason: string | undefined;
+	const isWritableTaskSpawn =
+		request.invocationKind === "task" &&
+		isolationEnabled &&
+		!isReadOnlyAgent(effectiveAgent);
+	if (isWritableTaskSpawn && request.isolation?.requested === undefined) {
+		if (vcs.isPureJj(request.session.cwd)) {
+			isolationSkipReason = "pure Jujutsu (jj) repository; worktree isolation unavailable";
+		} else if (vcs.git(request.session.cwd) === null) {
+			isolationSkipReason = "not a git checkout; worktree isolation unavailable";
+		}
+	}
+	// An omitted `isolated` on a task spawn defaults on only for writable agents in a Git checkout.
+	// Explicit true/false keeps its existing meaning; false is the opt-out with no worktree.
+	const isolationRequested =
+		request.isolation?.requested ??
+		(isWritableTaskSpawn && !vcs.isPureJj(request.session.cwd) && vcs.git(request.session.cwd) !== null);
+	const isIsolated = isolationRequested === true;
 	if (isIsolated && !isolationEnabled) {
 		throw new StructuredSubagentError(
 			"preflight",
@@ -429,6 +450,7 @@ export async function resolveEffectiveSubagentPolicy(
 		schema,
 		planMode,
 		isIsolated,
+		isolationSkipReason,
 		mergeMode: request.isolation?.merge ?? cfgTaskIsolationMerge.get(request.session.settings),
 		applyChanges:
 			request.isolation?.apply ??
@@ -754,6 +776,13 @@ function describeSalvagedWork(result: SingleResult): string {
 	return `\n${hint.trim()}`;
 }
 
+const unisolatedTaskWarningTemplate =
+	"<system-notification>Isolation skipped: {{agentName}} ran unisolated, writing directly into the parent tree at `{{cwd}}` ({{reason}}). Start the session from a git checkout so task spawns get worktree isolation; pass `isolated: false` explicitly to opt out and silence this note.</system-notification>";
+
+export function renderUnisolatedTaskWarning(agentName: string, cwd: string, reason: string): string {
+	return `\n\n${prompt.render(unisolatedTaskWarningTemplate, { agentName, cwd, reason })}`;
+}
+
 /**
  * Execute a validated subagent. Preflight errors occur before any artifact
  * lease or child dispatch; callers keep responsibility for their result text.
@@ -762,7 +791,23 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 	const policy = await applySpawnHook(request, await resolveEffectiveSubagentPolicy(request));
 	const lease = await leaseArtifacts(request.session, request.invocationKind);
 	let changesApplied: boolean | null = null;
-	let mergeSummary = "";
+	// A writable task spawn whose implicit worktree isolation silently fell back
+	// to the parent tree (cwd is not a git checkout, or pure jj) must be loud:
+	// log it, and ride the note on the same mergeSummary channel
+	// renderIsolationSummary uses so the parent sees the worker was unisolated.
+	// Placed here, not in the policy resolver, because frontends also run the
+	// resolver as a side-effect-free preflight (see applySpawnHook).
+	const unisolatedNote = policy.isolationSkipReason
+		? renderUnisolatedTaskWarning(policy.agentName, request.session.cwd, policy.isolationSkipReason)
+		: "";
+	if (policy.isolationSkipReason) {
+		logger.warn("Subagent worktree isolation skipped; worker runs directly in the parent tree", {
+			cwd: request.session.cwd,
+			agent: policy.agentName,
+			reason: policy.isolationSkipReason,
+		});
+	}
+	let mergeSummary = unisolatedNote;
 	let requiresRecoveryArtifacts = false;
 	let completedSuccessfully = false;
 	let hasValidStructuredOutput = false;

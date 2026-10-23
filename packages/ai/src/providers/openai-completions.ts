@@ -1569,10 +1569,10 @@ const streamOpenAICompletionsOnce = (
 									block.streamIndex = streamIndex;
 									toolCallBlockByIndex.set(streamIndex, block);
 								}
+								if (incomingName) block.name += incomingName;
 							}
 
 							if (toolCall.id) block.id = toolCall.id;
-							if (incomingName) block.name = incomingName;
 							const extraContent = getGeminiThoughtSignatureExtraContent(Reflect.get(toolCall, "extra_content"));
 							if (extraContent) {
 								block.thoughtSignature = mergeStoredGeminiSignature(block.thoughtSignature, {

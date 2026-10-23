@@ -81,10 +81,64 @@ export interface JudgeDeps {
 	 * hits never. Wire {@link journalJudgmentUsage} here to bill the session.
 	 */
 	onUsage?: (usage: JudgmentUsage) => void;
+	/**
+	 * Receives every traced candidate call, cache-only and failed ones included. Never billed; a throwing
+	 * callback is logged and cannot change the judgment. Wire {@link journalJudgmentDecision} here.
+	 */
+	onDecision?: (decision: JudgmentDecision) => void;
 	/** Host telemetry; every attempt, cache hits included, emits one `judgment` span. */
 	telemetry?: AgentTelemetryConfig;
 	/** Answer cache for native judgments; omitted runs every question against the provider. */
 	cache?: JudgmentCache;
+}
+
+/** Question wording as the trace records it: id, type, and a bounded single-line summary. */
+export interface JudgmentDecisionQuestion {
+	id: string;
+	type: string;
+	summary: string;
+}
+
+/**
+ * One candidate judgment call on the session, stored as the data of a `judge-decision` custom entry.
+ * Holds the typed answers as returned and no request state or model rationale; never billed.
+ */
+export interface JudgmentDecision {
+	version: 1;
+	purpose: string;
+	provider: string;
+	model: string;
+	status: "ok" | "error";
+	durationMs: number;
+	questions: JudgmentDecisionQuestion[];
+	answers: Record<string, unknown>;
+	cachedQuestions?: number;
+	totalQuestions?: number;
+	errorMessage?: string;
+}
+
+/** Custom entry type that holds {@link JudgmentDecision} records. */
+export const JUDGMENT_DECISION_ENTRY = "judge-decision";
+
+/** One candidate call as its backend observed it, before {@link ChainJudge} stamps its purpose. */
+interface DecisionDraft {
+	startedAt: number;
+	provider: string;
+	model: string;
+	questions: Questions;
+	status: "ok" | "error";
+	answers?: Record<string, unknown>;
+	cachedQuestions?: number;
+	errorMessage?: string;
+}
+
+const DECISION_SUMMARY_MAX = 160;
+const DECISION_ERROR_MAX = 500;
+
+/** Collapse control characters and whitespace, then bound the length. */
+function boundedText(text: string, max: number): string {
+	const flat = text.replace(/\p{Cc}+/gu, " ").replace(/\s+/g, " ").trim();
+	return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
 /**
@@ -121,6 +175,65 @@ export function journalJudgmentUsage(manager: Partial<JudgmentUsageLedger> | und
 	return usage => {
 		manager.appendModelUsage(usage, { sessionId, parentId: manager.getLeafId() });
 	};
+}
+
+/** Session journal surface that records judgment decisions; journal-only managers omit it. */
+export type JudgmentDecisionLedger = Pick<SessionManager, "appendCustomEntryOn" | "getSessionId" | "getLeafId">;
+
+function isDecisionLedger(manager: Partial<JudgmentDecisionLedger>): manager is JudgmentDecisionLedger {
+	return (
+		manager.appendCustomEntryOn !== undefined && manager.getSessionId !== undefined && manager.getLeafId !== undefined
+	);
+}
+
+/**
+ * Build a {@link JudgeDeps.onDecision} that journals each decision as a `judge-decision` custom entry beneath
+ * the session leaf at record time, without moving the leaf or writing usage. Decisions that land after the
+ * session changes are dropped by the ledger. Returns `undefined` when the journal cannot record entries.
+ */
+export function journalJudgmentDecision(
+	manager: Partial<JudgmentDecisionLedger> | undefined,
+): ((decision: JudgmentDecision) => string | undefined) | undefined {
+	if (!manager || !isDecisionLedger(manager)) return undefined;
+	const sessionId = manager.getSessionId();
+	return decision =>
+		manager.appendCustomEntryOn(JUDGMENT_DECISION_ENTRY, decision, { sessionId, parentId: manager.getLeafId() });
+}
+
+/** Custom entry recording which auto-thinking level was applied, linked to the decision that chose it. */
+export const JUDGMENT_EFFORT_APPLIED_ENTRY = "judge-effort-applied";
+
+export interface JudgmentEffortApplied {
+	version: 1;
+	/** Id of the latest successful `judge-decision` entry from the same classification. */
+	decisionEntryId: string;
+	/** Effort applied to the agent. */
+	level: string;
+	/** Id of the `thinking_level_change` written for this application; absent when the level was unchanged. */
+	thinkingEntryId?: string;
+}
+
+/**
+ * Record an applied auto-thinking level on the session branch. Dropped when the session no longer matches
+ * `sessionId`. Never throws and does not move the leaf.
+ */
+export function journalJudgmentEffortApplied(
+	manager: Partial<JudgmentDecisionLedger> | undefined,
+	sessionId: string,
+	applied: JudgmentEffortApplied,
+): string | undefined {
+	if (!manager || !isDecisionLedger(manager)) return undefined;
+	try {
+		return manager.appendCustomEntryOn(JUDGMENT_EFFORT_APPLIED_ENTRY, applied, {
+			sessionId,
+			parentId: manager.getLeafId(),
+		});
+	} catch (error) {
+		logger.warn("judge: failed to journal applied effort", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return undefined;
+	}
 }
 
 /** One keyword per answer; OpenAI-compatible endpoints reject budgets below 16. */
@@ -318,6 +431,71 @@ export class ChainJudge implements Judge {
 		}).catch(error => logger.warn("judgment telemetry failed", { error: String(error) }));
 	}
 
+	/** Trace one chat-backed or local candidate call; its billed attempts are still reported by their backends. */
+	#observed(judge: Judge, model: Model): Judge {
+		return {
+			label: judge.label,
+			judge: async <Q extends Questions>(
+				request: JudgmentRequest<Q>,
+				options?: JudgeOptions,
+			): Promise<JudgmentResult<Q>> => {
+				const startedAt = Date.now();
+				try {
+					const result = await judge.judge(request, options);
+					this.#trace({
+						startedAt,
+						provider: model.provider,
+						model: model.id,
+						questions: request.questions,
+						status: "ok",
+						answers: result.answers as Record<string, unknown>,
+					});
+					return result;
+				} catch (error) {
+					this.#trace({
+						startedAt,
+						provider: model.provider,
+						model: model.id,
+						questions: request.questions,
+						status: "error",
+						errorMessage: error instanceof Error ? error.message : String(error),
+					});
+					throw error;
+				}
+			},
+		};
+	}
+
+	/** Journal one decision on the session; a failing journal is logged and never changes the judgment. */
+	#trace(draft: DecisionDraft): void {
+		const onDecision = this.#deps.onDecision;
+		if (!onDecision) return;
+		try {
+			const ids = Object.keys(draft.questions);
+			onDecision({
+				version: 1,
+				purpose: this.#deps.purpose,
+				provider: draft.provider,
+				model: draft.model,
+				status: draft.status,
+				durationMs: Math.max(0, Date.now() - draft.startedAt),
+				questions: ids.map(id => ({
+					id,
+					type: draft.questions[id].type,
+					summary: boundedText(draft.questions[id].instructions, DECISION_SUMMARY_MAX),
+				})),
+				answers: draft.answers ?? {},
+				totalQuestions: ids.length,
+				...(draft.cachedQuestions !== undefined && { cachedQuestions: draft.cachedQuestions }),
+				...(draft.errorMessage !== undefined && {
+					errorMessage: boundedText(draft.errorMessage, DECISION_ERROR_MAX),
+				}),
+			});
+		} catch (error) {
+			logger.warn("judgment decision journal failed", { error: String(error) });
+		}
+	}
+
 	#rejections(): Map<string, number> {
 		const registry: RegistryWithRejections = this.#deps.registry;
 		return (registry[kRejections] ??= new Map());
@@ -334,13 +512,19 @@ export class ChainJudge implements Judge {
 
 	async #createJudge(candidate: RoleChainCandidate, signal: AbortSignal | undefined): Promise<Judge | undefined> {
 		const model = candidate.model;
-		if (model.api === "local-inference") return new TextJudge(new LocalTextBackend(model.id));
+		if (model.api === "local-inference") {
+			const local = new TextJudge(new LocalTextBackend(model.id));
+			return this.#deps.onDecision ? this.#observed(local, model) : local;
+		}
 		if (!(await this.#deps.registry.getApiKey(model, this.#deps.sessionId, { signal }))) return undefined;
 		const apiKey = this.#deps.registry.resolver(model, this.#deps.sessionId);
 		if (isJudgmentApi(model.api)) {
 			const headers = await this.#deps.registry.resolveModelHeaders(model, signal);
 			const judge = createNativeJudge(model, { apiKey, headers });
-			return nativeJudge(judge, model, this.#deps.cache, attempt => this.#report(attempt));
+			return nativeJudge(judge, model, this.#deps.cache, {
+				report: attempt => this.#report(attempt),
+				trace: this.#deps.onDecision ? draft => this.#trace(draft) : undefined,
+			});
 		}
 		// Resolve metadata after getApiKey so the session-sticky credential is recorded first.
 		const metadata = this.#deps.metadataResolver?.(model.provider);
@@ -362,7 +546,8 @@ export class ChainJudge implements Judge {
 					startedAt: attempt.timestamp,
 				}),
 		});
-		return new TextJudge(backend);
+		const text = new TextJudge(backend);
+		return this.#deps.onDecision ? this.#observed(text, model) : text;
 	}
 }
 
@@ -403,12 +588,13 @@ class LocalTextBackend implements TextBackend {
  * APIs report tokens only, so a response without a billed amount is priced from
  * the catalog model; a route that bills (OpenRouter) keeps its reported cost.
  * Attempts and results carry the catalog id, not the wire id the judge sends.
+ * Each call also traces one decision, cache-only and failed calls included.
  */
 function nativeJudge(
 	judge: NativeJudge,
 	model: Model,
 	cache: JudgmentCache | undefined,
-	report: (attempt: JudgmentAttempt) => void,
+	{ report, trace }: { report: (attempt: JudgmentAttempt) => void; trace?: (draft: DecisionDraft) => void },
 ): Judge {
 	const cacheModel = `${model.provider}/${model.id}`;
 	return {
@@ -460,6 +646,15 @@ function nativeJudge(
 						stopReason: isAbortOrTimeout(error) ? "aborted" : "error",
 						errorMessage: error instanceof Error ? error.message : String(error),
 					});
+					trace?.({
+						startedAt,
+						provider: judge.provider,
+						model: model.id,
+						questions: request.questions,
+						status: "error",
+						cachedQuestions: attempt.cachedQuestions,
+						errorMessage: error instanceof Error ? error.message : String(error),
+					});
 					throw error;
 				}
 				if (fresh.usage.cost.total === 0) calculateCost(model, fresh.usage);
@@ -472,6 +667,15 @@ function nativeJudge(
 				const answer = known[id] ?? fresh?.answers[id];
 				if (answer) answers[id] = answer;
 			}
+			trace?.({
+				startedAt,
+				provider: judge.provider,
+				model: model.id,
+				questions: request.questions,
+				status: "ok",
+				answers,
+				cachedQuestions: attempt.cachedQuestions,
+			});
 			return {
 				api: judge.api,
 				provider: judge.provider,

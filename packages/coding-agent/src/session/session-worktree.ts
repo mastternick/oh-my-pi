@@ -67,10 +67,14 @@ export async function canAutoCreateWorktree(cwd: string): Promise<boolean> {
 	return Boolean(await repository.headSha());
 }
 
-/** Default `/wt` branch name: `wt/<yyyymmdd-hhmmss>`. */
+/**
+ * Default `/wt` branch name: `wt/<yyyymmdd-hhmmss>-<uuid>`. The UUID makes each
+ * automatic creation unique, so concurrent launches in the same second never
+ * collide on the branch ref or the worktree path.
+ */
 export function defaultSessionWorktreeBranch(now = new Date()): string {
 	const pad = (n: number) => String(n).padStart(2, "0");
-	return `wt/${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+	return `wt/${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}-${crypto.randomUUID()}`;
 }
 
 /** One-line confirmation shown after the session moved into `worktree`. */

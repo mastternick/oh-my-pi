@@ -223,8 +223,11 @@ function purgeWorkingMemoryArtifacts(db: BeamMemoryState["db"], ids: readonly st
  * eligible: `consolidated_at IS NULL` no longer suffices on its own, since
  * restored or imported durable rows legitimately carry a NULL consolidation
  * marker with an old event timestamp (issue #4819). Rows flagged `IMPORTED`
- * are treated as durable and never trimmed, and trimmed rows cascade all linked
- * artifacts via `purgeWorkingMemoryArtifacts`.
+ * are treated as durable and never trimmed. Explicit writes (`coding-agent-retain`,
+ * `coding-agent-learn`, `coding-agent-memory-command`) are exempt by source: they are
+ * deliberate stored knowledge, and trimming them after the TTL would drop them before any
+ * consolidation has a chance to keep them. The exemption follows the write path's source
+ * label; it is not a guarantee about each row's content.
  */
 function trimWorkingMemory(beam: BeamMemoryState): void {
 	const limit = beam.config.workingMemoryLimit;
@@ -237,11 +240,13 @@ function trimWorkingMemory(beam: BeamMemoryState): void {
 			WHERE session_id = ?
 			  AND consolidated_at IS NULL
 			  AND trust_tier IS NOT 'IMPORTED'
+			  AND COALESCE(source, '') NOT IN ('coding-agent-retain', 'coding-agent-learn', 'coding-agent-memory-command')
 			  AND (
 				timestamp < ? OR
 				id NOT IN (
 					SELECT id FROM working_memory
 					WHERE session_id = ? AND consolidated_at IS NULL AND trust_tier IS NOT 'IMPORTED'
+					  AND COALESCE(source, '') NOT IN ('coding-agent-retain', 'coding-agent-learn', 'coding-agent-memory-command')
 					ORDER BY timestamp DESC
 					LIMIT ?
 				)

@@ -453,6 +453,19 @@ export const cfgTaskSoftRequestBudgetNotice = register({
 	},
 });
 
+export const cfgTaskStallGuard = register({
+	id: "task.stallGuard",
+	type: "boolean",
+	default: true,
+	ui: {
+		tab: "tasks",
+		group: "Subagents",
+		label: "Subagent Stall Guard",
+		description:
+			"Stop a subagent that keeps making requests without progress (no edits, no new commands, no yield). It gets one steering notice first; if it still makes no progress, it is stopped and must hand back its partial findings and blocker.",
+	},
+});
+
 export const cfgTaskMaxEffort = register({
 	id: "task.maxEffort",
 	type: "enum",

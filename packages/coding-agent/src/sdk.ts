@@ -64,6 +64,7 @@ import type { EffectiveExtensionRoots } from "./capability/types";
 import { type OAuthAccountPools, SessionAccountPoolScope } from "./config/account-pools";
 import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode";
 import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mode";
+import { attachSessionPreset, recordSessionPreset } from "./config/model-presets";
 import { isAuthenticated, kNoAuth, ModelRegistry } from "./config/model-registry";
 import {
 	disabledProviderIds,
@@ -1709,7 +1710,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	registerSshCleanup();
 	registerEvalCleanup();
 
-	const settings = await (options.settings ??
+	let settings = await (options.settings ??
 		options.settingsManager ??
 		logger.time("settings", Settings.init, { cwd, agentDir }));
 	// Discovery provider toggles and process-wide setting effects (theme, request limits, …)
@@ -1957,6 +1958,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	const hasExistingSession = existingBranch.length > 0;
 	const hasThinkingEntry = existingBranch.some(entry => entry.type === "thinking_level_change");
 	const hasServiceTierEntry = existingBranch.some(entry => entry.type === "service_tier_change");
+
+	// Session-scoped preset pin. Attached after `existingBranch` is read, since attaching may append
+	// the baseline snapshot, and before any role or model resolution below.
+	if (settings.pinnable) {
+		const view: Settings = settings.sessionView(undefined, {
+			onPinWrite: () => {
+				const pin = view.sessionPin();
+				if (pin) recordSessionPreset(sessionManager, pin);
+			},
+		});
+		attachSessionPreset(view, sessionManager, { record: true, startup: true });
+		settings = view;
+	}
 
 	const deferredModelPatterns = Array.isArray(options.modelPattern)
 		? options.modelPattern.map(pattern => pattern.trim()).filter(Boolean)

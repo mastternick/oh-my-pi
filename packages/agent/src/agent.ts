@@ -60,6 +60,7 @@ import type {
 	AgentTurnEndContext,
 	AsideMessage,
 	PrepareQueuedMessages,
+	QueuedMessageQueue,
 	SpeculativeToolExecutionConfig,
 	StreamFn,
 	ToolCallContext,
@@ -385,8 +386,6 @@ interface CursorToolResultEntry {
 	additionalContext?: string;
 }
 
-type QueuedMessageQueue = "steering" | "followUp";
-
 interface LiveSteeredEntry {
 	message: AgentMessage;
 	controller: AbortController | undefined;
@@ -504,7 +503,7 @@ export class Agent {
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
 	#beforeQueuedMessageDequeueHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
-	#beforeModelCallHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
+	#beforeModelCallHooks = new Set<(signal: AbortSignal | undefined, context: AgentContext) => Promise<void> | void>();
 
 	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
@@ -964,15 +963,18 @@ export class Agent {
 		return () => this.#beforeQueuedMessageDequeueHooks.delete(registration);
 	}
 
-	/** Register an independently removable hook that runs immediately before each model call. */
-	addBeforeModelCallHook(hook: (signal?: AbortSignal) => Promise<void> | void): () => void {
-		const registration = (signal?: AbortSignal) => hook(signal);
+	/** Register an independently removable hook that runs immediately before each model call, with the
+	 *  loop's live context (mutating `context.messages` changes what this and later calls send). */
+	addBeforeModelCallHook(
+		hook: (signal: AbortSignal | undefined, context: AgentContext) => Promise<void> | void,
+	): () => void {
+		const registration = (signal: AbortSignal | undefined, context: AgentContext) => hook(signal, context);
 		this.#beforeModelCallHooks.add(registration);
 		return () => this.#beforeModelCallHooks.delete(registration);
 	}
 
-	async #runBeforeModelCallHooks(signal?: AbortSignal): Promise<void> {
-		for (const hook of this.#beforeModelCallHooks) await hook(signal);
+	async #runBeforeModelCallHooks(signal: AbortSignal | undefined, context: AgentContext): Promise<void> {
+		for (const hook of this.#beforeModelCallHooks) await hook(signal, context);
 	}
 
 	async #runBeforeQueuedMessageDequeueHooks(signal?: AbortSignal): Promise<void> {
@@ -1006,7 +1008,7 @@ export class Agent {
 		this.#queuedMessageClaims[queue] = claim;
 		const preparationSignal = AbortSignal.any([signal, claim.controller.signal]);
 		try {
-			const preparation = await prepare(messages, preparationSignal);
+			const preparation = await prepare(messages, preparationSignal, queue);
 			signal.throwIfAborted();
 			if (preparationSignal.aborted || this.#queuedMessageClaims[queue] !== claim) return [];
 			const additional = preparation?.commit();
@@ -1384,6 +1386,20 @@ export class Agent {
 	steer(m: AgentMessage) {
 		this.#steeringQueue.push(m);
 		this.#notifySteeringWaiters();
+		this.#emitQueueChanged();
+	}
+
+	/**
+	 * Move the given pending steering messages (by identity) ahead of the rest,
+	 * keeping both groups' relative order, so one-at-a-time delivery takes them
+	 * first. Messages no longer pending, including a claimed batch already
+	 * being delivered, are ignored.
+	 */
+	prioritizeSteering(messages: readonly AgentMessage[]): void {
+		const wanted = new Set(messages);
+		const front = this.#steeringQueue.filter(message => wanted.has(message));
+		if (front.every((message, index) => this.#steeringQueue[index] === message)) return;
+		this.#steeringQueue = [...front, ...this.#steeringQueue.filter(message => !wanted.has(message))];
 		this.#emitQueueChanged();
 	}
 
@@ -1805,10 +1821,19 @@ export class Agent {
 			// that, a transformer resolving after the swap would patch a detached
 			// object while the persisted result kept the original payload — the
 			// rewrite silently lost.
+			//
+			// A result for a call already buffered is the server re-dispatching
+			// that call; the provider keeps one block for it, so the re-run's
+			// result replaces the first rather than pairing a second result with
+			// the same id (issue #15749).
 			const entry: CursorToolResultEntry = {
 				toolResult: message,
 				additionalContext: (message as ToolResultWithAdditionalContext)[TOOL_RESULT_ADDITIONAL_CONTEXT],
 			};
+			const superseded = this.#cursorToolResultBuffer.findIndex(
+				({ toolResult }) => toolResult.toolCallId === message.toolCallId,
+			);
+			if (superseded >= 0) this.#cursorToolResultBuffer.splice(superseded, 1);
 			this.#cursorToolResultBuffer.push(entry);
 			const transform = this.#cursorOnToolResult;
 			if (transform) {
@@ -1884,7 +1909,7 @@ export class Agent {
 			getApiKey: this.getApiKey,
 			getToolContext: this.#getToolContext,
 			syncContextBeforeModelCall: async (context, signal) => {
-				await this.#runBeforeModelCallHooks(signal);
+				await this.#runBeforeModelCallHooks(signal, context);
 				if (this.#listeners.size > 0) {
 					await Bun.sleep(0);
 				}

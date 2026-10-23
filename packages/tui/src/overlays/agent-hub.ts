@@ -5,11 +5,11 @@
  * - Table view: every registered agent except Main (Main IS the ambient
  *   chat), live from the global AgentHubRegistry — status, unread irc count,
  *   current/last task, last activity. Navigate with keys, wheel, hover, and
- *   click; `r` revives a parked agent, `x` aborts + releases one.
+ *   click; `r` revives a parked or killed agent, `x` aborts + releases one.
  * - Chat view: per-agent transcript (incremental session-file tail, absorbed
  *   from the old session observer overlay) plus an input line. Submitting
- *   revives a parked agent, then prompts/steers it; the message lands in the
- *   agent's persisted history via the normal prompt path.
+ *   revives a parked or killed agent, then prompts/steers it; the message
+ *   lands in the agent's persisted history via the normal prompt path.
  *
  * Replaces the old SessionObserverOverlayComponent (ctrl+s observer).
  */
@@ -1003,7 +1003,11 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 				id: "revive",
 				label: "Revive",
 				keys: ["r"],
-				disabled: readOnly ?? (selected?.status === "parked" ? undefined : "Only parked agents can be revived"),
+				disabled:
+					readOnly ??
+					(selected?.status === "parked" || selected?.status === "aborted"
+						? undefined
+						: "Only parked or killed agents can be revived"),
 			},
 			{ id: "kill", label: "Kill", keys: ["x"], danger: true, disabled: readOnly ?? (selected ? undefined : true) },
 			{ id: "view", label: "By parent", keys: ["t"], on: this.#viewMode === "tree" },
@@ -2096,7 +2100,10 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			`${cursor} ${theme.fg(JUDGE_OUTCOME_TONE[judge.outcome], judgeOutcomeText(judge.outcome))} ` +
 			`${theme.fg("dim", formatJudgeClock(judge.timestamp))} ${theme.bold(actor)} ` +
 			`${theme.fg("muted", sanitizeLine(judge.purpose, 24))} ${theme.fg("dim", cost)}`;
-		const detail = [judge.thinking ? `thinking ${judge.thinking.level}${judge.thinking.linked ? "" : " (unlinked)"}` : "", judge.summary]
+		const detail = [
+			judge.thinking ? `thinking ${judge.thinking.level}${judge.thinking.linked ? "" : " (unlinked)"}` : "",
+			judge.summary,
+		]
 			.filter(Boolean)
 			.join(" · ");
 		if (!detail) return prefix;
@@ -2747,7 +2754,9 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			.then(sources => {
 				if (this.#disposed) return;
 				this.#judgeProjection = projectJudgeActivity(sources);
-				this.#judgeSelected = this.#judgeFollow ? Math.max(0, this.#judgeProjection.rows.length - 1) : this.#judgeSelectedIndex();
+				this.#judgeSelected = this.#judgeFollow
+					? Math.max(0, this.#judgeProjection.rows.length - 1)
+					: this.#judgeSelectedIndex();
 				this.#requestRender();
 			})
 			.catch((error: unknown) => {
@@ -2906,15 +2915,15 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 	#activateAgent(ref: TRecord): void {
 		this.#notice = undefined;
 		const focusAgent = this.#focusAgent;
-		// Aborted agents and advisor refs are read-only transcripts with no
-		// revivable session; open the in-hub viewer instead of failing ensureLive.
-		if (ref.kind === "advisor" || ref.status === "aborted" || this.#remote || !focusAgent) {
+		// Advisor refs are read-only transcripts with no revivable session; open
+		// the in-hub viewer instead of failing ensureLive.
+		if (ref.kind === "advisor" || this.#remote || !focusAgent) {
 			this.openChat(ref.id);
 			return;
 		}
 		void (async () => {
 			try {
-				await focusAgent(ref.id); // ensureLive inside revives parked agents; no parking, no session files
+				await focusAgent(ref.id); // ensureLive inside revives parked and killed agents
 				this.#onDone();
 			} catch (error) {
 				this.#notice = error instanceof Error ? error.message : String(error);
@@ -2931,8 +2940,8 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			this.#requestRender();
 			return;
 		}
-		if (ref.status !== "parked") {
-			this.#notice = `Agent "${ref.id}" is ${ref.status} — only parked agents can be revived.`;
+		if (ref.status !== "parked" && ref.status !== "aborted") {
+			this.#notice = `Agent "${ref.id}" is ${ref.status} — only parked or killed agents can be revived.`;
 			this.#requestRender();
 			return;
 		}

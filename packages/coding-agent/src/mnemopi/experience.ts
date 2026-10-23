@@ -133,7 +133,9 @@ export interface ExtractionReply {
 
 export type GateVerdict = { ok: true } | { ok: false; reason: string };
 
-export type ConditionVerdict = { ok: true; paths: string[] } | { ok: false; reason: "unsafe-conditions" | "too-many-conditions" };
+export type ConditionVerdict =
+	| { ok: true; paths: string[] }
+	| { ok: false; reason: "unsafe-conditions" | "too-many-conditions" };
 
 /** Host-side snapshot of one capture window, built by `collectExperienceEvidence`. */
 export interface ExperienceEvidenceSnapshot {
@@ -524,7 +526,10 @@ export function collectExperienceEvidence(
 			if (!isUnsettledAsyncReceipt(details)) {
 				const request = requests.get(message.toolCallId);
 				const exitCode =
-					typeof details === "object" && details !== null && "exitCode" in details && typeof details.exitCode === "number"
+					typeof details === "object" &&
+					details !== null &&
+					"exitCode" in details &&
+					typeof details.exitCode === "number"
 						? details.exitCode
 						: undefined;
 				toolEvidence.push({
@@ -928,7 +933,9 @@ export function revalidateExperienceContext(input: ExperienceRevalidateInput): E
 /** Run transcript for the extraction prompt: opening and closing turns, with the middle elided when long. */
 function buildTranscriptDigest(messages: ExperienceCaptureInput["messages"]): string {
 	if (messages.length === 0) return "(no transcript)";
-	const lines = messages.map(message => `[role: ${message.role}] ${clampText(message.content, TRANSCRIPT_MESSAGE_CAP)}`);
+	const lines = messages.map(
+		message => `[role: ${message.role}] ${clampText(message.content, TRANSCRIPT_MESSAGE_CAP)}`,
+	);
 	const kept =
 		lines.length > TRANSCRIPT_HEAD + TRANSCRIPT_TAIL
 			? [...lines.slice(0, TRANSCRIPT_HEAD), "(… middle elided …)", ...lines.slice(-TRANSCRIPT_TAIL)]
@@ -988,7 +995,9 @@ function liveWriteInOwningBank(owner: OwningBank, id: string | undefined): LiveW
 				 UNION ALL
 				 SELECT id, superseded_by, valid_until, metadata_json FROM episodic_memory WHERE id = ?`,
 			)
-			.get(id, id) as { id: string; superseded_by: string | null; valid_until: string | null; metadata_json: string | null } | undefined;
+			.get(id, id) as
+			| { id: string; superseded_by: string | null; valid_until: string | null; metadata_json: string | null }
+			| undefined;
 		if (row === undefined) return undefined;
 		const expired = row.valid_until !== null && Date.parse(row.valid_until) <= Date.now();
 		const captured = parseMetadata(row.metadata_json)?.[CAPTURED_KEY];
@@ -1177,13 +1186,13 @@ function isStaleCandidate(candidate: DedupeCandidate, project: ExperienceProject
 function supersessionChain(scanned: readonly DedupeCandidate[], id: string): DedupeCandidate[] {
 	const seen = new Set<string>([id]);
 	const chain: DedupeCandidate[] = [];
-	for (let frontier = [id]; frontier.length > 0; ) {
+	for (let frontier = [id]; frontier.length > 0;) {
 		const next: string[] = [];
 		for (const ancestorId of frontier) {
 			for (const candidate of scanned) {
-			const metadata = candidate.metadata;
-			if (metadata === undefined || !isSchemaLesson(metadata) || seen.has(candidate.id)) continue;
-			const supersedes = metadata[SUPERSEDES_KEY];
+				const metadata = candidate.metadata;
+				if (metadata === undefined || !isSchemaLesson(metadata) || seen.has(candidate.id)) continue;
+				const supersedes = metadata[SUPERSEDES_KEY];
 				if (typeof supersedes !== "string" || supersedes !== ancestorId) continue;
 				seen.add(candidate.id);
 				chain.push(candidate);
@@ -1194,18 +1203,18 @@ function supersessionChain(scanned: readonly DedupeCandidate[], id: string): Ded
 	}
 	return chain;
 }
- 
- /** Candidates as the extraction sees them. A legacy candidate is unverified: updating one re-verifies the knowledge. */
+
+/** Candidates as the extraction sees them. A legacy candidate is unverified: updating one re-verifies the knowledge. */
 function renderCandidateDigest(candidates: readonly DedupeCandidate[], project: ExperienceProjectContext): string {
- 	if (candidates.length === 0) return "(no existing candidates)";
- 	return candidates
- 		.map(candidate => {
- 			const origin = isSchemaLesson(candidate.metadata) ? "experience" : "legacy";
+	if (candidates.length === 0) return "(no existing candidates)";
+	return candidates
+		.map(candidate => {
+			const origin = isSchemaLesson(candidate.metadata) ? "experience" : "legacy";
 			const stale = isStaleCandidate(candidate, project) ? "; conditions no longer hold — re-verify or update" : "";
 			return `- id=${candidate.id} (${origin}${stale}) ${clampText(candidate.content, MAX_CANDIDATE_CHARS)}`;
- 		})
- 		.join("\n");
- }
+		})
+		.join("\n");
+}
 
 /**
  * The candidate a new lesson duplicates, if any: identical after case and whitespace normalization, or the same claim
@@ -1670,17 +1679,15 @@ export async function captureExperience(input: ExperienceCaptureInput): Promise<
 	const bounded = latestCheck && !tail.includes(latestCheck) ? [latestCheck, ...tail.slice(1)] : tail;
 	// Credential-shaped tokens are removed before anything reaches the extraction model; state.ts still obfuscates
 	// the configured secrets on the outbound prompt, so both layers stay in force.
-	const evidence = bounded.map(
-		(entry): ExperienceToolEvidence => ({
-			...entry,
-			...(entry.request === undefined
-				? {}
-				: { request: redactMemorySecrets(clampText(entry.request, EVIDENCE_REQUEST_HEAD)) }),
-			...(entry.output === undefined
-				? {}
-				: { output: redactMemorySecrets(entry.output.trim().slice(-EVIDENCE_OUTPUT_TAIL)) }),
-		}),
-	);
+	const evidence = bounded.map((entry): ExperienceToolEvidence => ({
+		...entry,
+		...(entry.request === undefined
+			? {}
+			: { request: redactMemorySecrets(clampText(entry.request, EVIDENCE_REQUEST_HEAD)) }),
+		...(entry.output === undefined
+			? {}
+			: { output: redactMemorySecrets(entry.output.trim().slice(-EVIDENCE_OUTPUT_TAIL)) }),
+	}));
 	if (evidence.length === 0) return emptyCapture("no-tool-evidence");
 	// A check with output proves a solution if it passed, or a negative finding if it failed. Other output proves a negative only on a run that did not succeed.
 	const admissible =

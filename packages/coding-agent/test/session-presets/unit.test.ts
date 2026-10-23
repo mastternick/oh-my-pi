@@ -9,7 +9,15 @@ import type { Model } from "@oh-my-pi/pi-ai";
 // Dynamic: SOURCE_ROOT selects which source snapshot is under test, so specifiers are runtime-chosen.
 const SRC = process.env.SOURCE_ROOT;
 if (!SRC) throw new Error("SOURCE_ROOT must point at a src/ snapshot");
-const { applyModelPreset, applySessionPinDefault, attachSessionPreset, getModelPresetNames, recordSessionPreset, resolveSessionDefault, saveModelPreset } = await import(`${SRC}/config/model-presets.ts`);
+const {
+	applyModelPreset,
+	applySessionPinDefault,
+	attachSessionPreset,
+	getModelPresetNames,
+	recordSessionPreset,
+	resolveSessionDefault,
+	saveModelPreset,
+} = await import(`${SRC}/config/model-presets.ts`);
 const { Settings } = await import(`${SRC}/config/settings.ts`);
 const { cfgDefaultThinkingLevel, cfgRetryFallbackChains } = await import(`${SRC}/session/settings.ts`);
 const { SessionManager } = await import(`${SRC}/session/session-manager.ts`);
@@ -101,7 +109,10 @@ interface Stub {
 }
 
 /** Stub only the model registry and live model/thinking mutation; settings and SessionManager are real. */
-function makeSession(settings: InstanceType<typeof Settings>, sessionManager: InstanceType<typeof SessionManager>): Stub {
+function makeSession(
+	settings: InstanceType<typeof Settings>,
+	sessionManager: InstanceType<typeof SessionManager>,
+): Stub {
 	const stub: Stub = {
 		model: MODELS.gamma,
 		settings,
@@ -148,7 +159,13 @@ function consumerOf(s: InstanceType<typeof Settings>) {
 const digest = (file: string) => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 const lastSnapshot = (mgr: InstanceType<typeof SessionManager>) =>
 	JSON.stringify(
-		mgr.getBranch().filter(e => e.type === "custom" && e.customType === "model-preset-session").at(-1) ?? null,
+		mgr
+			.getBranch()
+			.filter(
+				(e: { type: string; customType?: string }) =>
+					e.type === "custom" && e.customType === "model-preset-session",
+			)
+			.at(-1) ?? null,
 	);
 
 /** Seeds P's project default to A through the real persistence path. */
@@ -358,7 +375,10 @@ test("reloadForCwd rescopes the root: project save targets the new project, not 
 	expect((await applyModelPreset(sess, "A", { scope: "project" })).kind).toBe("switched");
 	await root.flush();
 
-	expect(consumerOf((await load(Q)).sessionView()).roles).toEqual({ default: "fakeprov/alpha", smol: "fakeprov/beta" });
+	expect(consumerOf((await load(Q)).sessionView()).roles).toEqual({
+		default: "fakeprov/alpha",
+		smol: "fakeprov/beta",
+	});
 	expect(fs.existsSync(P_CONFIG)).toBe(false);
 });
 

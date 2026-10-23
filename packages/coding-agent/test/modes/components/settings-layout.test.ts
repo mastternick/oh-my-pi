@@ -40,7 +40,7 @@ describe("settings layout", () => {
 
 	it("getSettingsForTab returns contiguous groups in TAB_GROUPS order", () => {
 		for (const tab of SETTING_TABS) {
-			const defs = getSettingsForTab(createSettingsHost().entries, tab);
+			const defs = getSettingsForTab(createSettingsHost(Settings.isolated()).entries, tab);
 			expect(defs.length).toBeGreaterThan(0);
 
 			// Collapse the def sequence into the order groups first appear.
@@ -63,7 +63,7 @@ describe("settings layout", () => {
 	it("hides advisor dependent settings when advisor is disabled", () => {
 		const advisorDependentPaths = ["advisor.syncBacklog", "advisor.immuneTurns"];
 		const advisorDependentPathSet = new Set<string>(advisorDependentPaths);
-		const defs = getSettingsForTab(createSettingsHost().entries, "model").filter(def =>
+		const defs = getSettingsForTab(createSettingsHost(Settings.instance).entries, "model").filter(def =>
 			advisorDependentPathSet.has(def.path),
 		);
 
@@ -80,7 +80,7 @@ describe("settings layout", () => {
 	});
 
 	it("exposes usage-aware fallback as an opt-in advanced policy", () => {
-		const defs = getSettingsForTab(createSettingsHost().entries, "model").filter(def =>
+		const defs = getSettingsForTab(createSettingsHost(Settings.instance).entries, "model").filter(def =>
 			def.path.startsWith("retry.usage"),
 		);
 		expect(defs.map(def => def.path)).toEqual([
@@ -104,7 +104,7 @@ describe("settings layout", () => {
 				thinkingLevel: undefined,
 				availableThemes: ["dark", "light"],
 				providers: [],
-				settings: createSettingsHost(),
+				settings: createSettingsHost(Settings.isolated()),
 				plugins: createPluginSettingsHost(process.cwd()),
 			},
 			{

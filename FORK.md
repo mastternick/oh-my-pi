@@ -6,7 +6,7 @@ This is an **unofficial fork** of [can1357/oh-my-pi](https://github.com/can1357/
 
 - Upstream baseline: `can1357/oh-my-pi` tag `v18.10.3`, commit `81e1d8927a3c16cfaff2e9456baa8c060e1e0e9b`.
 - Snapshot: local customizations of the installed `@oh-my-pi/*` 18.10.3 packages, applied onto the upstream tag. Upstream `package.json` files are kept as-is. Publish-only rewrites from the installed packages are not carried.
-- Planned port target: upstream `v18.12.6`, commit `45c35e40c46166dc726ccc52f5d27f40f2449f99`. **Not done in this snapshot.**
+- Port target `v18.12.6`, commit `45c35e40c46166dc726ccc52f5d27f40f2449f99`. Ported in this snapshot; see "Port to upstream v18.12.6" and "Verification status".
 - License: MIT. `LICENSE` and `THIRD-PARTY-NOTICES.txt` are retained unchanged from upstream.
 
 ## Scope of this snapshot
@@ -76,12 +76,21 @@ Source-only divergence: `coding-agent/src/cli/update-cli.ts` (see above). `codin
 ## Tests included
 
 - `coding-agent/acceptance/` (11 files, including `support.ts`, `unresolved-tool-loop.test.ts`, and `embed-stub-child.ts`). These import package subpaths, not absolute paths. Gated by `XM_ACCEPTANCE_HARNESS` (not verified against the gate).
-- `coding-agent/test/session-presets/{unit,sdk-race}.test.ts`. Require `SOURCE_ROOT=packages/coding-agent`. `sdk-race.test.ts` also reads `ANTHROPIC_API_KEY` and `TMPDIR`.
+- `coding-agent/test/session-presets/{unit,sdk-race}.test.ts`. Run with an absolute `SOURCE_ROOT`, for example `env SOURCE_ROOT=$(pwd)/src bun test ...` from `packages/coding-agent`. The earlier `SOURCE_ROOT=packages/coding-agent` is wrong. `sdk-race.test.ts` also reads `ANTHROPIC_API_KEY` and `TMPDIR`.
 - `ai/acceptance/provider-tool-name.test.ts`.
+
+## Port to upstream v18.12.6
+
+- Base: upstream `45c35e40c4`. The snapshot's `src/mnemopi/*` and `src/config/model-presets.ts` semantics are kept. Upstream has no equivalent for the mnemopi modules.
+- `createSettingsHost(view: Settings)` (`src/config/settings-ui.ts`) takes an instance. Tests that mutate the global `Settings.instance` pass `Settings.instance`, not `Settings.isolated()`: `plan-autosave`, `settings-layout`, `settings-selector-memory-refresh`, and `settings-multiselect`.
+- Mnemopi test stubs must match real shapes: session stubs need `messages: []`, and `modelRegistry` stubs need `getAvailable: () => []`. Applied in `memory-tools`, `mnemopi-recall-features`, and `mnemopi-loop-phase-coverage`.
+- Explicit enqueue with `autoRetain` disabled does not retain transcripts. `src/mnemopi/state.ts` and `backend.ts` gate retention on `autoRetain`. `memory-tools.test.ts` now expects 0 retained items (was 1). The `sleepAllSessions` assertion is kept.
+- Legacy bank probe handle leak fixed: `bankBelongsToProject` in `src/mnemopi/config.ts` declares its probe statement with `using`, so the read-only handle is released. Covered by `test/mnemopi-bank-derivation.test.ts`.
+- Formatting: `oxfmt` applied to the 18 TS files that failed `check:tools`.
 
 ## Deferred, not in the commit
 
-- **Preset fallback PR #14490 test** (`coding-agent/test/model-presets.test.ts`). The PR head `cc15b618a3` (in local clone `~/.local/share/omp-preset-fallback-patch/omp-pr`) has a 32023-byte test and a different `model-presets.ts` (26075 bytes) and `settings.ts` (169765 bytes) than the snapshot. The snapshot's fallback rows are a different revision. The test has not been reconciled with the snapshot source. Choosing a source revision is a decision for the integration owner.
+- **Preset fallback PR #14490 test** (`coding-agent/test/model-presets.test.ts`). Reconciled to the snapshot source in this port (21/21 pass). Custom semantics win where upstream PR expectations differ: a project-scope switch replaces the whole project `modelRoles` record, a runtime `--model` override shadows the project preset and is reported as shadowed, and overlay values shadow the project layer. The PR head (`cc15b618a3`) is still not carried.
 - **Stall-guard tests**: the scout's source is `~/.omp/agent/backups/stall-guard-20261013/corrected/test/`. Not copied: backup tree, not verified against the manifest rows. The original `stall-guard.patch` is marked UNSAFE and is not a source of truth.
 - **Judge-view tests**: none found in any location searched. Report as a gap, not a completion signal.
 - **Typefix declaration-only workarounds** under `pi-tui/dist/types/` and `pi-catalog/dist/types/` are not carried (generated declarations).
@@ -96,4 +105,9 @@ Source-only divergence: `coding-agent/src/cli/update-cli.ts` (see above). `codin
 
 ## Verification status
 
-No build, typecheck, lint, or test has been run on this snapshot. Every check is NOT_RUN. The audit above is a file comparison only.
+Port target v18.12.6 (`45c35e40c4`). Results on the merged tree, run from `packages/coding-agent` unless noted:
+
+- `bun run check:tools` (repo root; oxlint + oxfmt --check): PASS, exit 0. oxlint reports six warnings, all pre-existing in the snapshot or the peer test additions: unused imports `applySessionPinDefault` (`src/session/agent-session.ts`), `StallEvidence` (`src/task/executor.ts`), `ProjectBankScopeOptions` (`src/mnemopi/state.ts`), `startCount` (`test/task/tan-memory-recall.test.ts`), `no-thenable` (`src/mnemopi/experience.ts`), and `new Array` (`ai/test/anthropic-signature.test.ts`).
+- `bun run check:types` (tsgo): FAIL, 2 errors, both from the sparse checkout. `test/tools/browser-relay-debugger-ownership.test.ts` imports `packages/browser-relay`, which is excluded (TS2307 and TS7006). Not patched.
+- Targeted batch, 29 files (`*mnemopi*`, `*stall*`, `*tool-call-loop*`, `*agent-hub*`, `session-presets/*`, `settings-*` components, `plan-autosave`, `memory-tools`, `config-cli-credentials`, `settings-manager*`): PASS, 453 pass, 0 fail, with `SOURCE_ROOT=$(pwd)/src`.
+- NOT_RUN: full `packages/coding-agent` suite, `packages/ai`, `packages/agent`, `packages/tui`, `packages/mnemopi`, `acceptance/`, Rust, and install tests.

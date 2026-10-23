@@ -55,7 +55,12 @@ export interface StallEvidence {
 
 export type StallDecision =
 	| { readonly kind: "ok" }
-	| { readonly kind: "suspect"; readonly token: number; readonly evidence: StallEvidence; readonly signal: AbortSignal }
+	| {
+			readonly kind: "suspect";
+			readonly token: number;
+			readonly evidence: StallEvidence;
+			readonly signal: AbortSignal;
+	  }
 	| { readonly kind: "notice"; readonly requests: number; readonly compactions: number; readonly blocked: boolean }
 	| { readonly kind: "stop"; readonly requests: number; readonly compactions: number; readonly reason: string };
 
@@ -127,9 +132,7 @@ function describeCall(name: string, args: unknown): string {
 
 export function stallStopReason(requests: number, compactions: number, verdict?: "looping" | "blocked"): string {
 	const detail = `no progress for ${requests} requests / ${compactions} compactions`;
-	return verdict
-		? `Stalled (stall guard, judge: ${verdict}): ${detail}`
-		: `Stalled: ${detail} (stall guard)`;
+	return verdict ? `Stalled (stall guard, judge: ${verdict}): ${detail}` : `Stalled: ${detail} (stall guard)`;
 }
 
 export interface StallToolResult {
@@ -170,7 +173,8 @@ type Window = { requests: number; compactions: number; outputTokens: number; rep
 
 const emptyWindow = (): Window => ({ requests: 0, compactions: 0, outputTokens: 0, repeats: 0 });
 
-const normalizeText = (text: string): string => text.toLowerCase().replace(/\s+/g, " ").trim().slice(0, EVIDENCE_TEXT_CHARS);
+const normalizeText = (text: string): string =>
+	text.toLowerCase().replace(/\s+/g, " ").trim().slice(0, EVIDENCE_TEXT_CHARS);
 
 export function createStallGuard(options: { readOnly: boolean; thresholds?: StallThresholds }): StallGuard {
 	const thresholds = options.thresholds ?? STALL_THRESHOLDS;
@@ -243,7 +247,12 @@ export function createStallGuard(options: { readOnly: boolean; thresholds?: Stal
 		if (!noticed) {
 			noticed = true;
 			afterNotice = { requests: 0, compactions: 0 };
-			return { kind: "notice", requests: window.requests, compactions: window.compactions, blocked: verdict === "blocked" };
+			return {
+				kind: "notice",
+				requests: window.requests,
+				compactions: window.compactions,
+				blocked: verdict === "blocked",
+			};
 		}
 		if (!graceDone()) return { kind: "ok" };
 		return {
@@ -304,7 +313,8 @@ export function createStallGuard(options: { readOnly: boolean; thresholds?: Stal
 			if (texts.length > 2) texts = texts.slice(-2);
 		},
 		startRequest(outputTokens) {
-			const decision = openOutputTokens === undefined ? { kind: "ok" as const } : closeRequest(inFlight, openOutputTokens);
+			const decision =
+				openOutputTokens === undefined ? { kind: "ok" as const } : closeRequest(inFlight, openOutputTokens);
 			openOutputTokens = outputTokens;
 			inFlight = "none";
 			return decision;

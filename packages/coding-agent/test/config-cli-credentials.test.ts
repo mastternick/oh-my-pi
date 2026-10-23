@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { runConfigCommand } from "@oh-my-pi/pi-coding-agent/cli/config-cli";
-import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { getConfigRootDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { all, lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
@@ -50,7 +50,7 @@ describe("credential masking reaches every surface", () => {
 		// a credential cannot render as plain text on one surface and dots on the
 		// other.
 		for (const path of ["hindsight.apiToken", "mnemopi.embeddingApiKey", "mnemopi.llmApiKey"] as const) {
-			const def = getSettingDef(createSettingsHost().entries, path);
+			const def = getSettingDef(createSettingsHost(Settings.isolated()).entries, path);
 			expect(def?.type).toBe("text");
 			expect(def && "secret" in def ? def.secret : undefined).toBe(true);
 		}
@@ -58,12 +58,12 @@ describe("credential masking reaches every surface", () => {
 
 	it("keeps credentials with no panel entry out of the panel entirely", () => {
 		for (const path of ["auth.broker.token", "searxng.token", "dev.autoqaPush.token"] as const) {
-			expect(getSettingDef(createSettingsHost().entries, path)).toBeUndefined();
+			expect(getSettingDef(createSettingsHost(Settings.isolated()).entries, path)).toBeUndefined();
 		}
 	});
 
 	it("leaves ordinary text settings unmasked", () => {
-		const def = getSettingDef(createSettingsHost().entries, "shellPath");
+		const def = getSettingDef(createSettingsHost(Settings.isolated()).entries, "shellPath");
 		if (def?.type === "text") expect(def.secret).toBe(false);
 	});
 });

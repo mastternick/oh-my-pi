@@ -132,6 +132,9 @@ function makeMnemopiConfig(
 	return {
 		dbPath: tempDbPath,
 		bank: "test-bank",
+		experienceEnabled: false,
+		projectIdentity: { kind: "path", key: "/test/project", label: "test-project" },
+		repoRoot: "/test/project",
 		autoRecall: true,
 		autoRetain: true,
 		polyphonicRecall: false,
@@ -176,6 +179,7 @@ function registerMnemopiState(
 		config: finalConfig,
 		session: {
 			sessionId,
+			messages: [],
 			settings: Settings.isolated({
 				"memory.backend": "mnemopi",
 				"mnemopi.noEmbeddings": true,
@@ -183,6 +187,7 @@ function registerMnemopiState(
 			}),
 			modelRegistry: {
 				getApiKeyForProvider: async () => undefined,
+				getAvailable: () => [],
 				resolver: () => async () => undefined,
 			} as never,
 			sessionManager: {
@@ -870,7 +875,7 @@ describe("Mnemopi backend lifecycle", () => {
 		expect(row?.count).toBe(0);
 	});
 
-	it("explicit enqueue retains the current session when auto-retain is disabled", async () => {
+	it("explicit enqueue skips transcript retention when auto-retain is disabled but still sleeps the banks", async () => {
 		const entries = [{ type: "message", message: { role: "user", content: "explicitly retained turn" } }];
 		const state = registerMnemopiState(makeMnemopiConfig({ autoRetain: false }), {
 			entries: () => entries,
@@ -887,8 +892,23 @@ describe("Mnemopi backend lifecycle", () => {
 				WHERE source = 'coding-agent-transcript'
 			`)
 			.get();
-		expect(row?.count).toBe(1);
+		expect(row?.count).toBe(0);
 		expect(retainMemory.sleepAllSessions).toHaveBeenCalledTimes(1);
+	});
+
+	it("stores an explicit memory save as stated, not as an unlabelled transcript row", async () => {
+		const state = registerMnemopiState();
+		const result = await mnemopiBackend.save!(
+			{ agentDir: path.dirname(tempDbPath!), cwd: "/tmp", session: state.session },
+			{ content: "The greenhouse sprinklers run at dawn." },
+		);
+		expect(result.stored).toBe(1);
+
+		const row = state
+			.getScopedRetainTarget()
+			.memory.beam.db.prepare<{ veracity: string }, [string]>("SELECT veracity FROM working_memory WHERE id = ?")
+			.get(result.ids?.[0] ?? "");
+		expect(row?.veracity).toBe("stated");
 	});
 
 	it("promotes aged working memory when the backend starts a top-level session (#10770)", async () => {
@@ -919,11 +939,16 @@ describe("Mnemopi backend lifecycle", () => {
 		registeredMnemopiState = undefined;
 		resetMemoryForTests();
 
-		const modelRegistry = { getApiKeyForProvider: async () => undefined, resolver: () => async () => undefined };
+		const modelRegistry = {
+			getApiKeyForProvider: async () => undefined,
+			getAvailable: () => [],
+			resolver: () => async () => undefined,
+		};
 		const session = {
 			sessionId: TEST_SESSION_ID,
 			settings,
 			modelRegistry,
+			messages: [],
 			sessionManager: { getEntries: () => [], getCwd: () => "/tmp" },
 			emitNotice: () => {},
 			getHindsightSessionState: () => undefined,
@@ -1296,6 +1321,7 @@ describe("Mnemopi backend lifecycle", () => {
 		const childSession = {
 			sessionId: "child-session-id",
 			settings,
+			messages: [],
 			sessionManager: { getEntries: () => [], getCwd: () => "/tmp" },
 			emitNotice: () => {},
 		} as never;
@@ -1332,6 +1358,7 @@ describe("Mnemopi backend lifecycle", () => {
 		const childSession = {
 			sessionId: "child-session-id",
 			settings,
+			messages: [],
 			sessionManager: { getEntries: () => [], getCwd: () => "/tmp" },
 			emitNotice: () => {},
 			modelRegistry: {} as never,

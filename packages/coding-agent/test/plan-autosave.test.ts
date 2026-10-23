@@ -35,7 +35,7 @@ function makeCwd(): string {
 
 describe("plan autosave settings UI", () => {
 	it("gates the autosave directory on plan.autosave", () => {
-		const defs = getSettingsForTab(createSettingsHost().entries, "tasks");
+		const defs = getSettingsForTab(createSettingsHost(Settings.instance).entries, "tasks");
 		const autosave = defs.find(def => def.path === "plan.autosave");
 		const autosaveDir = defs.find(def => def.path === "plan.autosaveDir");
 		if (!autosave?.condition || !autosaveDir?.condition) {
@@ -158,6 +158,8 @@ describe("plan-yolo approval autosave", () => {
 			configuredThinkingLevel: () => undefined,
 			restoreThinkingLevel: () => {},
 			resolveDefaultPrewalk: () => undefined,
+			resolveAutoPrewalkTarget: () => undefined,
+			classifyAutoPrewalk: async () => undefined,
 			emitNotice: (level, message, source) => {
 				notices.push({ level, message, source });
 			},
@@ -232,5 +234,20 @@ describe("plan-yolo approval autosave", () => {
 			message: expect.stringContaining("Plan autosave failed"),
 			source: "plan-yolo",
 		});
+	});
+
+	it("leaves an extension-shadowed write out of the plan-yolo tool set (#14030)", async () => {
+		const cwd = makeCwd();
+		const t = setupPlanYolo(cwd, path.join(cwd, "artifacts"), Settings.isolated({}));
+		const applied: string[][] = [];
+		t.host.getEnabledToolNames = () => ["read", "write"];
+		t.host.setActiveToolsByName = async names => {
+			applied.push(names);
+		};
+		const coordinator = new PrewalkCoordinator(t.host, { planYolo: { target } satisfies PlanYolo });
+
+		await coordinator.armPlanYoloIfNeeded();
+
+		expect(applied).toEqual([["read"]]);
 	});
 });

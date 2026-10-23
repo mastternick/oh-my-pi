@@ -21,7 +21,14 @@ import {
 } from "../../judgment";
 import findDescription from "../../prompts/tools/find.md" with { type: "text" };
 import type { ToolSession } from "..";
-import { formatPathRelativeToCwd, normalizePathLikeInput, resolveSearchResultPath } from "../path-utils";
+import { resolveToolTier } from "../approval";
+import {
+	formatPathRelativeToCwd,
+	normalizePathLikeInput,
+	resolveSearchResultPath,
+	searchPathTier,
+} from "../path-utils";
+import { searchApprovalCacheTargets } from "../search-approval-targets";
 import { toolResult } from "../tool-result";
 import { type CascadeResult, runCascade } from "./cascade";
 import { rankedHeat } from "./passages";
@@ -58,7 +65,12 @@ export function isFindEnabled(session: ToolSession): boolean {
 /** Semantic search tool: describe a behavior, get files and line ranges that implement it. */
 export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 	readonly name = "find";
-	readonly approval = "read" as const;
+	readonly approval = searchPathTier;
+	/** `always-ask-cached` keys: the tree (or file) it searches, as `grep` reports one. */
+	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined => {
+		const root = (args as { path?: string } | null | undefined)?.path;
+		return searchApprovalCacheTargets(root ? [root] : [], this.session.cwd, entry => entry);
+	};
 	readonly loadMode = "essential";
 	readonly label = "Find";
 	readonly summary = "Semantic grep: find files and line ranges by describing what they do";
@@ -82,7 +94,7 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 		// listed, scanned, and read in place through the URL filesystem.
 		const filesystem = new InternalUrlFilesystem({
 			context: sessionResolveContext(this.session, { signal }),
-			tier: this.approval,
+			tier: resolveToolTier(this, params),
 		});
 		const root = await resolveSearchRoot(filesystem, rawScopeInput, cwd);
 		const scopePath =
@@ -122,7 +134,7 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 			throw error;
 		}
 		const elapsedMs = performance.now() - started;
-		const { stats, threshold, keywords } = result;
+		const { stats, threshold, keywords, coverage } = result;
 		// Cascade paths are root-relative; the model and renderer want paths
 		// `read` resolves (cwd-relative files, URLs under URL scopes, including
 		// with `:start-end` selectors) without knowing the scope.
@@ -130,34 +142,50 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 			...hit,
 			rel: formatPathRelativeToCwd(resolveSearchResultPath(root.path, hit.rel), cwd),
 		}));
-		const details: FindToolDetails = { query, keywords, threshold, hits, stats, elapsedMs, cwd, scopePath };
+		const details: FindToolDetails = {
+			query,
+			keywords,
+			threshold,
+			hits,
+			coverage,
+			stats,
+			elapsedMs,
+			cwd,
+			scopePath,
+		};
 		const where = scopePath === undefined ? "" : ` in ${scopePath}`;
 		const out: string[] = [];
-		if (hits.length === 0) {
+		if (coverage === "unavailable") {
+			out.push(
+				`find unavailable for "${query}"${where}: all ${stats.requests} judge requests failed, nothing was judged. This is not evidence of absence; use grep.`,
+			);
+		} else if (hits.length === 0) {
 			out.push(`no hits for "${query}"${where} (τ ${threshold.toFixed(2)})`);
 		} else {
-			out.push(`${hits.length} hit(s) for "${query}"${where} (τ ${threshold.toFixed(2)}), strongest first`, "");
-			for (const hit of hits) {
-				const coverage = hit.truncated ? `${hit.linesSeen} lines judged, partial` : `${hit.linesSeen} lines judged`;
-				out.push(`${hit.rel}  ${hit.contentScore.toFixed(2)}  ${coverage}`);
-				for (const range of rankedHeat(hit.ranges, RANGES_SHOWN)) {
-					const span = range.start === range.end ? String(range.start) : `${range.start}-${range.end}`;
-					out.push(`  ${hit.rel}:${span}  ${range.p.toFixed(2)}  ${range.snippet}`);
-				}
-			}
+			out.push(`${hits.length} hit(s) for "${query}"${where} (τ ${threshold.toFixed(2)}), strongest first`);
 		}
-		out.push(
-			"",
-			`listed ${stats.listed} · judged ${stats.judged} · read ${stats.filesRead} files (${formatBytes(stats.fileBytes)}) · ${stats.requests} requests · ${formatNumber(stats.inputTokens)} tokens · $${stats.cost.toFixed(4)} · ${formatDuration(elapsedMs)} wall / ${formatDuration(stats.apiMs)} api`,
-		);
-		if (stats.failures.length > 0) {
+		if (coverage === "partial") {
 			out.push(
-				`${stats.errors} of ${stats.requests} requests failed:`,
-				...stats.failures.map(failure => `  ${failure}`),
+				`partial: ${stats.failed} of ${stats.requests} judge requests failed; unjudged files may still match`,
 			);
 		}
+		if (hits.length > 0) out.push("");
+		for (const hit of hits) {
+			const seen = hit.truncated ? `${hit.linesSeen} lines judged, partial` : `${hit.linesSeen} lines judged`;
+			out.push(`${hit.rel}  ${hit.contentScore.toFixed(2)}  ${seen}`);
+			for (const range of rankedHeat(hit.ranges, RANGES_SHOWN)) {
+				const span = range.start === range.end ? String(range.start) : `${range.start}-${range.end}`;
+				out.push(`  ${hit.rel}:${span}  ${range.p.toFixed(2)}  ${range.snippet}`);
+			}
+		}
+		const unanswered = stats.unanswered > 0 ? ` · ${stats.unanswered} unanswered` : "";
+		out.push(
+			"",
+			`listed ${stats.listed} · judged ${stats.judged} · read ${stats.filesRead} files (${formatBytes(stats.fileBytes)}) · ${stats.requests} requests${unanswered} · ${formatNumber(stats.inputTokens)} tokens · $${stats.cost.toFixed(4)} · ${formatDuration(elapsedMs)} wall / ${formatDuration(stats.apiMs)} api`,
+		);
+		if (stats.failures.length > 0) out.push("failures:", ...stats.failures.map(failure => `  ${failure}`));
 		const builder = toolResult(details).text(out.join("\n"));
-		if (stats.requests > 0 && stats.errors === stats.requests) builder.error();
+		if (coverage === "unavailable") builder.error();
 		else if (hits.length === 0) builder.useless();
 		return builder.done();
 	}

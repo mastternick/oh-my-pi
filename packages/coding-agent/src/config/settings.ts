@@ -15,6 +15,9 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { roleDefaultModels } from "@oh-my-pi/pi-catalog/compat/behavior";
+import { type GeneratedProvider, getBundledModels } from "@oh-my-pi/pi-catalog/models";
+import { type Api, type Model, modelKind } from "@oh-my-pi/pi-catalog/types";
 import {
 	getAgentDbPath,
 	getAgentDir,
@@ -37,7 +40,6 @@ import type { ModelRole } from "../config/model-roles";
 import { loadCapability } from "../discovery";
 import { AgentStorage } from "../session/agent-storage";
 import { type CompactionMethod, DEFAULT_COMPACTION_METHOD_ORDER } from "../session/compaction-methods";
-import MODEL_PRIO from "../priority.json" with { type: "json" };
 import { replaceFileAtomically } from "../utils/atomic-file";
 import { isRegisteredSearchEngine } from "../web/search/provider";
 import { stringifyYamlConfig } from "@oh-my-pi/pi-utils/yaml-config";
@@ -1011,7 +1013,9 @@ export class Settings {
 		return {
 			modelRoles: this.getModelRoles(),
 			defaultThinkingLevel: typeof level === "string" ? parseConfiguredThinkingLevel(level) : undefined,
-			fallbackChains: { ...(lookupSetting("retry.fallbackChains")?.get(this) as Record<string, string[]> | undefined) },
+			fallbackChains: {
+				...(lookupSetting("retry.fallbackChains")?.get(this) as Record<string, string[]> | undefined),
+			},
 		};
 	}
 
@@ -1200,7 +1204,11 @@ export class Settings {
 		if (this.#pin) {
 			// Global entry writes persist through the parent; a pinned record also updates this session's snapshot.
 			this.#parent?.writeEntry(setting, key, value);
-			if (field && field !== "defaultThinkingLevel" && this.#mutatePin(setting, pin => setPinEntry(pin[field], key, value))) {
+			if (
+				field &&
+				field !== "defaultThinkingLevel" &&
+				this.#mutatePin(setting, pin => setPinEntry(pin[field], key, value))
+			) {
 				this.#onPinWrite?.();
 			}
 			return;
@@ -3628,6 +3636,23 @@ export class Settings {
 			const legacyWebOrder = legacy(providerSettings, "webSearchOrder", "providers.webSearchOrder");
 			const legacyWebExclude = legacy(providerSettings, "webSearchExclude", "providers.webSearchExclude");
 			const legacyGeminiModel = legacy(providerSettings, "webSearchGeminiModel", "providers.webSearchGeminiModel");
+			// Legacy settings named a provider; its swap target is the catalog's
+			// resolved per-model policy (`web-search-model` / `image-model` / tts
+			// seed kind), uniform across that provider's bundled rows.
+			const bundledSelector = (
+				provider: string,
+				pick: (model: Model<Api>) => string | undefined,
+			): string | undefined => {
+				for (const model of getBundledModels(provider as GeneratedProvider)) {
+					const id = pick(model);
+					if (id) return `${provider}/${id}`;
+				}
+				return undefined;
+			};
+			const webSearchSelector = (provider: string): string[] => {
+				const selector = bundledSelector(provider, model => model.webSearchModel);
+				return selector ? [selector] : [];
+			};
 			const geminiSelectors = (model: string): string[] => [
 				`google-gemini-cli/${model}`,
 				`google-antigravity/${model}`,
@@ -3638,11 +3663,11 @@ export class Settings {
 					case "gemini":
 						return geminiSelectors(geminiModel);
 					case "anthropic":
-						return ["anthropic/claude-haiku-4-5"];
+						return webSearchSelector("anthropic");
 					case "codex":
-						return ["openai-codex/gpt-5.6-luna"];
+						return webSearchSelector("openai-codex");
 					case "xai":
-						return ["xai/grok-4.5"];
+						return webSearchSelector("xai");
 					case "auto":
 						return [];
 					default:
@@ -3652,7 +3677,7 @@ export class Settings {
 			const geminiModel =
 				typeof legacyGeminiModel === "string" && legacyGeminiModel.trim()
 					? legacyGeminiModel.trim()
-					: "gemini-2.5-flash";
+					: (getBundledModels("google").find(model => model.webSearchModel)?.webSearchModel ?? "");
 			const excludedWebProviders = new Set(
 				Array.isArray(legacyWebExclude)
 					? legacyWebExclude.filter(
@@ -3685,31 +3710,28 @@ export class Settings {
 			if (orderedWebSelectors.length > 0 || excludedWebProviders.size > 0) {
 				setRoleChain(
 					"web",
-					dedupe([...orderedWebSelectors, ...MODEL_PRIO.web]).filter(selector => !isWebSelectorExcluded(selector)),
+					dedupe([...orderedWebSelectors, ...roleDefaultModels().web]).filter(
+						selector => !isWebSelectorExcluded(selector),
+					),
 				);
 			}
 
 			const legacyImage = legacy(providerSettings, "image", "providers.image");
 			const legacyImageOrder = legacy(providerSettings, "imageOrder", "providers.imageOrder");
+			const legacyImageProviders: Record<string, string> = {
+				openai: "openai",
+				"openai-codex": "openai-codex",
+				antigravity: "google-antigravity",
+				xai: "xai",
+				gemini: "google",
+				deepinfra: "deepinfra",
+			};
 			const imageSelector = (provider: string): string | undefined => {
-				switch (provider) {
-					case "openai":
-						return "openai/gpt-image-2";
-					case "openai-codex":
-						return "openai-codex/gpt-image-2";
-					case "antigravity":
-						return "google-antigravity/gemini-3-pro-image";
-					case "xai":
-						return "xai/grok-imagine-image";
-					case "openrouter":
-						return "openrouter/google/gemini-3-pro-image";
-					case "gemini":
-						return "google/gemini-3-pro-image";
-					case "deepinfra":
-						return "deepinfra/black-forest-labs/FLUX-2-pro";
-					default:
-						return undefined;
-				}
+				// OpenRouter rows carry no gemini image-model swap (the gemini class
+				// binds to Google transports only), so its legacy target stays literal.
+				if (provider === "openrouter") return "openrouter/google/gemini-3-pro-image";
+				const catalogProvider = legacyImageProviders[provider];
+				return catalogProvider ? bundledSelector(catalogProvider, model => model.imageModel) : undefined;
 			};
 			const orderedImageProviders = Array.isArray(legacyImageOrder)
 				? legacyImageOrder
@@ -3720,18 +3742,14 @@ export class Settings {
 				typeof value === "string" ? (imageSelector(value) ?? []) : [],
 			);
 			if (orderedImageSelectors.length > 0) {
-				setRoleChain("image", dedupe([...orderedImageSelectors, ...MODEL_PRIO.image]));
+				setRoleChain("image", dedupe([...orderedImageSelectors, ...roleDefaultModels().image]));
 			}
 
 			const legacyTtsProvider = legacy(providerSettings, "tts", "providers.tts");
 			const speechSelector =
-				legacyTtsProvider === "local"
-					? "local/kokoro"
-					: legacyTtsProvider === "xai"
-						? "xai/grok-tts"
-						: legacyTtsProvider === "deepinfra"
-							? "deepinfra/hexgrad/Kokoro-82M"
-							: undefined;
+				legacyTtsProvider === "local" || legacyTtsProvider === "xai" || legacyTtsProvider === "deepinfra"
+					? bundledSelector(legacyTtsProvider, model => (modelKind(model) === "tts" ? model.id : undefined))
+					: undefined;
 			if (speechSelector) setRoleChain("speech", [speechSelector]);
 
 			const legacySttModel = legacy(sttSettings, "modelName", "stt.modelName");
@@ -3761,7 +3779,7 @@ export class Settings {
 				(typeof legacyUnexpectedStopModel === "string" && legacyUnexpectedStopModel !== "online");
 			if (nonDefaultJudge) {
 				const judgeCandidates: string[] = [];
-				if (legacyJudgmentProvider !== "llm") judgeCandidates.push("typesafe/jev-latest");
+				if (legacyJudgmentProvider !== "llm") judgeCandidates.push("typesafe/jev-1.14.0");
 				if (typeof legacyAutoThinkingModel === "string" && legacyAutoThinkingModel !== "online") {
 					judgeCandidates.push(`local/${legacyAutoThinkingModel}`);
 				}
@@ -4262,7 +4280,10 @@ export class Settings {
 	 * a preset default owns its model roles and fallback chains, so the global layer's are left out.
 	 */
 	#mergeOwnLayers(layers: OwnLayers): RawSettings {
-		const global = typeof layers.project.modelPresetDefault === "string" ? withoutPresetDefaultKeys(layers.global) : layers.global;
+		const global =
+			typeof layers.project.modelPresetDefault === "string"
+				? withoutPresetDefaultKeys(layers.global)
+				: layers.global;
 		let merged = this.#deepMerge(this.#deepMerge({}, global), projectLayerForMerge(layers.project));
 		merged = this.#deepMerge(merged, layers.configOverlay);
 		return this.#deepMerge(merged, layers.overrides);

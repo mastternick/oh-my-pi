@@ -43,8 +43,10 @@ function startSession(overrides: Record<string, unknown>): { state: MnemopiSessi
 			settings,
 			modelRegistry: {
 				getApiKeyForProvider: async () => undefined,
+				getAvailable: () => [],
 				resolver: () => async () => undefined,
 			} as never,
+			messages: [],
 			sessionManager: { getEntries: () => [], getCwd: () => dir.path() } as never,
 			emitNotice: () => {},
 			getHindsightSessionState: () => undefined,

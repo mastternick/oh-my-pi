@@ -58,7 +58,7 @@ function createSelector(): SettingsSelectorComponent {
 			thinkingLevel: undefined,
 			availableThemes: ["dark"],
 			providers: [],
-			settings: createSettingsHost(),
+			settings: createSettingsHost(Settings.instance),
 			plugins: createPluginSettingsHost(process.cwd()),
 		},
 		{

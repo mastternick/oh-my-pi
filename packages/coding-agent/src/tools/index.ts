@@ -215,6 +215,8 @@ export interface ToolSession {
 	hasUI: boolean;
 	/** Whether `ask` can reach a human. Defaults to `hasUI`. */
 	canPromptUser?: boolean;
+	/** Keep `ask` in a headless fork's roster; execution still requires UI. */
+	advertiseHeadlessAsk?: boolean;
 	/** The user approves `cfg://` writes for this session (top-level TUI session only). */
 	settingsApproval?: boolean;
 	/** Whether this session has begun disposal. */
@@ -321,6 +323,8 @@ export interface ToolSession {
 	 * required yield tool). Suppresses automatic tool-set expansion.
 	 */
 	restrictToolNames?: boolean;
+	/** Seance forks: the consulted session's artifacts dir, read in place by history://, artifact://, agent://. */
+	readonly seanceSourceArtifactsDir?: string;
 	/** Task recursion depth (0 = top-level, 1 = first child, etc.) */
 	taskDepth?: number;
 	/** Get this agent's eval executor session ID; keys its retained JS/Python/Ruby/Julia state. */
@@ -365,8 +369,6 @@ export interface ToolSession {
 	getToolContext?: () => AgentToolContext | undefined;
 	/** Names currently authorized for invocation through the eval bridge. */
 	getEvalBridgeToolNames?: () => readonly string[];
-	/** Direct partition of the active Code Mode surface; undefined when Code Mode is inactive. */
-	getCodeModeDirectToolNames?: () => readonly string[] | undefined;
 	/** Return whether a built-in tool is active in this turn's tool set. */
 	isToolActive?: (name: string) => boolean;
 	/** Update the active built-in tool predicate when a session changes tools mid-run. */
@@ -478,6 +480,8 @@ export interface ToolSession {
 	getLastAssistantText?: () => string | undefined;
 	/** Resolve a terminal yield's current or immediately preceding report, bound to its call ID. */
 	getYieldReportText?: (toolCallId: string) => string | undefined;
+	/** The `i` intent the model wrote on a tool call of the current turn, by call ID. */
+	getToolCallIntent?: (toolCallId: string) => string | undefined;
 	/** Replace the active workpool item contract and refresh its provider-facing prompt. */
 	setWorkPoolYieldItems?: (items: readonly WorkPoolYieldItem[]) => Promise<void>;
 	/** The tool-choice queue used to force forthcoming tool invocations and carry invocation handlers. */

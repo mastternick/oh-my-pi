@@ -43,7 +43,7 @@ it("clearing a settings-panel text field removes the key from config.yml so its 
 	const configPath = path.join(agentDir, "config.yml");
 	await Bun.write(configPath, YAML.stringify({ searxng: { endpoint: "https://cfg.example" }, temperature: 0.4 }));
 	await Settings.init({ cwd: projectDir, agentDir });
-	const host = createSettingsHost();
+	const host = createSettingsHost(settings);
 	// The panel edits the configured layers: env values are never shown or pre-filled.
 	expect(host.get("hindsight.apiToken")).toBeUndefined();
 

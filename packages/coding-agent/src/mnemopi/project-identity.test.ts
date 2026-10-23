@@ -204,10 +204,7 @@ describe("extendRecallWithLegacyBanks", () => {
 		keyA = resolveProjectIdentity(repoA).key;
 		deadDir = path.join(root, "t9", "gone");
 		fs.mkdirSync(path.join(repoA, "src"), { recursive: true });
-		writeLegacyBank("good-cwd", [
-			JSON.stringify({ cwd: path.join(repoA, "src") }),
-			JSON.stringify({ cwd: repoA }),
-		]);
+		writeLegacyBank("good-cwd", [JSON.stringify({ cwd: path.join(repoA, "src") }), JSON.stringify({ cwd: repoA })]);
 		writeLegacyBank("good-pid", [JSON.stringify({ [PROJECT_IDENTITY_METADATA_KEY]: keyA, cwd: deadDir })]);
 		writeLegacyBank("unrelated", [JSON.stringify({ cwd: repoU })]);
 		writeLegacyBank("mixed", [JSON.stringify({ cwd: repoA }), JSON.stringify({ cwd: repoU })]);

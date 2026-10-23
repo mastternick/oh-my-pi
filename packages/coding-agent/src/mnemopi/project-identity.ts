@@ -60,7 +60,7 @@ export function resolveProjectIdentity(cwd: string): ProjectIdentity {
  * Walks ancestors so nested directories inside the mount resolve too.
  */
 function isolationSourceRoot(dir: string): string | undefined {
-	for (let current = dir; ; ) {
+	for (let current = dir; ;) {
 		if (path.basename(current) === ISOLATION_MOUNT_NAME) {
 			const owner = readIsolationOwnerSync(path.dirname(current));
 			if (owner) return validSourceRoot(owner.sourceRoot);
@@ -79,7 +79,7 @@ function validSourceRoot(sourceRoot: string | undefined): string | undefined {
 }
 
 function isInsideIsolationMount(dir: string): boolean {
-	for (let current = dir; ; ) {
+	for (let current = dir; ;) {
 		if (path.basename(current) === ISOLATION_MOUNT_NAME && readIsolationOwnerSync(path.dirname(current))) return true;
 		const parent = path.dirname(current);
 		if (parent === current) return false;
@@ -168,7 +168,10 @@ export function normalizeGitRemoteUrl(raw: string): string | undefined {
 		host = scp[1].toLowerCase();
 		repoPath = scp[2];
 	}
-	const repo = repoPath.replace(/^\/+|\/+$/g, "").replace(/\.git$/, "").replace(/\/+$/g, "");
+	const repo = repoPath
+		.replace(/^\/+|\/+$/g, "")
+		.replace(/\.git$/, "")
+		.replace(/\/+$/g, "");
 	const normalizedRepo = CASE_INSENSITIVE_PATH_HOSTS[host] === true ? repo.toLowerCase() : repo;
 	if (!host || !normalizedRepo) return undefined;
 	return `${host}${port ? `:${port}` : ""}/${normalizedRepo}`;

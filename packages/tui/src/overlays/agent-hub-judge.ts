@@ -166,7 +166,10 @@ function finiteOrZero(value: unknown): number {
 /** Strip control characters, collapse whitespace, and bound length. */
 export function boundJudgeText(value: unknown, max: number): string {
 	if (typeof value !== "string") return "";
-	const clean = value.replace(/\p{Cc}+/gu, " ").replace(/\s+/g, " ").trim();
+	const clean = value
+		.replace(/\p{Cc}+/gu, " ")
+		.replace(/\s+/g, " ")
+		.trim();
 	return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
 }
 
@@ -330,8 +333,7 @@ function projectSource(source: JudgeSourceInput, rows: JudgeRow[], totals: Judge
 		const { answers, confidence } = answersFor(trace);
 		const cachedQuestions = trace.cachedQuestions ?? 0;
 		const questionCount = questionCountOf(trace);
-		const outcome: JudgeOutcome =
-			trace.status === "error" ? "error" : isFullCache(trace) ? "cache" : "ok";
+		const outcome: JudgeOutcome = trace.status === "error" ? "error" : isFullCache(trace) ? "cache" : "ok";
 		const row: JudgeRow = {
 			id: rowId(trace.id),
 			timestamp: trace.timestamp,

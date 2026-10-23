@@ -548,7 +548,10 @@ export interface SessionDefaultSelection {
  * Resolves the model and thinking level `pin` selects for `session`, without touching it. A failure returns the
  * reason, so a caller can refuse a transition before any state changes.
  */
-export function resolveSessionDefault(session: ModelPresetSession, pin: SessionPresetPin): SessionDefaultSelection | string {
+export function resolveSessionDefault(
+	session: ModelPresetSession,
+	pin: SessionPresetPin,
+): SessionDefaultSelection | string {
 	return resolvePresetDefault(session.settings, session, presetCandidates(session), {
 		modelRoles: pin.modelRoles,
 		fallbackChains: pin.fallbackChains,

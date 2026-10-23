@@ -98,7 +98,8 @@ export function readIsolationOwnerSync(baseDir: string): { id: string; sourceRoo
 	if (typeof decoded !== "object" || decoded === null || !("id" in decoded) || typeof decoded.id !== "string") {
 		return undefined;
 	}
-	const sourceRoot = "sourceRoot" in decoded && typeof decoded.sourceRoot === "string" ? decoded.sourceRoot : undefined;
+	const sourceRoot =
+		"sourceRoot" in decoded && typeof decoded.sourceRoot === "string" ? decoded.sourceRoot : undefined;
 	return sourceRoot ? { id: decoded.id, sourceRoot } : { id: decoded.id };
 }
 

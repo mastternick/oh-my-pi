@@ -416,13 +416,12 @@ function bankBelongsToProject(dbPath: string, activeKey: string, keyOfCwd: (cwd:
 	let db: Database | undefined;
 	try {
 		db = new Database(dbPath, { readonly: true });
-		const rows = db
-			.prepare<{ pid: unknown; cwd: unknown }, [string, string, number]>(`
+		using query = db.prepare<{ pid: unknown; cwd: unknown }, [string, string, number]>(`
 				SELECT DISTINCT json_extract(metadata_json, ?1) AS pid, json_extract(metadata_json, ?2) AS cwd
 				FROM working_memory
 				LIMIT ?3
-			`)
-			.all(`$.${PROJECT_IDENTITY_METADATA_KEY}`, "$.cwd", MAX_LEGACY_IDENTITY_GROUPS + 1);
+			`);
+		const rows = query.all(`$.${PROJECT_IDENTITY_METADATA_KEY}`, "$.cwd", MAX_LEGACY_IDENTITY_GROUPS + 1);
 		if (rows.length === 0 || rows.length > MAX_LEGACY_IDENTITY_GROUPS) return false;
 		return rows.every(row => {
 			if (typeof row.pid === "string") return row.pid === activeKey;

@@ -784,7 +784,8 @@ export class MnemopiSessionState {
 			if (signal?.aborted || !revalidated.changed) return undefined;
 			return {
 				context: revalidated.context || undefined,
-				commit: () => this.#commitExperienceRecall(generation, key, taskText, revalidated.memories, revalidated.context),
+				commit: () =>
+					this.#commitExperienceRecall(generation, key, taskText, revalidated.memories, revalidated.context),
 			};
 		}
 		if (key === this.#experienceTaskKey) return undefined;
@@ -976,10 +977,10 @@ export class MnemopiSessionState {
 		const flat = withLoopPhase("mnemopi.recall", () => flattenAgentMessages(messages));
 		const lastUser = flat.findLast(message => message.role === "user");
 		if (!lastUser) return undefined;
-		const query = withLoopPhase("mnemopi.recall", () =>
-			composeRecallQuery(lastUser.content, flat, this.config.recallContextTurns),
-		);
-		const truncated = truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
+		const truncated = withLoopPhase("mnemopi.recall", () => {
+			const query = composeRecallQuery(lastUser.content, flat, this.config.recallContextTurns);
+			return truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
+		});
 		return await this.recallForContext(truncated);
 	}
 
@@ -1055,8 +1056,7 @@ export class MnemopiSessionState {
 	#restoreRetainedTurnCursor(): void {
 		if (this.#retentionCursorLoaded) return;
 		this.#retentionCursorLoaded = true;
-		const rows = this.memory.beam.db
-			.prepare<MnemopiRetentionCursorRow, [string]>(`
+		using statement = this.memory.beam.db.prepare<MnemopiRetentionCursorRow, [string]>(`
 				SELECT
 					content,
 					json_extract(metadata_json, '$.source_id') AS sourceId,
@@ -1066,8 +1066,8 @@ export class MnemopiSessionState {
 				WHERE source = 'coding-agent-transcript'
 				  AND json_extract(metadata_json, '$.session_id') = ?
 				ORDER BY rowid
-			`)
-			.all(this.sessionId);
+		`);
+		const rows = statement.all(this.sessionId);
 		this.lastRetainedTurn = Math.max(this.lastRetainedTurn, deriveRetainedTurnCursor(rows, this.sessionId));
 	}
 
@@ -1114,10 +1114,10 @@ export class MnemopiSessionState {
 			const messages = withLoopPhase("mnemopi.recall", () => extractMessages(this.session.sessionManager));
 			const lastUser = messages.findLast(message => message.role === "user");
 			if (!lastUser) return;
-			const query = withLoopPhase("mnemopi.recall", () =>
-				composeRecallQuery(lastUser.content, messages, this.config.recallContextTurns),
-			);
-			const truncated = truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
+			const truncated = withLoopPhase("mnemopi.recall", () => {
+				const query = composeRecallQuery(lastUser.content, messages, this.config.recallContextTurns);
+				return truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
+			});
 			try {
 				const recall = await this.#recallBlock(truncated);
 				record = recall && this.#deliveredRecall(recall, block => this.budgetRecallBlock(block));
@@ -1563,7 +1563,10 @@ export function getExperienceRecallScope(config: MnemopiBackendConfig): string {
 
 /** A short prompt that asks to carry on rather than stating a new task. */
 function isContinuationPrompt(text: string): boolean {
-	const normalized = text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+	const normalized = text
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, " ")
+		.trim();
 	if (!normalized || normalized.length > 80) return false;
 	if (normalized.split(" ").length > 8) return false;
 	return CONTINUATION_RE.test(normalized);
@@ -1589,7 +1592,10 @@ function resolveExperienceTaskText(
 
 /** Deterministic "same task context" key: sorted unique significant tokens of the task text. */
 function experienceTaskKey(taskText: string): string {
-	const normalized = taskText.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+	const normalized = taskText
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, " ")
+		.trim();
 	const tokens = [...new Set(normalized.split(" ").filter(token => token.length >= 3))].sort();
 	return Bun.hash(tokens.join(" ")).toString(36);
 }

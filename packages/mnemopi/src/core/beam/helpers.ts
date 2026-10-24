@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { logger, withLoopPhase } from "@oh-my-pi/pi-utils";
 import { generateId as generateTimedId, sha256Hex16, stableMemoryId } from "../../util/ids";
 import { cjkFtsTerms, containsSpacelessCjk, ftsQueryTerms, hasCjk, isCjkChar, recallTokens } from "../../util/regex";
-import { currentEmbeddingModel, embed } from "../embeddings";
+import { currentEmbeddingModel, embed, embeddingChain } from "../embeddings";
 import { getMnemopiRuntimeOptions, mnemopiDebugEnabled, withMnemopiRuntimeOptions } from "../runtime-options";
 import { buildExactVectorIndex, searchExactVectorIndex } from "../vector-index";
 import type { BeamMemoryState, JsonValue, Metadata } from "./types";
@@ -348,7 +348,12 @@ export function vecSearch(db: Database, embedding: readonly number[], k = 20): V
 	}
 }
 
-export function inMemoryVecSearch(db: Database, queryEmbedding: readonly number[], k = 20): VectorDistanceResult[] {
+export function inMemoryVecSearch(
+	db: Database,
+	queryEmbedding: readonly number[],
+	k = 20,
+	model: string = currentEmbeddingModel(),
+): VectorDistanceResult[] {
 	if (queryEmbedding.length === 0) return [];
 	try {
 		const rows = db
@@ -356,9 +361,10 @@ export function inMemoryVecSearch(db: Database, queryEmbedding: readonly number[
 				SELECT em.rowid, me.memory_id, me.embedding_json
 				FROM memory_embeddings me
 				JOIN episodic_memory em ON me.memory_id = em.id
+				WHERE me.model = ?
 				LIMIT 10000
 			`)
-			.all() as Record<string, unknown>[];
+			.all(model) as Record<string, unknown>[];
 		const index = buildExactVectorIndex(
 			rows.map(row => ({ id: Number(row.rowid), vector: decodeVector(String(row.embedding_json ?? "")) })),
 		);
@@ -373,6 +379,7 @@ export function workingMemoryVecSearch(
 	queryEmbedding: readonly number[],
 	k = 20,
 	now: Date = new Date(),
+	model: string = currentEmbeddingModel(),
 ): WorkingVectorResult[] {
 	if (queryEmbedding.length === 0) return [];
 	try {
@@ -382,11 +389,12 @@ export function workingMemoryVecSearch(
 				SELECT wm.id, me.embedding_json
 				FROM memory_embeddings me
 				JOIN working_memory wm ON me.memory_id = wm.id
-				WHERE wm.superseded_by IS NULL
+				WHERE me.model = ?
+				  AND wm.superseded_by IS NULL
 				  AND (wm.valid_until IS NULL OR wm.valid_until > ?)
 				LIMIT ?
 			`)
-			.all(now.toISOString(), limit) as Record<string, unknown>[];
+			.all(model, now.toISOString(), limit) as Record<string, unknown>[];
 		const index = buildExactVectorIndex(
 			rows.map(row => ({ id: String(row.id), vector: decodeVector(String(row.embedding_json ?? "")) })),
 		);
@@ -723,14 +731,16 @@ export interface EmbedItem {
 	readonly content: string;
 }
 
-async function runEmbedding(beam: BeamMemoryState, items: readonly EmbedItem[]): Promise<void> {
+async function runEmbedding(beam: BeamMemoryState, items: readonly EmbedItem[], model: string): Promise<void> {
 	try {
-		const matrix = await embed(items.map(item => item.content));
+		const matrix = await embed(
+			items.map(item => item.content),
+			model,
+		);
 		if (matrix === null) return;
 		// Persisting the vectors runs synchronously on the caller's event loop; label it so a
 		// stall is attributable. The embedding itself is awaited above, outside the label.
 		withLoopPhase("mnemopi.embed-persist", () => {
-			const model = currentEmbeddingModel();
 			using insertEmbedding = beam.db.prepare(
 				"INSERT OR REPLACE INTO memory_embeddings(memory_id, embedding_json, model) VALUES (?, ?, ?)",
 			);
@@ -777,15 +787,22 @@ async function runEmbedding(beam: BeamMemoryState, items: readonly EmbedItem[]):
  * `flushExtractions()`. The active runtime options (provider, model, API URL/key) are
  * captured here and re-entered inside the task because the `AsyncLocalStorage` scope
  * set by `Mnemopi.#withRuntimeOptions` has already exited by the time the task runs.
+ * One task runs per model, so a model that fails does not block the others.
  */
-export function scheduleEmbedding(beam: BeamMemoryState, items: readonly EmbedItem[]): void {
+export function scheduleEmbedding(
+	beam: BeamMemoryState,
+	items: readonly EmbedItem[],
+	models: readonly string[] = embeddingChain(),
+): void {
 	const cleaned = items.filter(item => item.content.trim() !== "");
 	if (cleaned.length === 0) return;
 	const runtimeOptions = getMnemopiRuntimeOptions();
-	const task = withMnemopiRuntimeOptions(runtimeOptions, () => runEmbedding(beam, cleaned));
 	const pending = beam.pendingExtractions;
-	if (pending !== undefined) {
-		pending.add(task);
-		void task.finally(() => pending.delete(task));
+	for (const model of models) {
+		const task = withMnemopiRuntimeOptions(runtimeOptions, () => runEmbedding(beam, cleaned, model));
+		if (pending !== undefined) {
+			pending.add(task);
+			void task.finally(() => pending.delete(task));
+		}
 	}
 }

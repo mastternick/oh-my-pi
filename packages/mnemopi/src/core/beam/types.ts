@@ -184,6 +184,8 @@ export interface RecallOptions {
 	ftsWeight?: number;
 	importanceWeight?: number;
 	queryEmbedding?: readonly number[] | null;
+	/** Embedding model that produced `queryEmbedding`; omitted means the primary model. Vectors are only compared against rows of this model. */
+	queryEmbeddingModel?: string;
 	useSynonyms?: boolean;
 	useIntent?: boolean;
 	useMmr?: boolean;

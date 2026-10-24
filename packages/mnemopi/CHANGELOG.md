@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `mnemopi.embeddingFallbackModels` (env `MNEMOPI_EMBEDDING_FALLBACK_MODELS`, comma-separated): an ordered embedding-model chain after the primary `mnemopi.embeddingModel`. A failed model is skipped for query embedding for five minutes before it is retried. Query vectors are compared only against stored vectors from the model that produced them.
+- Non-fastembed embedding models (e.g. OpenRouter ids) now use the API endpoint whenever an API key or custom base URL is configured, without `MNEMOPI_EMBEDDINGS_VIA_API`.
+
+### Changed
+
+- `memory_embeddings` is keyed by `(memory_id, model)` instead of `memory_id`. The table is migrated in place and existing rows are kept; rows with no recorded model are reassigned to the empty model and dropped on the next store open.
+- Changing the primary embedding model clears only the binary vector and sqlite-vec caches; vectors for other chain models are kept.
+
 ## [18.12.4] - 2026-10-20
 
 ### Fixed

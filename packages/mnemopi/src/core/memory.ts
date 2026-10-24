@@ -36,6 +36,7 @@ export interface MnemopiOptions {
 	readonly channel_id?: string | null;
 	readonly noEmbeddings?: boolean;
 	readonly embeddingModel?: string;
+	readonly embeddingFallbackModels?: readonly string[];
 	readonly embeddingApiUrl?: string;
 	readonly embeddingApiKey?: ApiKey;
 	readonly embeddings?: false | MnemopiEmbeddingRuntimeOptions;
@@ -192,12 +193,14 @@ function resolveRuntimeOptions(options: MnemopiOptions): ResolvedMnemopiRuntimeO
 	const embeddingModel = options.embeddingModel ?? nestedEmbeddings?.model;
 	const embeddingApiUrl = options.embeddingApiUrl ?? nestedEmbeddings?.apiUrl;
 	const embeddingApiKey = options.embeddingApiKey ?? nestedEmbeddings?.apiKey;
+	const embeddingFallbackModels = options.embeddingFallbackModels ?? nestedEmbeddings?.fallbackModels;
 	const embeddingProvider = resolveEmbeddingProvider(nestedEmbeddings?.provider);
 	const embeddingMaxInputChars = nestedEmbeddings?.maxInputChars;
 
 	const embeddings =
 		embeddingDisabled !== undefined ||
 		embeddingModel !== undefined ||
+		embeddingFallbackModels !== undefined ||
 		embeddingApiUrl !== undefined ||
 		embeddingApiKey !== undefined ||
 		embeddingProvider !== undefined ||
@@ -205,6 +208,7 @@ function resolveRuntimeOptions(options: MnemopiOptions): ResolvedMnemopiRuntimeO
 			? {
 					disabled: embeddingDisabled,
 					model: embeddingModel,
+					fallbackModels: embeddingFallbackModels,
 					apiUrl: embeddingApiUrl,
 					apiKey: embeddingApiKey,
 					provider: embeddingProvider,
@@ -338,6 +342,7 @@ function toRecallOptions(options: RecallFacadeOptions): BeamRecallFacadeOptions 
 	// FTS-only, `number[]` = caller-supplied) so callers can opt out of `recall()`'s
 	// auto-embed without being forced into it.
 	if ("queryEmbedding" in options) beamOptions.queryEmbedding = options.queryEmbedding;
+	if (options.queryEmbeddingModel !== undefined) beamOptions.queryEmbeddingModel = options.queryEmbeddingModel;
 	return beamOptions;
 }
 

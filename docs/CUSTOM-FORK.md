@@ -29,6 +29,8 @@ Local source changes are recorded in the commit history of `custom`. Upstream hi
 
 Known deliberate source change: `checkForNewVersion` in `main.ts` resolves the real launcher path before calling `managedInstallName`, so the custom channel's `manager.json` is honored and the startup update prompt does not suggest `omp update`.
 
+Known deliberate source change: Mnemopi embedding model chain. `mnemopi.embeddingFallbackModels` (env `MNEMOPI_EMBEDDING_FALLBACK_MODELS`) is an ordered list tried after `embeddingModel`. `memory_embeddings` is keyed by (memory_id, model) with a migration, and reconcile runs per model. Query-time fallback skips a failed model for 5 minutes. Non-fastembed models route to the API without `MNEMOPI_EMBEDDINGS_VIA_API`.
+
 ## Upstream CI
 
 Upstream workflows that target `omp-kata` runners or Bazel are disabled on the fork, not deleted, so upstream merges stay conflict-free.

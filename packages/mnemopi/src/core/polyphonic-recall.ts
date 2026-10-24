@@ -4,6 +4,7 @@ import { type Env, polyphonicRecallEnabled } from "../config";
 import { closeQuietly, type DatabasePath, openDatabase } from "../db";
 import { backfillConsolidatedFacts, ensureVeracityConsolidator } from "./beam/consolidate";
 import type { BeamMemoryState, JsonValue, Metadata, RecallResult, RecallTierLabel } from "./beam/types";
+import { currentEmbeddingModel } from "./embeddings";
 import { EpisodicGraph } from "./episodic-graph";
 import { STOP_WORDS } from "./synonyms";
 import { VeracityConsolidator } from "./veracity-consolidation";
@@ -49,6 +50,11 @@ export interface PolyphonicCallOptions {
 	 * the `hybrid` voice and are reused verbatim when a fused hit is one of them.
 	 */
 	readonly baseline?: readonly RecallResult[];
+	/**
+	 * Embedding model that produced the query vector; omitted means the primary model. The vector
+	 * voice compares it only against stored rows of this model.
+	 */
+	queryEmbeddingModel?: string;
 }
 
 export interface PolyphonicRecallOptions extends PolyphonicCallOptions {
@@ -352,6 +358,7 @@ export class PolyphonicRecallEngine {
 		const queryUnit = normalizeVector(queryEmbedding);
 		if (queryUnit === null) return [];
 		const now = new Date().toISOString();
+		const model = options.queryEmbeddingModel ?? currentEmbeddingModel();
 		const working = this.#visibility("wm", options.channelId);
 		const episodic = this.#visibility("em", options.channelId);
 		let rows: EmbeddingRow[] = [];
@@ -361,19 +368,21 @@ export class PolyphonicRecallEngine {
 					SELECT me.memory_id, me.embedding_json, 'working' AS embedding_tier
 					FROM memory_embeddings me
 					JOIN working_memory wm ON wm.id = me.memory_id
-					WHERE wm.superseded_by IS NULL
+					WHERE me.model = ?
+						AND wm.superseded_by IS NULL
 						AND (wm.valid_until IS NULL OR wm.valid_until > ?)
 						AND ${working.clause}
 					UNION ALL
 					SELECT me.memory_id, me.embedding_json, 'episodic' AS embedding_tier
 					FROM memory_embeddings me
 					JOIN episodic_memory em ON em.id = me.memory_id
-					WHERE em.superseded_by IS NULL
+					WHERE me.model = ?
+						AND em.superseded_by IS NULL
 						AND (em.valid_until IS NULL OR em.valid_until > ?)
 						AND ${episodic.clause}
 					LIMIT 50000
 				`)
-				.all(now, ...working.params, now, ...episodic.params) as EmbeddingRow[];
+				.all(model, now, ...working.params, model, now, ...episodic.params) as EmbeddingRow[];
 		} catch {
 			return [];
 		}
@@ -611,7 +620,9 @@ export class PolyphonicRecallEngine {
 	getStats(): Record<string, JsonValue> {
 		let embeddedRows = 0;
 		try {
-			const row = this.db.query("SELECT COUNT(*) AS count FROM memory_embeddings").get() as {
+			const row = this.db
+				.query("SELECT COUNT(*) AS count FROM memory_embeddings WHERE model = ?")
+				.get(currentEmbeddingModel()) as {
 				count: number;
 			};
 			embeddedRows = row.count;

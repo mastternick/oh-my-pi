@@ -4,6 +4,7 @@ import { factRecall, formatContext, recall, recallEnhanced } from "@oh-my-pi/pi-
 import { initBeam } from "@oh-my-pi/pi-mnemopi/core/beam/schema";
 import { invalidate } from "@oh-my-pi/pi-mnemopi/core/beam/store";
 import type { BeamMemoryState } from "@oh-my-pi/pi-mnemopi/core/beam/types";
+import { currentEmbeddingModel } from "@oh-my-pi/pi-mnemopi/core/embeddings";
 import { currentLoopPhase } from "@oh-my-pi/pi-utils";
 
 type TestBeam = BeamMemoryState & { close(): void };
@@ -103,9 +104,10 @@ describe("beam recall free functions", () => {
 			[project, ["gate-status", "word-choice"]],
 		] as const) {
 			for (const id of ids) {
-				beam.db.run("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, 'fixture')", [
+				beam.db.run("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)", [
 					id,
 					JSON.stringify([0.5, Math.sqrt(0.75)]),
+					currentEmbeddingModel(),
 				]);
 			}
 		}
@@ -229,9 +231,9 @@ describe("beam recall free functions", () => {
 			"identifier",
 		]);
 		insertWorking(beam, "semantic", "The vault selects the personal login.");
-		beam.db.run(
-			"INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES ('semantic', '[1,0]', 'fixture')",
-		);
+		beam.db.run("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES ('semantic', '[1,0]', ?)", [
+			currentEmbeddingModel(),
+		]);
 		expect((await recall(beam, "1Password", 5, { queryEmbedding: [1, 0] })).map(result => result.id)).toEqual([
 			"semantic",
 		]);

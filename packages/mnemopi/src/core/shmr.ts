@@ -381,13 +381,14 @@ function precomputedVectors(db: Database, memoryIds: readonly (string | undefine
 	const out = new Map<string, Vector>();
 	const ids = memoryIds.filter((id): id is string => id !== undefined);
 	if (ids.length === 0 || !tableExists(db, "memory_embeddings")) return out;
+	const model = embeddings.currentEmbeddingModel();
 	for (let offset = 0; offset < ids.length; offset += 500) {
 		const chunk = ids.slice(offset, offset + 500);
 		const rows = db
 			.query(
-				`SELECT memory_id, embedding_json FROM memory_embeddings WHERE memory_id IN (${chunk.map(() => "?").join(", ")})`,
+				`SELECT memory_id, embedding_json FROM memory_embeddings WHERE model = ? AND memory_id IN (${chunk.map(() => "?").join(", ")})`,
 			)
-			.all(...chunk) as Array<{ memory_id: string; embedding_json: string | null }>;
+			.all(model, ...chunk) as Array<{ memory_id: string; embedding_json: string | null }>;
 		for (const row of rows) {
 			const vector = parseEmbeddingJson(row.embedding_json);
 			if (vector !== null) out.set(row.memory_id, vector);

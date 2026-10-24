@@ -3,7 +3,7 @@ import { logger, withLoopPhase } from "@oh-my-pi/pi-utils";
 import { transaction } from "../../db";
 import { toUtcIso } from "../../util/datetime";
 import { generateId } from "../../util/ids";
-import { currentEmbeddingModel, embeddingsDisabled } from "../embeddings";
+import { embeddingChain, embeddingsDisabled } from "../embeddings";
 import { EpisodicGraph } from "../episodic-graph";
 import { countExtractedFactCategories, extractFactCategoriesSafe } from "../extraction";
 import { getMnemopiRuntimeOptions, withMnemopiRuntimeOptions } from "../runtime-options";
@@ -350,55 +350,51 @@ function rowToDict(row: Row): Row {
  *  embedding request instead of embedding the whole corpus in one call. */
 const EMBED_REBUILD_BATCH = 128;
 
+/** `mnemopi_meta` key recording the primary embedding model that produced the primary-only vectors. */
+const PRIMARY_MODEL_META_KEY = "embedding_primary_model";
+
 /**
- * Reconcile stored embeddings against the active embedding model at store open.
+ * Reconcile stored embeddings against the configured embedding chain at store open.
  *
- * Every `memory_embeddings` row is stamped with the model that produced it (see
- * `runEmbedding` in `helpers.ts`). When the configured embedding model changes,
- * its vector dimension changes too, so the previously-stored vectors are no
- * longer comparable. On a mismatch we wipe every stored vector — the
- * `memory_embeddings` table, the `episodic_memory.binary_vector` column, and the
- * sqlite-vec `vec_episodes` index — then enqueue all live memories for
- * background re-embedding under the new model via `scheduleEmbedding`.
+ * `memory_embeddings` holds one vector per (memory, model); the chain is the primary model followed by
+ * its fallbacks (`embeddingChain()`). This pass:
+ * - deletes rows whose model is no longer in the chain, since nothing can compare against them;
+ * - when the PRIMARY model changed, clears the primary-only acceleration data (`episodic_memory.binary_vector`
+ *   and the sqlite-vec `vec_episodes` index), which was built from the previous primary;
+ * - re-enqueues, per chain model, every live memory that lacks a vector for that model.
  *
- * Runs once per store open; a fresh store (no embeddings) or an already-current
- * store is a no-op. The destructive wipe is skipped whenever it could not be
- * rebuilt — embeddings disabled via the runtime option OR the
- * `MNEMOPI_NO_EMBEDDINGS` env, or an unresolved (empty) active model — so a
- * stale-but-valid corpus is never destroyed without a replacement. MUST run
- * inside the active runtime-options scope so `currentEmbeddingModel()` /
- * `embeddingsDisabled()` reflect the per-instance configuration.
+ * Rows for models still in the chain are never wiped. Runs once per store open; an already-current store is
+ * a no-op. Skipped entirely when embeddings are disabled or the primary model is unresolved, so a
+ * stale-but-valid corpus is never destroyed without a replacement. MUST run inside the active runtime-options
+ * scope so `embeddingChain()` / `embeddingsDisabled()` reflect the per-instance configuration.
  */
 export function reconcileEmbeddingModel(beam: BeamMemoryState): void {
 	if (embeddingsDisabled()) return;
-	const active = currentEmbeddingModel().trim();
-	if (active === "") return;
+	const chain = embeddingChain();
+	const primary = chain[0] ?? "";
+	if (primary.trim() === "") return;
+	const chainPlaceholders = chain.map(() => "?").join(", ");
 
-	// Re-embed in bounded batches so a corpus-wide rebuild never issues one giant
-	// embedding request; each batch is its own tracked background task.
-	const rebuild = (items: readonly EmbedItem[]): void => {
-		for (let offset = 0; offset < items.length; offset += EMBED_REBUILD_BATCH) {
-			scheduleEmbedding(beam, items.slice(offset, offset + EMBED_REBUILD_BATCH));
+	const storedPrimary = (
+		beam.db.query("SELECT value FROM mnemopi_meta WHERE key = ?").get(PRIMARY_MODEL_META_KEY) as {
+			value: string;
+		} | null
+	)?.value;
+	// Without a recorded primary (store predating the meta table), any row stamped with another model
+	// proves the primary changed since those vectors were written.
+	const primaryChanged =
+		storedPrimary === undefined
+			? Boolean(beam.db.query("SELECT 1 FROM memory_embeddings WHERE model IS NOT ? LIMIT 1").get(primary))
+			: storedPrimary !== primary;
+
+	const orphanModels = beam.db
+		.query(`SELECT DISTINCT model FROM memory_embeddings WHERE model NOT IN (${chainPlaceholders})`)
+		.all(...chain) as { model: string }[];
+	transaction(beam.db, () => {
+		if (orphanModels.length > 0) {
+			beam.db.query(`DELETE FROM memory_embeddings WHERE model NOT IN (${chainPlaceholders})`).run(...chain);
 		}
-	};
-
-	// Stop at the first row whose stamped model differs from the active one
-	// (NULL/unstamped counts as a mismatch via `IS NOT`).
-	const mismatch = beam.db.query("SELECT 1 FROM memory_embeddings WHERE model IS NOT ? LIMIT 1").get(active);
-	if (mismatch) {
-		const staleModels = beam.db
-			.query("SELECT DISTINCT model FROM memory_embeddings WHERE model IS NOT ?")
-			.all(active) as { model: string | null }[];
-		const live = beam.db
-			.query(`
-				SELECT id AS memoryId, COALESCE(embed_text, content) AS content FROM working_memory WHERE superseded_by IS NULL
-				UNION ALL
-				SELECT id AS memoryId, content FROM episodic_memory WHERE superseded_by IS NULL
-			`)
-			.all() as EmbedItem[];
-
-		transaction(beam.db, () => {
-			beam.db.run("DELETE FROM memory_embeddings");
+		if (primaryChanged) {
 			beam.db.run("UPDATE episodic_memory SET binary_vector = NULL");
 			if (vecAvailable(beam.db)) {
 				try {
@@ -407,33 +403,41 @@ export function reconcileEmbeddingModel(beam: BeamMemoryState): void {
 					// sqlite-vec cleanup is best-effort; rebuild correctness takes precedence.
 				}
 			}
-		});
-
+		}
+		beam.db
+			.query("INSERT OR REPLACE INTO mnemopi_meta (key, value) VALUES (?, ?)")
+			.run(PRIMARY_MODEL_META_KEY, primary);
+	});
+	if (primaryChanged) {
 		logger.info("mnemopi: embedding model changed, rebuilding", {
-			from: staleModels.map(row => row.model ?? "(unstamped)"),
-			to: active,
-			count: live.length,
+			from: storedPrimary ?? "(unstamped)",
+			to: primary,
 		});
-		rebuild(live);
-		return;
+	}
+	if (orphanModels.length > 0) {
+		logger.info("mnemopi: dropping embeddings for models outside the chain", {
+			models: orphanModels.map(row => row.model),
+		});
 	}
 
-	// No stale embeddings, but a previously-interrupted rebuild (a failed embed or a process
-	// exit after the wipe) can leave live memories with no active-model embedding. Treating an
-	// empty/partial table as "reconciled" would strand them FTS-only, so re-enqueue any live
-	// row still missing an active-model embedding.
-	const missing = beam.db
-		.query(`
-			SELECT id AS memoryId, COALESCE(embed_text, content) AS content FROM working_memory
-			WHERE superseded_by IS NULL AND id NOT IN (SELECT memory_id FROM memory_embeddings WHERE model = ?)
-			UNION ALL
-			SELECT id AS memoryId, content FROM episodic_memory
-			WHERE superseded_by IS NULL AND id NOT IN (SELECT memory_id FROM memory_embeddings WHERE model = ?)
-		`)
-		.all(active, active) as EmbedItem[];
-	if (missing.length === 0) return;
-	logger.info("mnemopi: resuming interrupted embedding rebuild", { to: active, count: missing.length });
-	rebuild(missing);
+	// Backfill per model in bounded batches so a corpus-wide rebuild never issues one giant embedding
+	// request; each batch is its own tracked background task.
+	for (const model of chain) {
+		const missing = beam.db
+			.query(`
+				SELECT id AS memoryId, COALESCE(embed_text, content) AS content FROM working_memory
+				WHERE superseded_by IS NULL AND id NOT IN (SELECT memory_id FROM memory_embeddings WHERE model = ?)
+				UNION ALL
+				SELECT id AS memoryId, content FROM episodic_memory
+				WHERE superseded_by IS NULL AND id NOT IN (SELECT memory_id FROM memory_embeddings WHERE model = ?)
+			`)
+			.all(model, model) as EmbedItem[];
+		if (missing.length === 0) continue;
+		logger.info("mnemopi: resuming embedding backfill", { model, count: missing.length });
+		for (let offset = 0; offset < missing.length; offset += EMBED_REBUILD_BATCH) {
+			scheduleEmbedding(beam, missing.slice(offset, offset + EMBED_REBUILD_BATCH), [model]);
+		}
+	}
 }
 
 export function remember(beam: BeamMemoryState, content: string, options: StoreRememberOptions = {}): string {

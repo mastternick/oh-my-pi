@@ -88,6 +88,7 @@ Common environment fallbacks:
 - `MNEMOPI_DB_PAGE_SIZE`: optional SQLite page size for new file-backed databases; use a valid power of two from 512 to 65536 or `os` to request the detected system page size. Unset preserves SQLite's default.
 - `MNEMOPI_NO_EMBEDDINGS=1`: force FTS-only recall.
 - `MNEMOPI_EMBEDDING_MODEL`: defaults to `BAAI/bge-small-en-v1.5`.
+- `MNEMOPI_EMBEDDING_FALLBACK_MODELS`: comma-separated embedding models tried in order after `MNEMOPI_EMBEDDING_MODEL` when it fails (e.g. `nvidia/nemotron-3-embed-1b:free,perplexity/pplx-embed-v1-0.6b`). Each memory is stored once per chain model; query vectors are compared only against rows of the model that produced them. Models outside the chain are dropped on store open.
 - `MNEMOPI_EMBEDDING_API_URL` and `MNEMOPI_EMBEDDING_API_KEY`: OpenAI-compatible embedding endpoint.
 - `MNEMOPI_LLM_ENABLED=1`, `MNEMOPI_LLM_BASE_URL`, `MNEMOPI_LLM_API_KEY`, `MNEMOPI_LLM_MODEL`: OpenAI-compatible LLM endpoint.
 

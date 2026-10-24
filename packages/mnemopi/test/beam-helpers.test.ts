@@ -102,21 +102,30 @@ describe("beam vector fallback helpers", () => {
 		const db = new Database(":memory:");
 		try {
 			db.run("CREATE TABLE episodic_memory (rowid INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, content TEXT)");
-			db.run("CREATE TABLE memory_embeddings (memory_id TEXT PRIMARY KEY, embedding_json TEXT)");
+			db.run(
+				"CREATE TABLE memory_embeddings (memory_id TEXT NOT NULL, embedding_json TEXT, model TEXT NOT NULL, PRIMARY KEY (memory_id, model))",
+			);
 			db.query("INSERT INTO episodic_memory (id, content) VALUES (?, ?)").run("same", "same vector");
 			db.query("INSERT INTO episodic_memory (id, content) VALUES (?, ?)").run("orthogonal", "orthogonal vector");
-			db.query("INSERT INTO memory_embeddings (memory_id, embedding_json) VALUES (?, ?)").run(
+			db.query("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)").run(
 				"same",
 				encodeVector([1, 0]),
+				"m",
 			);
-			db.query("INSERT INTO memory_embeddings (memory_id, embedding_json) VALUES (?, ?)").run(
+			db.query("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)").run(
 				"orthogonal",
 				encodeVector([0, 1]),
+				"m",
+			);
+			db.query("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)").run(
+				"same",
+				encodeVector([0, 1]),
+				"other",
 			);
 
 			expect(decodeVector("[1,0]")).toEqual([1, 0]);
 			expect(decodeVector("[1,null]")).toBeNull();
-			expect(inMemoryVecSearch(db, [1, 0], 2)).toEqual([
+			expect(inMemoryVecSearch(db, [1, 0], 2, "m")).toEqual([
 				{ rowid: 1, distance: 0 },
 				{ rowid: 2, distance: 1 },
 			]);
@@ -131,7 +140,9 @@ describe("beam vector fallback helpers", () => {
 			db.run(
 				"CREATE TABLE working_memory (id TEXT PRIMARY KEY, content TEXT, superseded_by TEXT, valid_until TEXT)",
 			);
-			db.run("CREATE TABLE memory_embeddings (memory_id TEXT PRIMARY KEY, embedding_json TEXT)");
+			db.run(
+				"CREATE TABLE memory_embeddings (memory_id TEXT NOT NULL, embedding_json TEXT, model TEXT NOT NULL, PRIMARY KEY (memory_id, model))",
+			);
 			db.query("INSERT INTO working_memory (id, content, superseded_by, valid_until) VALUES (?, ?, NULL, NULL)").run(
 				"same",
 				"same",
@@ -141,16 +152,18 @@ describe("beam vector fallback helpers", () => {
 				"expired",
 				"2024-01-01T00:00:00.000Z",
 			);
-			db.query("INSERT INTO memory_embeddings (memory_id, embedding_json) VALUES (?, ?)").run(
+			db.query("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)").run(
 				"same",
 				encodeVector([1, 0]),
+				"m",
 			);
-			db.query("INSERT INTO memory_embeddings (memory_id, embedding_json) VALUES (?, ?)").run(
+			db.query("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)").run(
 				"expired",
 				encodeVector([1, 0]),
+				"m",
 			);
 
-			expect(workingMemoryVecSearch(db, [1, 0], 10, new Date("2024-01-02T00:00:00.000Z"))).toEqual([
+			expect(workingMemoryVecSearch(db, [1, 0], 10, new Date("2024-01-02T00:00:00.000Z"), "m")).toEqual([
 				{ id: "same", sim: 1 },
 			]);
 		} finally {

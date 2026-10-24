@@ -15,6 +15,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import type { EmbeddingModel } from "fastembed";
+import { parseModelList } from "../config";
 import { loadFastembed } from "./fastembed-runtime";
 import {
 	type EmbeddingOutput,
@@ -51,11 +52,35 @@ export type LocalModelInitializer = (options: LocalModelInitOptions) => Promise<
 
 const QUERY_CACHE_MAX = 512;
 
+/** A chain model whose query embed fails is skipped for query embedding for this long. */
+const EMBED_COOLDOWN_MS = 5 * 60 * 1000;
+
+export interface EmbedBudget {
+	/** Per-request timeout in milliseconds. */
+	timeoutMs: number;
+	/** Attempts per request, including the first. The 429 backoff sits inside each attempt. */
+	maxAttempts: number;
+}
+
+/** Background embeds (retain, backfill) keep the retrying budget. */
+const BACKGROUND_EMBED_BUDGET: EmbedBudget = { timeoutMs: 30_000, maxAttempts: 3 };
+/** Query-time embeds make one short attempt so recall never waits on a stalled endpoint. */
+const QUERY_EMBED_BUDGET: EmbedBudget = { timeoutMs: 8_000, maxAttempts: 1 };
+
+/** A query vector together with the chain model that produced it. */
+export interface QueryEmbedding {
+	vector: Vector;
+	/** Recall compares `vector` only against stored rows of this model. */
+	model: string;
+}
+
 let providerOverride: EmbeddingProvider | null = null;
-let localModelPromise: Promise<LocalEmbeddingModel> | null = null;
+const localModelPromises = new Map<string, Promise<LocalEmbeddingModel>>();
 let localModelInitializer: LocalModelInitializer = defaultLocalModelInitializer;
 let apiCallCount = 0;
 const queryCache = new LRUCache<string, Vector>({ max: QUERY_CACHE_MAX });
+/** Per-(embedding scope, model) cooldown deadlines (epoch ms), set when a query embed fails. */
+const embedCooldownUntil = new Map<string, number>();
 
 // Provider identity table for the cache key. Each unique `provider` object/function
 // (configured via `withMnemopiRuntimeOptions`) gets a stable integer id so the cache
@@ -120,13 +145,13 @@ function activeEmbeddingOptions() {
 }
 
 /**
- * Compose the per-query cache key. Includes the active provider's identity, the
- * resolved model name, and the API base URL so two `Mnemopi` instances in the same
- * process that point at different providers/models never share a cached query
- * vector. Provider identity comes from `providerIds` (WeakMap-assigned integer);
- * `0` is the sentinel for "no provider configured, fall back to env defaults".
+ * Identity of the active embedding source: the provider object (stable integer id from
+ * `providerIds`; `0` is the sentinel for "no provider configured, fall back to env defaults")
+ * and the API base URL. Query vectors and cooldowns are scoped by it so two `Mnemopi`
+ * instances in one process that point at different providers never share a cached vector
+ * or each other's failures.
  */
-function queryCacheKey(text: string): string {
+function embeddingScope(): string {
 	const active = activeEmbeddingOptions();
 	const provider = active?.provider as object | undefined;
 	let providerId = 0;
@@ -139,9 +164,12 @@ function queryCacheKey(text: string): string {
 			providerId = existing;
 		}
 	}
-	const model = defaultModel();
-	const apiUrl = active?.apiUrl ?? "";
-	return `${providerId}::${model}::${apiUrl}::${text}`;
+	return `${providerId}::${active?.apiUrl ?? ""}`;
+}
+
+/** Compose the per-query cache key from the embedding scope, resolved model name, and text. */
+function queryCacheKey(text: string, model: string): string {
+	return `${embeddingScope()}::${model}::${text}`;
 }
 
 function inTestRuntime(): boolean {
@@ -237,6 +265,18 @@ function defaultModel(): string {
 }
 
 /**
+ * Ordered embedding models for the active runtime scope: the primary model followed by its
+ * fallbacks, de-duplicated with order preserved. Fallbacks come from the runtime
+ * `embeddings.fallbackModels` option, else `MNEMOPI_EMBEDDING_FALLBACK_MODELS`.
+ */
+export function embeddingChain(): string[] {
+	const fallbacks =
+		activeEmbeddingOptions()?.fallbackModels ?? parseModelList($env.MNEMOPI_EMBEDDING_FALLBACK_MODELS ?? "");
+	const trimmed = fallbacks.map(model => model.trim()).filter(model => model !== "");
+	return [...new Set([defaultModel(), ...trimmed])];
+}
+
+/**
  * Resolve the embedding model name for the currently active runtime scope.
  *
  * Reads (in order): the active provider's `model` from `withMnemopiRuntimeOptions`,
@@ -261,6 +301,10 @@ export function isApiModel(modelName: string): boolean {
 	if (baseUrl !== undefined && baseUrl !== "" && !hostMatchesUrl(baseUrl, "openrouter")) {
 		return true;
 	}
+	// A model with no fastembed mapping can only be served by the API, so a configured key routes it there.
+	if (fastembedModelName(modelName) === null && embeddingKeyConfigured()) {
+		return true;
+	}
 	return $flag("MNEMOPI_EMBEDDINGS_VIA_API");
 }
 
@@ -282,6 +326,9 @@ const MODEL_DIMS: Record<string, number> = {
 	"text-embedding-3-large": 3072,
 	"jina-embeddings-v5-omni-nano": 768,
 	"jina-embeddings-v5-omni-small": 1024,
+	"nvidia/nemotron-3.5-embed-1b:free": 2048,
+	"nvidia/nemotron-3-embed-1b:free": 2048,
+	"perplexity/pplx-embed-v1-0.6b": 1024,
 };
 export function embeddingDimFor(modelName: string): number {
 	const override = Number.parseInt($env.MNEMOPI_EMBEDDING_DIM ?? "", 10);
@@ -321,15 +368,16 @@ function fastembedModelName(modelName: string): StandardEmbeddingModel | null {
 	return id === undefined ? null : (id as StandardEmbeddingModel);
 }
 
-async function getLocalModel(): Promise<LocalEmbeddingModel | null> {
-	if (isApiModel(defaultModel()) || embeddingsDisabled() || inTestRuntime()) {
+async function getLocalModel(model: string): Promise<LocalEmbeddingModel | null> {
+	if (isApiModel(model) || embeddingsDisabled() || inTestRuntime()) {
 		return null;
 	}
-	if (localModelPromise !== null) {
-		return localModelPromise;
+	const pending = localModelPromises.get(model);
+	if (pending !== undefined) {
+		return pending.catch(() => null);
 	}
 
-	const modelName = fastembedModelName(defaultModel());
+	const modelName = fastembedModelName(model);
 	if (modelName === null) {
 		return null;
 	}
@@ -340,7 +388,7 @@ async function getLocalModel(): Promise<LocalEmbeddingModel | null> {
 		cacheDir,
 		showDownloadProgress: false,
 	});
-	localModelPromise = loading;
+	localModelPromises.set(model, loading);
 	try {
 		return await loading;
 	} catch (error) {
@@ -348,12 +396,12 @@ async function getLocalModel(): Promise<LocalEmbeddingModel | null> {
 			model: modelName,
 			error: String(error),
 		});
-		if (localModelPromise === loading) localModelPromise = null;
+		if (localModelPromises.get(model) === loading) localModelPromises.delete(model);
 		return null;
 	}
 }
 
-async function embedApi(texts: readonly string[]): Promise<EmbeddingMatrix | null> {
+async function embedApi(texts: readonly string[], model: string, budget: EmbedBudget): Promise<EmbeddingMatrix | null> {
 	const baseUrl = embeddingBaseUrl();
 	const isCustom = !hostMatchesUrl(baseUrl, "openrouter");
 	const apiKey = embeddingApiKey();
@@ -361,7 +409,7 @@ async function embedApi(texts: readonly string[]): Promise<EmbeddingMatrix | nul
 		return null;
 	}
 
-	const body = JSON.stringify({ model: defaultModel(), input: texts });
+	const body = JSON.stringify({ model, input: texts });
 	try {
 		// withAuth re-resolves the key on 401 (force-refresh, then sibling
 		// rotation) when `apiKey` is a resolver. The 429 backoff stays inside
@@ -379,8 +427,8 @@ async function embedApi(texts: readonly string[]): Promise<EmbeddingMatrix | nul
 				method: "POST",
 				headers,
 				body,
-				signal: AbortSignal.timeout(30000),
-				maxAttempts: 3,
+				signal: AbortSignal.timeout(budget.timeoutMs),
+				maxAttempts: budget.maxAttempts,
 				defaultDelayMs: attempt => 2 ** attempt * 1000,
 			});
 			if (res.status === 401) {
@@ -420,13 +468,14 @@ async function providerAvailable(provider: EmbeddingProvider): Promise<boolean> 
 export function setEmbeddingProviderForTests(provider: EmbeddingProvider | null | undefined): void {
 	providerOverride = provider ?? null;
 	queryCache.clear();
+	embedCooldownUntil.clear();
 }
 
 export const setEmbeddingProvider = setEmbeddingProviderForTests;
 
 export function setLocalModelInitializerForTests(initializer: LocalModelInitializer | null | undefined): void {
 	localModelInitializer = initializer ?? defaultLocalModelInitializer;
-	localModelPromise = null;
+	localModelPromises.clear();
 	queryCache.clear();
 }
 
@@ -442,10 +491,11 @@ export const setLocalModelInitializer = setLocalModelInitializerForTests;
 
 export function resetEmbeddingProviderForTests(): void {
 	providerOverride = null;
-	localModelPromise = null;
+	localModelPromises.clear();
 	localModelInitializer = defaultLocalModelInitializer;
 	apiCallCount = 0;
 	queryCache.clear();
+	embedCooldownUntil.clear();
 }
 
 export const resetEmbeddingStateForTests = resetEmbeddingProviderForTests;
@@ -479,24 +529,41 @@ export function availableApi(): boolean {
 	return embeddingKeyConfigured();
 }
 
-export async function embedQuery(text: string): Promise<Vector | null> {
+export async function embedQuery(text: string): Promise<QueryEmbedding | null> {
 	if (text === "" || embeddingsDisabled()) {
 		return null;
 	}
-	const key = queryCacheKey(text);
-	const cached = queryCache.get(key);
-	if (cached !== undefined) {
-		return cached;
+	const scope = embeddingScope();
+	for (const model of embeddingChain()) {
+		const cooldownKey = `${scope}::${model}`;
+		const cooldownUntil = embedCooldownUntil.get(cooldownKey);
+		if (cooldownUntil !== undefined) {
+			if (cooldownUntil > Date.now()) {
+				continue;
+			}
+			embedCooldownUntil.delete(cooldownKey);
+		}
+		const key = queryCacheKey(text, model);
+		const cached = queryCache.get(key);
+		if (cached !== undefined) {
+			return { vector: cached, model };
+		}
+		const vector = (await embed([text], model, QUERY_EMBED_BUDGET))?.[0];
+		if (vector !== undefined) {
+			queryCache.set(key, vector);
+			return { vector, model };
+		}
+		embedCooldownUntil.set(cooldownKey, Date.now() + EMBED_COOLDOWN_MS);
 	}
-	const vectors = await embed([text]);
-	const vector = vectors?.[0] ?? null;
-	if (vector !== null) {
-		queryCache.set(key, vector);
-	}
-	return vector;
+	return null;
 }
 
-export async function embed(texts: readonly string[]): Promise<EmbeddingMatrix | null> {
+/** Embed texts with one model of the chain. `budget` bounds the API path only. */
+export async function embed(
+	texts: readonly string[],
+	model: string = defaultModel(),
+	budget: EmbedBudget = BACKGROUND_EMBED_BUDGET,
+): Promise<EmbeddingMatrix | null> {
 	if (texts.length === 0 || embeddingsDisabled()) {
 		return null;
 	}
@@ -516,26 +583,26 @@ export async function embed(texts: readonly string[]): Promise<EmbeddingMatrix |
 			return null;
 		}
 	}
-	if (isApiModel(defaultModel())) {
-		return embedApi(texts);
+	if (isApiModel(model)) {
+		return embedApi(texts, model, budget);
 	}
 	if (texts.length === 1) {
-		const key = queryCacheKey(texts[0] ?? "");
+		const key = queryCacheKey(texts[0] ?? "", model);
 		const cached = queryCache.get(key);
 		if (cached !== undefined) {
 			return [cached];
 		}
 	}
-	const model = await getLocalModel();
-	if (model === null) {
+	const localModel = await getLocalModel(model);
+	if (localModel === null) {
 		return null;
 	}
 	try {
-		const vectors = await withLoopPhase("mnemopi.embed", () => collectMatrix(model.embed([...texts])));
+		const vectors = await withLoopPhase("mnemopi.embed", () => collectMatrix(localModel.embed([...texts])));
 		if (vectors.length === 1) {
 			const vector = vectors[0];
 			if (vector !== undefined) {
-				queryCache.set(queryCacheKey(texts[0] ?? ""), vector);
+				queryCache.set(queryCacheKey(texts[0] ?? "", model), vector);
 			}
 		}
 		return vectors;

@@ -82,8 +82,16 @@ describe("SHMR embedding integration", () => {
 				"gamma delta umbra two",
 				0.8,
 			]);
-			db.run("INSERT INTO memory_embeddings (memory_id, embedding_json) VALUES (?, ?)", ["m1", "[1, 0, 0]"]);
-			db.run("INSERT INTO memory_embeddings (memory_id, embedding_json) VALUES (?, ?)", ["m2", "[1, 0, 0]"]);
+			db.run("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)", [
+				"m1",
+				"[1, 0, 0]",
+				embeddings.currentEmbeddingModel(),
+			]);
+			db.run("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)", [
+				"m2",
+				"[1, 0, 0]",
+				embeddings.currentEmbeddingModel(),
+			]);
 			const stats = await harmonize({ db, session_id: "s" }, 10, 1, 0.9);
 			expect(stats.status).toBe("harmonized");
 			expect(stats.clusters_found).toBe(1);

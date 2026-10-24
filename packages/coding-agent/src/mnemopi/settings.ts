@@ -219,6 +219,22 @@ export const cfgMnemopiEmbeddingModel = register({
 	},
 });
 
+export const cfgMnemopiEmbeddingFallbackModels = register({
+	id: "mnemopi.embeddingFallbackModels",
+	type: "array",
+	default: [] as string[],
+	// `fallback: true`: a configured list wins; the env var only fills in while the setting is unset.
+	env: {
+		name: "MNEMOPI_EMBEDDING_FALLBACK_MODELS",
+		parse: raw =>
+			raw
+				.split(",")
+				.map(model => model.trim())
+				.filter(model => model.length > 0),
+		fallback: true,
+	},
+});
+
 export const cfgMnemopiEmbeddingApiUrl = register({
 	id: "mnemopi.embeddingApiUrl",
 	type: "string",

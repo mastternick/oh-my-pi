@@ -23,6 +23,7 @@ import {
 	cfgMnemopiDebug,
 	cfgMnemopiEmbeddingApiKey,
 	cfgMnemopiEmbeddingApiUrl,
+	cfgMnemopiEmbeddingFallbackModels,
 	cfgMnemopiEmbeddingModel,
 	cfgMnemopiEmbeddingVariant,
 	cfgMnemopiEnhancedRecall,
@@ -48,7 +49,13 @@ export type MnemopiScoping = "global" | "per-project" | "per-project-tagged";
 
 export type MnemopiProviderOptions = Pick<
 	MnemopiOptions,
-	"noEmbeddings" | "embeddingModel" | "embeddingApiUrl" | "embeddingApiKey" | "llm" | "debug"
+	| "noEmbeddings"
+	| "embeddingModel"
+	| "embeddingFallbackModels"
+	| "embeddingApiUrl"
+	| "embeddingApiKey"
+	| "llm"
+	| "debug"
 >;
 
 export interface MnemopiBackendConfig {
@@ -134,6 +141,7 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 			noEmbeddings: cfgMnemopiNoEmbeddings.get(settings),
 			debug: cfgMnemopiDebug.get(settings),
 			embeddingModel,
+			embeddingFallbackModels: cfgMnemopiEmbeddingFallbackModels.get(settings),
 			embeddingApiUrl: cfgMnemopiEmbeddingApiUrl.get(settings),
 			embeddingApiKey: cfgMnemopiEmbeddingApiKey.get(settings),
 			llm:

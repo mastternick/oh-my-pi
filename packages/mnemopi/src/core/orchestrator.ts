@@ -50,16 +50,19 @@ export async function orchestrateRecall(
 		!options.forceLinear &&
 		(options.forcePolyphonic === true || polyphonicRecallIsEnabled(process.env, beam.config.polyphonicRecall));
 	let queryEmbedding: readonly number[] | Float32Array | null | undefined = options.queryEmbedding;
+	let queryEmbeddingModel = options.queryEmbeddingModel;
 	if (queryEmbedding === undefined && query.length > 0) {
 		// Auto-derive when the caller did not pass one. `embedQuery()` returns null when
 		// embeddings are disabled or no provider is configured, so this is a no-op for
 		// FTS-only deployments. `null` (explicit "no embedding") is preserved untouched.
-		queryEmbedding = await embedQuery(query);
+		const derived = await embedQuery(query);
+		queryEmbedding = derived === null ? null : derived.vector;
+		queryEmbeddingModel = derived?.model;
 	}
 	if (polyphonic) {
-		return polyphonicRecall(beam, query, topK, { ...options, queryEmbedding });
+		return polyphonicRecall(beam, query, topK, { ...options, queryEmbedding, queryEmbeddingModel });
 	}
-	const linearOptions = toLinearRecallOptions({ ...options, queryEmbedding });
+	const linearOptions = toLinearRecallOptions({ ...options, queryEmbedding, queryEmbeddingModel });
 	if (options.enhanced === true && typeof beam.recallEnhanced === "function") {
 		return beam.recallEnhanced(query, topK, linearOptions);
 	}

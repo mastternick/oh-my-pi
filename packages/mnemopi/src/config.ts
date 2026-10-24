@@ -47,6 +47,9 @@ export const EMBEDDING_DIMS: Readonly<Record<string, number>> = {
 	"text-embedding-3-large": 3072,
 	"jina-embeddings-v5-omni-nano": 768,
 	"jina-embeddings-v5-omni-small": 1024,
+	"nvidia/nemotron-3.5-embed-1b:free": 2048,
+	"nvidia/nemotron-3-embed-1b:free": 2048,
+	"perplexity/pplx-embed-v1-0.6b": 1024,
 };
 
 export const VERACITY_WEIGHT_DEFAULTS = {
@@ -71,6 +74,18 @@ export function beamOptimizationsEnabled(env: Env = process.env): boolean {
 
 export function embeddingModel(env: Env = process.env): string {
 	return envString("MNEMOPI_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL, env);
+}
+
+/** Parses a comma-separated model list, trimming entries and dropping empties. */
+export function parseModelList(value: string): string[] {
+	return value
+		.split(",")
+		.map(model => model.trim())
+		.filter(model => model !== "");
+}
+
+export function embeddingFallbackModels(env: Env = process.env): string[] {
+	return parseModelList(envOptionalString("MNEMOPI_EMBEDDING_FALLBACK_MODELS", env) ?? "");
 }
 
 export function embeddingDim(env: Env = process.env): number {

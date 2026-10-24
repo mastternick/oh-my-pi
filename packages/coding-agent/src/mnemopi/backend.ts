@@ -686,6 +686,7 @@ async function resolveMnemopiProviderOptions(
 	const base: MnemopiProviderOptions = {
 		noEmbeddings: config.providerOptions.noEmbeddings,
 		embeddingModel: config.providerOptions.embeddingModel,
+		embeddingFallbackModels: config.providerOptions.embeddingFallbackModels,
 		embeddingApiUrl: config.providerOptions.embeddingApiUrl,
 		embeddingApiKey:
 			config.providerOptions.embeddingApiKey ??

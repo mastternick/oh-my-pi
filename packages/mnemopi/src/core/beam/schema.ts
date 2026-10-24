@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 
 type PragmaTableInfoRow = {
 	name: string;
+	pk: number;
 };
 
 function addColumnIfMissing(db: Database, table: string, column: string, definition: string): boolean {
@@ -19,6 +20,34 @@ function runAll(db: Database, statements: readonly string[]): void {
 	for (const statement of statements) {
 		db.run(statement);
 	}
+}
+
+/**
+ * `memory_embeddings` was keyed by `memory_id` alone, which leaves no room for a second embedding
+ * model. Rebuild it keyed by `(memory_id, model)`, keeping every existing row. Idempotent: a table
+ * whose `model` column is already part of the key is left alone.
+ */
+function migrateMemoryEmbeddingsKey(db: Database): void {
+	const columns = db.query("PRAGMA table_info(memory_embeddings)").all() as PragmaTableInfoRow[];
+	if (columns.length === 0 || columns.some(column => column.name === "model" && column.pk > 0)) {
+		return;
+	}
+	db.transaction(() => {
+		db.run(`
+			CREATE TABLE memory_embeddings_v2 (
+				memory_id TEXT NOT NULL,
+				embedding_json TEXT NOT NULL,
+				model TEXT NOT NULL,
+				created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+				PRIMARY KEY (memory_id, model)
+			)
+		`);
+		db.run(
+			"INSERT INTO memory_embeddings_v2 (memory_id, embedding_json, model, created_at) SELECT memory_id, embedding_json, COALESCE(model, ''), created_at FROM memory_embeddings",
+		);
+		db.run("DROP TABLE memory_embeddings");
+		db.run("ALTER TABLE memory_embeddings_v2 RENAME TO memory_embeddings");
+	})();
 }
 
 export function initBeam(db: Database): void {
@@ -271,12 +300,20 @@ export function initBeam(db: Database): void {
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		)
 	`);
+	migrateMemoryEmbeddingsKey(db);
 	db.run(`
 		CREATE TABLE IF NOT EXISTS memory_embeddings (
-			memory_id TEXT PRIMARY KEY,
+			memory_id TEXT NOT NULL,
 			embedding_json TEXT NOT NULL,
-			model TEXT,
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+			model TEXT NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (memory_id, model)
+		)
+	`);
+	db.run(`
+		CREATE TABLE IF NOT EXISTS mnemopi_meta (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
 		)
 	`);
 
@@ -293,7 +330,6 @@ export function initBeam(db: Database): void {
 	runAll(db, [
 		"CREATE INDEX IF NOT EXISTS idx_em_scope_imp ON episodic_memory(scope, importance) WHERE superseded_by IS NULL",
 		"CREATE INDEX IF NOT EXISTS idx_wm_session_recall ON working_memory(session_id, last_recalled) WHERE valid_until IS NULL",
-		"CREATE INDEX IF NOT EXISTS idx_mem_emb_type ON memory_embeddings(memory_id, model)",
 	]);
 
 	for (const table of ["working_memory", "episodic_memory"] as const) {

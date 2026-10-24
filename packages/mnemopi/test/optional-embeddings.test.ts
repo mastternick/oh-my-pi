@@ -106,8 +106,8 @@ describe("optional embeddings", () => {
 			});
 
 			expect(await available()).toBe(true);
-			expect(await embedQuery("cache me")).toEqual(new Float32Array([8, 99]));
-			expect(await embedQuery("cache me")).toEqual(new Float32Array([8, 99]));
+			expect((await embedQuery("cache me"))?.vector).toEqual(new Float32Array([8, 99]));
+			expect((await embedQuery("cache me"))?.vector).toEqual(new Float32Array([8, 99]));
 			expect(calls).toBe(1);
 		});
 	});

@@ -36,6 +36,8 @@ export interface MnemopiEmbeddingProvider {
 export interface MnemopiEmbeddingRuntimeOptions {
 	disabled?: boolean;
 	model?: string;
+	/** Ordered fallback embedding models tried after `model`. Each chain model keeps its own vectors. */
+	fallbackModels?: readonly string[];
 	apiUrl?: string;
 	apiKey?: ApiKey;
 	provider?: MnemopiEmbeddingProvider | ((texts: readonly string[]) => EmbeddingOutput | Promise<EmbeddingOutput>);
@@ -66,6 +68,7 @@ export interface MnemopiRuntimeOptions {
 export interface ResolvedMnemopiEmbeddingRuntimeOptions {
 	disabled?: boolean;
 	model?: string;
+	fallbackModels?: readonly string[];
 	apiUrl?: string;
 	apiKey?: ApiKey;
 	provider?: MnemopiEmbeddingProvider;

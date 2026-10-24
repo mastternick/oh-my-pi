@@ -13,7 +13,7 @@ import {
 	unknownWeight,
 } from "../../config";
 import { hasCjk, matchesWordForm } from "../../util/regex";
-import { embedQuery } from "../embeddings";
+import { currentEmbeddingModel, embedQuery } from "../embeddings";
 import { mmrRerank } from "../mmr";
 import { type OrchestratedRecallResult, orchestrateRecall } from "../orchestrator";
 import { POLYPHONIC_MAX_COMBINED_SCORE } from "../polyphonic-recall";
@@ -594,6 +594,7 @@ function vectorSimilarities(
 	beam: BeamMemoryState,
 	memoryIds: readonly string[],
 	queryEmbedding: readonly number[] | null | undefined,
+	model: string,
 ): Map<string, number> {
 	const out = new Map<string, number>();
 	if (
@@ -608,8 +609,8 @@ function vectorSimilarities(
 		const chunk = memoryIds.slice(offset, offset + 500);
 		const rows = queryAll(
 			beam,
-			`SELECT memory_id, embedding_json FROM memory_embeddings WHERE memory_id IN (${placeholders(chunk.length)})`,
-			chunk,
+			`SELECT memory_id, embedding_json FROM memory_embeddings WHERE model = ? AND memory_id IN (${placeholders(chunk.length)})`,
+			[model, ...chunk],
 		);
 		for (const row of rows) {
 			const vector = parseEmbedding(row.embedding_json);
@@ -898,8 +899,9 @@ function collectMemoryCandidates(
 	if (queryEmbedding !== null && queryEmbedding !== undefined) {
 		const allWmIds = options.includeWorking === false ? [] : allVisibleIds(beam, "working_memory", options);
 		const allEmIds = allVisibleIds(beam, "episodic_memory", options);
-		wmVec = vectorSimilarities(beam, allWmIds, queryEmbedding);
-		emVec = vectorSimilarities(beam, allEmIds, queryEmbedding);
+		const model = options.queryEmbeddingModel ?? currentEmbeddingModel();
+		wmVec = vectorSimilarities(beam, allWmIds, queryEmbedding, model);
+		emVec = vectorSimilarities(beam, allEmIds, queryEmbedding, model);
 		wmIds = [
 			...new Set([
 				...wmIds,
@@ -952,7 +954,8 @@ export async function recall(
 		// so this is a no-op when the user has not wired one up. Float32Array → number[]
 		// because RecallOptions exposes the narrower public shape.
 		const derived = query.length > 0 ? await embedQuery(query) : null;
-		temporalOptions.queryEmbedding = derived === null ? null : Array.from(derived);
+		temporalOptions.queryEmbedding = derived === null ? null : Array.from(derived.vector);
+		temporalOptions.queryEmbeddingModel = derived?.model;
 	}
 	return withLoopPhase("mnemopi.recall", () => {
 		let weights = normalizedRecallWeights(
@@ -1054,13 +1057,16 @@ export async function recallEnhanced(
 	// Derive the query embedding once: it feeds the cache's semantic tiers, the linear
 	// ranking and the polyphonic vector voice. Same three-state contract as `recall()`.
 	let queryEmbedding = options.queryEmbedding;
+	let queryEmbeddingModel = options.queryEmbeddingModel;
 	if (queryEmbedding === undefined) {
 		const derived = query.length > 0 ? await embedQuery(query) : null;
-		queryEmbedding = derived === null ? null : Array.from(derived);
+		queryEmbedding = derived === null ? null : Array.from(derived.vector);
+		queryEmbeddingModel = derived?.model;
 	}
 	const runOptions: RecallEnhancedOptions & RecallOptionsInternal = {
 		...options,
 		queryEmbedding,
+		queryEmbeddingModel,
 		updateRecallCounts: false,
 	};
 	const countRecalls = options.updateRecallCounts !== false;
@@ -1083,7 +1089,7 @@ export async function recallEnhanced(
 				cache.invalidate();
 				beam.caches.queryCacheToken = token;
 			}
-			scope = enhancedRecallCacheScope(beam, topK, options, polyphonic);
+			scope = enhancedRecallCacheScope(beam, topK, options, polyphonic, queryEmbeddingModel);
 			const cached = cache.get(query, queryEmbedding, scope);
 			if (cached !== null) {
 				const results = structuredClone(cached) as RecallResult[];
@@ -1242,6 +1248,7 @@ function enhancedRecallCacheScope(
 	topK: number,
 	options: RecallEnhancedOptions & RecallOptionsInternal,
 	polyphonic: boolean,
+	queryEmbeddingModel: string | undefined,
 ): string {
 	const scope: Record<string, unknown> = {
 		bank: beam.dbPath ?? null,
@@ -1252,7 +1259,8 @@ function enhancedRecallCacheScope(
 	const record = options as Record<string, unknown>;
 	for (const key of Object.keys(record).sort()) {
 		const value = record[key];
-		if (key === "useCache" || key === "queryEmbedding" || value === undefined) continue;
+		if (key === "useCache" || key === "queryEmbedding" || key === "queryEmbeddingModel" || value === undefined)
+			continue;
 		scope[key] = value instanceof Date ? value.toISOString() : value;
 	}
 	// A caller-supplied embedding changes the ranking; a derived one is a function of the query.
@@ -1260,6 +1268,8 @@ function enhancedRecallCacheScope(
 	else if (options.queryEmbedding !== undefined) {
 		scope.queryEmbedding = Bun.hash(JSON.stringify(options.queryEmbedding)).toString(36);
 	}
+	// The model that produced a derived embedding decides which stored vectors it is compared against.
+	scope.queryEmbeddingModel = queryEmbeddingModel ?? null;
 	return JSON.stringify(scope);
 }
 

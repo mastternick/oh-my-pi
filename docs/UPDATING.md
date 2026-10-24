@@ -35,9 +35,11 @@ Checks, in order. Nothing becomes `current` unless every check passes:
 2. That commit is an ancestor of `origin/custom`.
 3. The `custom-release.yml` run for that tag and commit has conclusion `success`, checked through the Actions API.
 4. The bundle matches `SHA256SUMS.txt` (`sha256sum -c`).
-5. The bundle is extracted into a staging directory and installed with `bun install --frozen-lockfile --ignore-scripts`, then passes the packaged smoke test (`--version`, `--help`, `--smoke-test`).
+5. The bundle is extracted into a staging directory and installed with `bun install --frozen-lockfile --ignore-scripts` using a private bun cache that is deleted afterwards. A shared cache could reuse an older same-version tarball (`18.12.6-c2` vs `18.12.6-c3`), so it is not used. The installed `@oh-my-pi` packages are then compared byte-for-byte with the bundle tarballs, and the staged copy must pass the packaged smoke test (`--version`, `--help`, `--smoke-test`).
 
 Only then does `versions/<label>` appear and `current` move to it.
+
+A same-commit re-run skips the install only when the installed packages still match the bundle. Otherwise the version is reinstalled.
 
 The existing launcher is kept. The installer:
 

@@ -4,6 +4,7 @@
 #   2. the custom-release workflow succeeded for that tag and commit (GitHub Actions API)
 #   3. the release bundle matches SHA256SUMS.txt
 #   4. the unpacked CLI passes the smoke test before the atomic switch
+#   5. the installed @oh-my-pi packages match the bundle tarballs byte-for-byte (a stale install is refused)
 #
 # The existing omp launcher is kept. Only its config is rewritten to point at the current version,
 # and the legacy preset-fallback guard is disabled. Sessions started under an older binary keep it
@@ -72,7 +73,7 @@ gh release download "$tag" -R "$REPO" -D "$dl" -p SHA256SUMS.txt -p "$asset"
 
 # 4. Unpack and install into a staging dir, smoke-test it, then move it into place.
 vdir="$ROOT/versions/$label"
-if [[ -f "$vdir/.commit" && "$(cat "$vdir/.commit")" == "$commit" ]]; then
+if [[ -f "$vdir/.commit" && "$(cat "$vdir/.commit")" == "$commit" ]] && omp_custom_bundle_matches "$vdir"; then
   echo "$label already installed at $commit"
 else
   stage=""

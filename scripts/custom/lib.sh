@@ -29,12 +29,75 @@ process.stdin.on("data", chunk => (text += chunk)).on("end", () => {
 ' || die "$1 has unresolved or non-exact dependency specs (listed above)"
 }
 
-# Unpack a release bundle into <dir> and install its pinned lockfile without lifecycle scripts.
+# Unpack a release bundle into <dir>, install its pinned lockfile without lifecycle scripts, and verify the
+# result. bun caches file: tarball deps by tarball name, not content, and a same-version re-release (cN)
+# reuses those names, so each install gets a private cache that is removed afterwards.
 # usage: omp_custom_install_bundle <bundle.tgz> <dir>
 omp_custom_install_bundle() {
   mkdir -p "$2"
   tar -xzf "$1" -C "$2"
-  (cd "$2" && bun install --frozen-lockfile --ignore-scripts >/dev/null)
+  (
+    cache="$(mktemp -d "$2.bun-cache.XXXXXX")"
+    trap 'rm -rf "$cache"' EXIT
+    cd "$2" && BUN_INSTALL_CACHE_DIR="$cache" bun install --frozen-lockfile --ignore-scripts >/dev/null
+  ) || die "bun install failed for $1"
+  omp_custom_bundle_matches "$2" || die "could not verify $2 against bundle $1 (mismatch or unreadable package)"
+}
+
+# Checks that every @oh-my-pi package the bundle declares as file:./<tgz> is installed byte-for-byte under
+# node_modules (files and symlink targets). Prints each mismatch to stderr. Returns 1 on any mismatch,
+# missing package, or empty declaration list.
+# usage: omp_custom_bundle_matches <install-dir>
+omp_custom_bundle_matches() {
+  bun -e '
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { execFileSync } = require("node:child_process");
+const dir = process.argv[1];
+const manifest = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
+const specs = Object.entries({ ...manifest.dependencies, ...manifest.overrides }).filter(([, spec]) => spec.startsWith("file:./"));
+const tree = root => {
+	const out = new Map();
+	const walk = current => {
+		for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+			const full = path.join(current, entry.name);
+			const rel = path.relative(root, full);
+			// a nested node_modules holds the deps of other packages, not the files of this package
+			if (entry.isDirectory()) { if (entry.name !== "node_modules") walk(full); }
+			else if (entry.isSymbolicLink()) out.set(rel, `symlink:${fs.readlinkSync(full)}`);
+			else out.set(rel, crypto.createHash("sha256").update(fs.readFileSync(full)).digest("hex"));
+		}
+	};
+	walk(root);
+	return out;
+};
+const bad = specs.length === 0 ? ["bundle declares no file: packages"] : [];
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-custom-verify-"));
+try {
+	for (const [name, spec] of specs) {
+		const tarball = path.join(dir, spec.slice("file:./".length));
+		const installed = path.join(dir, "node_modules", name);
+		if (!fs.existsSync(installed)) {
+			bad.push(`${name}: not installed`);
+			continue;
+		}
+		const unpacked = fs.mkdtempSync(path.join(tmp, "x-"));
+		execFileSync("tar", ["-xzf", tarball, "-C", unpacked]);
+		const want = tree(path.join(unpacked, "package"));
+		const got = tree(installed);
+		const differ = [...new Set([...want.keys(), ...got.keys()])].filter(file => want.get(file) !== got.get(file));
+		if (differ.length > 0) bad.push(`${name}: ${differ.length} file(s) differ from ${spec.slice("file:./".length)}, first: ${differ[0]}`);
+	}
+} finally {
+	fs.rmSync(tmp, { recursive: true, force: true });
+}
+if (bad.length > 0) {
+	console.error(bad.join("\n"));
+	process.exit(1);
+}
+' "$1"
 }
 
 # usage: omp_custom_pkg_version <install-dir>

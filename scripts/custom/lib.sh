@@ -49,6 +49,7 @@ omp_custom_install_bundle() {
 # missing package, or empty declaration list.
 # usage: omp_custom_bundle_matches <install-dir>
 omp_custom_bundle_matches() {
+  # shellcheck disable=SC2016 # the node program is single-quoted on purpose
   bun -e '
 const fs = require("node:fs");
 const os = require("node:os");

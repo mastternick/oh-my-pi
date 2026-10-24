@@ -4,7 +4,7 @@ import { type Env, polyphonicRecallEnabled } from "../config";
 import { closeQuietly, type DatabasePath, openDatabase } from "../db";
 import { backfillConsolidatedFacts, ensureVeracityConsolidator } from "./beam/consolidate";
 import type { BeamMemoryState, JsonValue, Metadata, RecallResult, RecallTierLabel } from "./beam/types";
-import { currentEmbeddingModel } from "./embeddings";
+import { currentEmbeddingModel, denseOnlyFloor } from "./embeddings";
 import { EpisodicGraph } from "./episodic-graph";
 import { STOP_WORDS } from "./synonyms";
 import { VeracityConsolidator } from "./veracity-consolidation";
@@ -127,9 +127,10 @@ export const POLYPHONIC_MAX_COMBINED_SCORE = POLYPHONIC_VOICES.length / (POLYPHO
 const TEMPORAL_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const NEAR_DUPLICATE_JACCARD = 0.8;
 /**
- * Cosine a memory needs to count as a vector-voice hit: the bar linear recall applies
- * to candidates with no keyword match. Without it the voice's nearest neighbours pad
- * every result list with unrelated memories.
+ * Default cosine a memory needs to count as a vector-voice hit: the bar linear recall applies
+ * to candidates with no keyword match. A model with a calibrated `denseOnlyFloor` uses that
+ * floor instead. Without a floor the voice's nearest neighbours pad every result list with
+ * unrelated memories.
  */
 const VECTOR_VOICE_MIN_COSINE = 0.65;
 /**
@@ -359,6 +360,7 @@ export class PolyphonicRecallEngine {
 		if (queryUnit === null) return [];
 		const now = new Date().toISOString();
 		const model = options.queryEmbeddingModel ?? currentEmbeddingModel();
+		const floor = denseOnlyFloor(model) ?? VECTOR_VOICE_MIN_COSINE;
 		const working = this.#visibility("wm", options.channelId);
 		const episodic = this.#visibility("em", options.channelId);
 		let rows: EmbeddingRow[] = [];
@@ -396,7 +398,7 @@ export class PolyphonicRecallEngine {
 				continue;
 			}
 			const cosine = cosineAgainstUnit(queryUnit, parsed);
-			if (cosine === null || cosine < VECTOR_VOICE_MIN_COSINE) continue;
+			if (cosine === null || cosine < floor) continue;
 			const similarity = (cosine + 1) / 2;
 			const existing = byId.get(row.memory_id);
 			if (existing === undefined || similarity > existing.score) {

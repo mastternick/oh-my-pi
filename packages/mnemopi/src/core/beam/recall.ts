@@ -13,13 +13,13 @@ import {
 	unknownWeight,
 } from "../../config";
 import { hasCjk, matchesWordForm } from "../../util/regex";
-import { currentEmbeddingModel, embedQuery } from "../embeddings";
+import { currentEmbeddingModel, denseOnlyFloor, embedQuery } from "../embeddings";
 import { mmrRerank } from "../mmr";
 import { type OrchestratedRecallResult, orchestrateRecall } from "../orchestrator";
 import { POLYPHONIC_MAX_COMBINED_SCORE } from "../polyphonic-recall";
 import { isQueryCacheEnabled, QueryCache } from "../query-cache";
 import { adjustWeights, classifyIntent } from "../query-intent";
-import { getSynonyms, STOP_WORDS as QUERY_STOP_WORDS } from "../synonyms";
+import { getSynonyms, STOP_WORDS as QUERY_STOP_WORDS, ROMANIAN_FUNCTION_WORDS } from "../synonyms";
 import { extractTemporal } from "../temporal-parser";
 import { cosineSimilarity } from "../vector-math";
 import type { BeamMemoryState, RecallEnhancedOptions, RecallOptions, RecallResult } from "./types";
@@ -132,7 +132,9 @@ export function clipRecallContent(
 }
 
 const DEFAULT_LIMIT = 500;
+const DEFAULT_DENSE_ONLY_FLOOR = 0.65;
 const STOP_WORDS = new Set([
+	...Object.keys(ROMANIAN_FUNCTION_WORDS),
 	"a",
 	"an",
 	"and",
@@ -708,7 +710,9 @@ function scoreCandidate(
 	const searchableContent = asString(candidate.row.embed_text) || content;
 	const lexical = lexicalGroupRelevance(queryGroups, searchableContent);
 	const minRel = minimumRelevance(queryTokens);
-	if (lexical < minRel && candidate.signals.dense < 0.65) return null;
+	const denseFloor =
+		denseOnlyFloor(options.queryEmbeddingModel ?? currentEmbeddingModel()) ?? DEFAULT_DENSE_ONLY_FLOOR;
+	if (lexical < minRel && candidate.signals.dense < denseFloor) return null;
 	const [vecWeight, ftsWeight, importanceWeight] = weights;
 	const importance = asNumber(candidate.row.importance, 0.5);
 	const decay =

@@ -330,6 +330,22 @@ const MODEL_DIMS: Record<string, number> = {
 	"nvidia/nemotron-3-embed-1b:free": 2048,
 	"perplexity/pplx-embed-v1-0.6b": 1024,
 };
+
+/**
+ * Minimum raw cosine for a dense-only recall hit (no lexical overlap). Models absent here keep the
+ * 0.65 default in `recall.ts`, which suits compressed-cosine models such as e5. Calibrated on a small
+ * sample (6 passages, 6 gold and 6 unrelated queries, raw cosine via OpenRouter): nemotron gold min
+ * 0.222 vs unrelated max 0.097; pplx gold min 0.364 vs unrelated max 0.199.
+ */
+const DENSE_ONLY_FLOORS: Record<string, number> = {
+	"nvidia/nemotron-3.5-embed-1b:free": 0.18,
+	"nvidia/nemotron-3-embed-1b:free": 0.18,
+	"perplexity/pplx-embed-v1-0.6b": 0.28,
+};
+/** Dense-only cosine floor for `modelName`, or `null` when the model is uncalibrated. */
+export function denseOnlyFloor(modelName: string): number | null {
+	return DENSE_ONLY_FLOORS[modelName] ?? null;
+}
 export function embeddingDimFor(modelName: string): number {
 	const override = Number.parseInt($env.MNEMOPI_EMBEDDING_DIM ?? "", 10);
 	if (Number.isFinite(override)) {

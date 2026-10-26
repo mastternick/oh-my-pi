@@ -88,7 +88,14 @@ it("preserves the parent's recalled prompt prefix while adding custom experience
 		});
 		sessions.push(parent);
 		await mnemopiStarts[0]!.promise;
-		getMnemopiSessionState(parent)!.rememberScoped(MEMORY);
+		const parentState = getMnemopiSessionState(parent)!;
+		parentState.rememberScoped({
+			content: MEMORY,
+			metadata: {
+				"exp:schema": "1",
+				"exp:project": parentState.experienceProject().projectKey,
+			},
+		});
 		await parent.prompt("Where is the deploy host?");
 		await parent.prompt("And which host serves staging?");
 		const parentPrompt = systemPrompts.at(-1)!;

@@ -183,8 +183,8 @@ const MAX_CONTENT_CHARS = 3000;
 const MAX_FINGERPRINT_PATHS = 8;
 const FINGERPRINT_PREFIX_CHARS = 16;
 const MAX_FILE_FINGERPRINT_BYTES = 1 << 20;
-const SCHEMA_MIN_OVERLAP = 1;
-const LEGACY_MIN_OVERLAP = 2;
+export const SCHEMA_MIN_OVERLAP = 2;
+export const MIN_RECALL_JACCARD = 0.1;
 const EVIDENCE_MIN_OVERLAP = 2;
 const LEGACY_FACT_MIN_OVERLAP = 2;
 const DUPLICATE_JACCARD = 0.8;
@@ -894,12 +894,14 @@ export async function recallExperience(input: ExperienceRecallInput): Promise<Ex
 		const content = hit.row.content;
 		if (excludedIds.has(hit.row.id) || excludedContent.has(content)) continue;
 		const metadata = parseMetadata(hit.row.metadata);
-		const verified = isSchemaLesson(metadata);
-		if (verified && !schemaApplies(metadata, project)) continue;
+		if (!isSchemaLesson(metadata)) continue;
+		if (!schemaApplies(metadata, project)) continue;
 		// Overlap is measured on claim text, so schema labels such as "Situation:" never count as relevance.
-		const overlap = tokenOverlap(assignmentTokens, significantTokens(applicabilityText(content)));
-		if (overlap < (verified ? SCHEMA_MIN_OVERLAP : LEGACY_MIN_OVERLAP)) continue;
-		const entry: RecallEntry = { ref: { id: hit.row.id, bank: hit.bank, content }, verified };
+		const claimTokens = significantTokens(applicabilityText(content));
+		const overlap = tokenOverlap(assignmentTokens, claimTokens);
+		if (overlap < SCHEMA_MIN_OVERLAP) continue;
+		if (tokenJaccard(assignmentTokens, claimTokens) < MIN_RECALL_JACCARD) continue;
+		const entry: RecallEntry = { ref: { id: hit.row.id, bank: hit.bank, content }, verified: true };
 		// Budget whole lessons only; a lesson that does not fit is skipped.
 		const block = renderRecallBlock([...entries, entry]);
 		if (truncateApproxTokens(block, budget) !== block) continue;

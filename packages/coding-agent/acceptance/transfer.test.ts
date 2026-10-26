@@ -19,6 +19,7 @@ import {
 	parserSolution,
 	say,
 	turn,
+	getMnemopiSessionState,
 } from "./support.ts";
 
 const TRANSFER_PROMPT = "Fix the parser empty input crash so sh verify.sh passes.";
@@ -70,6 +71,38 @@ describe("experience transfer", () => {
 		const context = flatten(unrelated.mock.calls[0]!.context);
 		expect(context).not.toContain(TITLE);
 		expect(context).not.toContain(SOLUTION_TEXT);
+		expect(context).not.toContain(RECALL_HEADER);
+	});
+
+	it("generic-token match with low Jaccard is rejected despite token overlap", async () => {
+		const repo = lab.fixture("parser");
+		await learnParser(lab, repo);
+
+		const generic = await lab.session({ cwd: repo, responses: ["ok"] });
+		await turn(
+			generic.session,
+			"Fix the parser so sh verify.sh passes and comprehensively refactor all modules, documentation, benchmarks, telemetry, deployment configurations, network topologies, database queries, and test assertions.",
+		);
+
+		const context = flatten(generic.mock.calls[0]!.context);
+		expect(context).not.toContain(TITLE);
+		expect(context).not.toContain(SOLUTION_TEXT);
+		expect(context).not.toContain(RECALL_HEADER);
+	});
+
+	it("legacy row without schema metadata is not injected into recall", async () => {
+		const repo = lab.fixture("parser");
+		const prior = await lab.session({ cwd: repo, responses: ["ok"] });
+		const state = getMnemopiSessionState(prior.session);
+		state!.rememberScoped({
+			content: "Prior legacy note: verify.sh parser empty input crash requires guard in parser.txt",
+		});
+
+		const later = await lab.session({ cwd: repo, responses: ["ok"] });
+		await turn(later.session, TRANSFER_PROMPT);
+
+		const context = flatten(later.mock.calls[0]!.context);
+		expect(context).not.toContain("Prior legacy note");
 		expect(context).not.toContain(RECALL_HEADER);
 	});
 

@@ -12,6 +12,7 @@
 - Mnemopi startup no longer promotes working memory into regex episodes unless `mnemopi.autoRetain` is on. Only auto-retained transcripts need that pass before their 24h trim, so with auto-retention off, session start no longer rewrites explicit memories.
 - Explicit memories saved through `xd://retain`, `learn`, and `/memory` writes are no longer tagged `IMPORTED` and are exempt from working-memory trimming by source. Rows with a NULL source are no longer dropped by the trim predicate. Imported rows keep their guard.
 - Session-preset snapshot write failures during startup are latched and reported through RPC persistence notices instead of aborting session creation.
+- `/usage` details no longer treats unreported quota windows as empty usage: accounts missing from a window now show as `not reported` columns, the aggregate line counts only real reports (e.g. `0% free · 1/6 reported`), columns stay aligned across reported/sparse windows, and widths under the placeholder render a compact `?` with one `? = not reported` legend. Accounts without any quota keep their single `-- no limits` row and are excluded from those columns and the reported count.
 ## [18.12.6] - 2026-10-21
 
 ### Added

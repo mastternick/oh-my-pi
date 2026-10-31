@@ -3,7 +3,7 @@ name: custom-sync
 # Note: GitHub runs scheduled workflows only from the default branch, which is `custom` on this fork.
 on:
   schedule:
-    - cron: '17 6 * * 1'
+    - cron: '17 6 * * *'
   workflow_dispatch:
     inputs:
       upstream_tag:

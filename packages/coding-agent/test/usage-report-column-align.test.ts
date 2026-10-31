@@ -215,7 +215,7 @@ describe("renderUsageReports multi-account column alignment (#6067)", () => {
 					id: `${counter}-${limit.window!.id}`,
 					label: "Claude & GPT (shared)",
 					scope: { ...limit.scope, shared: true, sharedGroup: `3p-${limit.window!.id}` },
-					amount: { unit: "percent", usedFraction: 0.25 },
+					amount: { unit: "percent" as const, usedFraction: 0.25 },
 					status: "ok" as const,
 				})),
 			);
@@ -252,5 +252,4 @@ describe("renderUsageReports multi-account column alignment (#6067)", () => {
 		expect(short.accounts).not.toContain("zero-limit");
 		expect(output.match(/zero-limit -- no limits/g)).toHaveLength(1);
 	});
-
 });

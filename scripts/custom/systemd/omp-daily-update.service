@@ -1,0 +1,20 @@
+[Unit]
+Description=omp-custom daily release installer
+Documentation=file:%h/tmp/omp-daily-update/README.md
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/omp-daily-update.sh
+Environment="PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+TimeoutStartSec=30min
+TimeoutStopSec=2min
+KillMode=mixed
+ProtectSystem=full
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ReadWritePaths=-%h/.bun/bin
+# Logs land in journalctl --user -u omp-daily-update.
+
+[Install]
+WantedBy=default.target

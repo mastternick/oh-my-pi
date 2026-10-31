@@ -1159,6 +1159,9 @@ interface StepCounter {
 	count: number;
 }
 
+/** Largest setTimeout delay before 32-bit overflow (Node/Bun fire in ~1 ms past this). */
+const MAX_TIMER_MS = 2_147_483_647;
+
 function isDeadlineExceeded(deadline: number | undefined): boolean {
 	return deadline !== undefined && Date.now() >= deadline;
 }
@@ -1245,16 +1248,17 @@ async function runLoopBody(
 ): Promise<void> {
 	let deadlineTimer: Timer | undefined;
 	if (config.deadline !== undefined) {
+		const deadline = config.deadline;
 		const deadlineAbortController = new AbortController();
 		const deadlineReason = new DOMException("Deadline exceeded", "TimeoutError");
-		const delay = config.deadline - Date.now();
-		if (delay <= 0) {
-			deadlineAbortController.abort(deadlineReason);
-		} else {
-			deadlineTimer = setTimeout(() => {
-				deadlineAbortController.abort(deadlineReason);
-			}, delay);
-		}
+		// setTimeout overflows past 2^31-1 ms and fires in ~1 ms, so a valid `--max-time 600h`
+		// aborted the first turn at once: wait in bounded slices and recheck the deadline.
+		const armDeadline = (): void => {
+			const delay = deadline - Date.now();
+			if (delay <= 0) deadlineAbortController.abort(deadlineReason);
+			else deadlineTimer = setTimeout(armDeadline, Math.min(delay, MAX_TIMER_MS));
+		};
+		armDeadline();
 		signal = signal ? AbortSignal.any([signal, deadlineAbortController.signal]) : deadlineAbortController.signal;
 	}
 
@@ -1853,7 +1857,7 @@ async function runLoopBody(
 						: [...live, ...((await config.getSteeringMessages?.(signal)) || [])];
 					if (hasMoreToolCalls) {
 						// Mid-work: fold any non-interrupting asides into the next turn alongside steering.
-						const asides = signal?.aborted ? [] : resolveAsides(await config.getAsideMessages?.());
+						const asides = signal?.aborted ? [] : resolveAsides(await config.getAsideMessages?.("work"));
 						pendingMessages = asides.length > 0 ? [...steering, ...asides] : steering;
 					} else {
 						// Stop boundary: only steering (live user input) forces another turn here. Leave
@@ -1881,7 +1885,7 @@ async function runLoopBody(
 			// above and this yield point (e.g. queued while onBeforeYield ran). Without
 			// this poll it would strand in the queue until the next manual prompt.
 			const lateSteering = signal?.aborted ? [] : (await config.getSteeringMessages?.(signal)) || [];
-			const asideMessages = signal?.aborted ? [] : resolveAsides(await config.getAsideMessages?.());
+			const asideMessages = signal?.aborted ? [] : resolveAsides(await config.getAsideMessages?.("stop"));
 			const followUpMessages = signal?.aborted ? [] : (await config.getFollowUpMessages?.(signal)) || [];
 			if (lateSteering.length > 0 || asideMessages.length > 0 || followUpMessages.length > 0) {
 				// Set as pending so the inner loop processes them before stopping.

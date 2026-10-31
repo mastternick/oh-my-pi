@@ -5,6 +5,7 @@
 ### Added
 
 - Added the native Judge view to Agent Hub (`Alt+A`, then `3`), showing per-session and descendant-scope Judge activity, actual questions and typed answers (with confidence when returned), raw automatic choices versus applied levels, and measured paid calls, tokens, cost, and reused cached-question counts.
+- Added a daily `omp-custom` updater (`omp-daily-update.sh` with a systemd user timer) that installs the newest release tag, keeps the previous version for rollback, and skips the install when disk space is low.
 
 ### Fixed
 
@@ -12,6 +13,7 @@
 - Mnemopi startup no longer promotes working memory into regex episodes unless `mnemopi.autoRetain` is on. Only auto-retained transcripts need that pass before their 24h trim, so with auto-retention off, session start no longer rewrites explicit memories.
 - Explicit memories saved through `xd://retain`, `learn`, and `/memory` writes are no longer tagged `IMPORTED` and are exempt from working-memory trimming by source. Rows with a NULL source are no longer dropped by the trim predicate. Imported rows keep their guard.
 - Session-preset snapshot write failures during startup are latched and reported through RPC persistence notices instead of aborting session creation.
+- Archive reads no longer return members of the previous contents when an archive is rewritten within the same filesystem timestamp tick: archives changed in the last 2 seconds are re-read instead of cached.
 ## [18.13.0] - 2026-10-26
 
 ### Breaking Changes

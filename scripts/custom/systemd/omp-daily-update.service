@@ -1,6 +1,5 @@
 [Unit]
 Description=omp-custom daily release installer
-Documentation=file:%h/tmp/omp-daily-update/README.md
 
 [Service]
 Type=oneshot

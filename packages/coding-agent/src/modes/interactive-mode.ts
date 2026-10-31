@@ -1404,7 +1404,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	loadingAnimation: Loader | undefined = undefined;
 	autoCompactionLoader: Loader | undefined = undefined;
 	retryLoader: Loader | undefined = undefined;
-	#pendingWorkingMessage: string | undefined;
+	#pendingWorkingMessage: string | (() => string) | undefined;
 	#retryHintRow: DescribedComponent | undefined;
 	#workingMessageAccentCacheKey?: WorkingMessageAccentCacheKey;
 	#workingMessageAccentCacheValue?: WorkingMessageAccent;
@@ -1447,7 +1447,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		return ["", " ".repeat(Math.max(0, width - visibleWidth(trailer))) + trailer];
 	}
 	/** Message the working row shows; mirrors what the loader was last given. */
-	#workingMessage = DEFAULT_WORKING_MESSAGE;
+	#workingMessage: string | (() => string) = DEFAULT_WORKING_MESSAGE;
 	/**
 	 * The native row's `elapsed` origin: the viewed session's run start, so a
 	 * loader recreated by a focus switch keeps the real elapsed time.
@@ -1492,7 +1492,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#workingRowSpec(): WorkingRowSpec {
 		const accent = this.#getWorkingMessageAccent() !== undefined;
 		return {
-			label: this.#workingMessage,
+			label: typeof this.#workingMessage === "function" ? this.#workingMessage() : this.#workingMessage,
 			startedAt: this.#workingStartedAt,
 			palette: accent ? NATIVE_ACCENT_SHIMMER : undefined,
 			interruptKey: this.keybindings.getKeys("app.interrupt")[0] ?? "escape",
@@ -3550,10 +3550,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	/**
-	 * Hands back a prompt the session dropped before dispatch (an Esc abort or
-	 * usage preflight denial raced turn setup). The message was never persisted,
-	 * so the tree/branch selectors cannot offer it — remove the optimistic
-	 * transcript row and put the typed text back in the editor for editing.
+	 * Hands back a prompt the session dropped before dispatch (an Esc abort,
+	 * usage preflight denial or the cost cap raced turn setup). The message was
+	 * never persisted, so the tree/branch selectors cannot offer it — remove the
+	 * optimistic transcript row and put the typed text back in the editor for editing.
 	 */
 	#restoreDroppedPrompt(prompt: DroppedPrompt): void {
 		this.clearOptimisticUserMessage();
@@ -3562,6 +3562,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#stopLoadingAnimation(true);
 		}
 		this.rebuildChatFromMessages();
+		// The rebuild drops transient notices, including the one that refused this prompt.
+		if (prompt.reason) this.showError(prompt.reason);
 		// The drop arrives asynchronously (after the abort settles); never clobber
 		// a draft the user has already started typing in the meantime.
 		if (!this.editor.getText().trim()) {
@@ -3601,7 +3603,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			pendingSubmissionDispose?.();
 			this.#optimisticUserMessageComponents = [];
 			this.#pendingWorkingMessage = undefined;
-			if (this.loadingAnimation) {
+			// A run that only waits on background jobs keeps its working row, which
+			// names the wait; the settle watch or the next run tears it down.
+			if (this.loadingAnimation && !this.#eventController.isAwaitingAsyncWork()) {
 				this.#stopLoadingAnimation(true);
 			}
 		}
@@ -7936,7 +7940,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	setWorkingMessage(message?: string): void {
+	/**
+	 * Set the working row's label; no argument restores the default. A function
+	 * label is live — re-read on every spinner tick — and is kept to one row.
+	 */
+	setWorkingMessage(message?: string | (() => string)): void {
 		if (message === undefined) {
 			this.#pendingWorkingMessage = undefined;
 			if (this.loadingAnimation) {
@@ -7947,12 +7955,24 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 
 		if (this.loadingAnimation) {
-			this.loadingAnimation.setMessage(message);
-			this.#workingMessage = message;
+			const label = typeof message === "function" ? this.#oneRowWorkingLabel(message) : message;
+			this.loadingAnimation.setMessage(label);
+			this.#workingMessage = label;
 			return;
 		}
 
 		this.#pendingWorkingMessage = message;
+	}
+
+	/**
+	 * Clamp a live label to the loader row: the terminal width minus the row's
+	 * interrupt glyph, the gap after it and the row's one-column side padding.
+	 */
+	#oneRowWorkingLabel(message: () => string): () => string {
+		return () => {
+			const lead = visibleWidth(` ${appKey(this.keybindings, "app.interrupt")}`) + 1;
+			return truncateToWidth(message(), Math.max(1, this.ui.terminal.columns - lead - 2));
+		};
 	}
 
 	applyPendingWorkingMessage(): void {
@@ -8586,12 +8606,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#inputController.handleQueueCommand(message, detached);
 	}
 
-	handleBtwCommand(question: string): Promise<void> {
-		return this.#btwController.start(question);
+	handleBtwCommand(question: string, images?: ImageContent[], title?: string): Promise<boolean> {
+		return this.#btwController.start(question, images, title);
 	}
 
-	handleTanCommand(work: string): Promise<void> {
-		return this.#tanCommandController.start(work);
+	handleTanCommand(work: string, images?: ImageContent[]): Promise<boolean> {
+		return this.#tanCommandController.start(work, images);
 	}
 
 	hasActiveBtw(): boolean {
@@ -8640,9 +8660,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		assistantMessage: AssistantMessage,
 		leafId: string,
 		sessionId: string,
+		images?: ImageContent[],
 	): Promise<void> {
 		try {
-			const result = await this.session.branchFromBtw(question, assistantMessage, leafId, sessionId);
+			const result = await this.session.branchFromBtw(question, assistantMessage, leafId, sessionId, images);
 			if (result.cancelled) {
 				this.showStatus("/btw branch cancelled", { dim: true });
 				return;

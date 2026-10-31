@@ -449,6 +449,13 @@ describe("cost gate in a running session", () => {
 			{ "session.maxCost": 1 },
 			{ sessionManager: SessionManager.create(tempDir.path(), tempDir.path()) },
 		);
+		// Custom fork semantics: a session model must be registry-backed with configured auth to be restored or to seed a new session.
+		session.modelRegistry.registerProvider("llama.cpp", {
+			api,
+			baseUrl: "http://127.0.0.1:8080/v1",
+			apiKey: "test-key",
+			models: [costModelSpec],
+		});
 
 		await session.prompt("first");
 		await session.waitForIdle();
@@ -466,6 +473,12 @@ describe("cost gate in a running session", () => {
 		const api = "test-cost-gate-new-session";
 		const provider = scriptedProvider(api, [response(1.2), response(0.1)]);
 		const session = await createSession(api, { "session.maxCost": 1 });
+		session.modelRegistry.registerProvider("llama.cpp", {
+			api,
+			baseUrl: "http://127.0.0.1:8080/v1",
+			apiKey: "test-key",
+			models: [costModelSpec],
+		});
 
 		await session.prompt("first");
 		await session.waitForIdle();

@@ -2780,8 +2780,7 @@ export function renderUsageReports(
 			const sortedLimits = columnLimits.filter((limit): limit is UsageLimit => limit !== undefined);
 			const sortedReports = entries.map(entry => entry.report);
 			const amount = formatAggregateAmount(sortedLimits);
-			const coverage =
-				reportedCount < quotaReports.length ? `${reportedCount}/${quotaReports.length} reported` : "";
+			const coverage = reportedCount < quotaReports.length ? `${reportedCount}/${quotaReports.length} reported` : "";
 			const amountText = coverage ? `${amount}${amount ? " · " : ""}${coverage}` : amount;
 			return { group, columnLimits, sortedLimits, sortedReports, amountText, coverage };
 		});

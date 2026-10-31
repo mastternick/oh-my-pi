@@ -252,5 +252,4 @@ describe("renderUsageReports multi-account column alignment (#6067)", () => {
 		expect(short.accounts).not.toContain("zero-limit");
 		expect(output.match(/zero-limit -- no limits/g)).toHaveLength(1);
 	});
-
 });

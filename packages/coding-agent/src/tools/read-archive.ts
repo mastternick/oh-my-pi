@@ -67,6 +67,9 @@ const archiveReaderCache = new LRUCache<string, CachedArchiveReader>({
 	sizeCalculation: cached => Math.max(1, cached.entryCount),
 });
 
+/** Archives changed more recently than this are not cached; see openArchiveCached. */
+const ARCHIVE_CACHE_RACY_WINDOW_MS = 2_000;
+
 async function openArchiveCached(absolutePath: string): Promise<ArchiveReader> {
 	// A vanished or unreadable archive is reported by the opener, as it always has been.
 	const stat = await Bun.file(absolutePath)
@@ -84,7 +87,9 @@ async function openArchiveCached(absolutePath: string): Promise<ArchiveReader> {
 		return cached.reader;
 	}
 	const reader = await openArchive(absolutePath);
-	if (!CACHEABLE_ARCHIVE_FORMATS[reader.format]) {
+	// Coarse kernel timestamps can give a rewrite the same ctime as the copy it replaces, so an archive
+	// changed inside that granularity window is reopened next time rather than trusted from the cache.
+	if (!CACHEABLE_ARCHIVE_FORMATS[reader.format] || Date.now() - stat.ctimeMs < ARCHIVE_CACHE_RACY_WINDOW_MS) {
 		archiveReaderCache.delete(absolutePath);
 		return reader;
 	}

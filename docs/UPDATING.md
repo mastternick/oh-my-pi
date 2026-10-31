@@ -52,6 +52,26 @@ The existing launcher is kept. The installer:
 
 Sessions already running keep the binary they started with until they exit. New sessions use `current`.
 
+## Daily update
+
+`scripts/custom/omp-daily-update.sh` installs the newest published `custom-v*` release once a day. It never merges, tags, or publishes. The systemd user units are `scripts/custom/systemd/omp-daily-update.service` and `omp-daily-update.timer`.
+
+- The timer fires at 05:40 with up to a 2 h random delay (`OnCalendar=*-*-* 05:40:00`, `RandomizedDelaySec=2h`, `Persistent=true`).
+- Discovery reads every release page and picks the newest non-draft, non-prerelease `custom-v*` tag by semver.
+- If that tag is already `current`, the run does nothing. A tag older than `current` is refused.
+- A run is refused when free space on the install root is below `OMP_DAILY_MIN_FREE` (default 1.5 GiB).
+- The install is delegated to `install.sh`, so every check in the Install section applies. Previous and current versions are kept; nothing is deleted.
+- A failure appends a line to `state/last-failure` and runs `OMP_DAILY_NOTIFY_CMD` if set. A successful install clears that file.
+
+Layout: the service runs `~/.local/bin/omp-daily-update.sh`. The wrapper finds the installer at `~/.local/libexec/omp-custom/install.sh`, so the installer suite (`scripts/custom/*.sh` and `launcher/`) is copied there. The units go in `~/.config/systemd/user/`. Timers run while logged out only if linger is enabled (`loginctl enable-linger <user>`).
+
+```
+systemctl --user daemon-reload
+systemctl --user enable --now omp-daily-update.timer
+systemctl --user start omp-daily-update.service   # run once now
+journalctl --user -u omp-daily-update.service
+```
+
 ## Rollback
 
 - `scripts/custom/rollback.sh` swaps `current` and `previous`.

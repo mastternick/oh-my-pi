@@ -1,8 +1,6 @@
 [Unit]
 Description=omp-custom daily release installer
 Documentation=file:%h/tmp/omp-daily-update/README.md
-Wants=network-online.target
-After=network-online.target
 
 [Service]
 Type=oneshot

@@ -96,6 +96,11 @@ if ! flock -n 9; then
   echo "error: lock contention in install.sh ($ROOT/.lock still held by parent)" >&2
   exit 1
 fi
+ver="${2#custom-v}"
+old="$(readlink "$OMP_CUSTOM_HOME/current" 2>/dev/null || true)"
+mkdir -p "$OMP_CUSTOM_HOME/versions/$ver"
+if [[ -n "$old" ]]; then ln -sfn "$old" "$OMP_CUSTOM_HOME/previous"; fi
+ln -sfn "versions/$ver" "$OMP_CUSTOM_HOME/current"
 echo "$2" >> "${OMP_DAILY_STATE_DIR}/install-calls"
 INSTEOF
 chmod +x "$SANDBOX/bin/install.sh"
@@ -310,6 +315,33 @@ out="$(HOME="$NO_BUN_HOME" PATH="/bin:/usr/bin" "$SCRIPT" 2>&1)"; rc=$?
 [[ $rc -ne 0 && "$out" == *"missing required command: bun"* ]] \
   && check "15. missing required command aborts early" 1 \
   || { echo "$out"; check "15. missing required command aborts early" 0; }
+
+export OMP_INSTALL_SH="$SANDBOX/bin/install.sh"
+# 16. current already equals newest release with no marker (installed by hand): marker is
+#     recorded, installer is NOT called, and previous (rollback target) stays untouched.
+mkdir -p "$OMP_CUSTOM_HOME/versions"/{18.12.6-c4,18.12.6-c5}
+ln -sfn "versions/18.12.6-c5" "$OMP_CUSTOM_HOME/current"
+ln -sfn "versions/18.12.6-c4" "$OMP_CUSTOM_HOME/previous"
+rm -f "$OMP_DAILY_STATE_DIR/installed-tag"
+export FAKE_RELEASES="$SANDBOX/releases.json"
+before="$(wc -l < "$OMP_DAILY_STATE_DIR/install-calls")"
+out="$("$SCRIPT" 2>&1)"; rc=$?
+[[ $rc -eq 0 && "$(wc -l < "$OMP_DAILY_STATE_DIR/install-calls")" == "$before" \
+   && "$(readlink "$OMP_CUSTOM_HOME/previous")" == "versions/18.12.6-c4" \
+   && "$(cat "$OMP_DAILY_STATE_DIR/installed-tag")" == "custom-v18.12.6-c5" ]] \
+  && check "16. current==newest without marker: marker written, no installer call, previous kept" 1 \
+  || { echo "$out"; check "16. current==newest without marker: marker written, no installer call, previous kept" 0; }
+
+# 16b. Fake installer relinks like the real one: previous <- old current, current <- new.
+ln -sfn "versions/18.12.6-c4" "$OMP_CUSTOM_HOME/current"
+ln -sfn "versions/18.12.6-c1" "$OMP_CUSTOM_HOME/previous"
+rm -f "$OMP_DAILY_STATE_DIR/installed-tag"
+out="$("$SCRIPT" 2>&1)"; rc=$?
+[[ $rc -eq 0 && "$(tail -n1 "$OMP_DAILY_STATE_DIR/install-calls")" == "custom-v18.12.6-c5" \
+   && "$(readlink "$OMP_CUSTOM_HOME/previous")" == "versions/18.12.6-c4" \
+   && "$(readlink "$OMP_CUSTOM_HOME/current")" == "versions/18.12.6-c5" ]] \
+  && check "16b. installer relinks previous<-old current, current<-new" 1 \
+  || { echo "$out"; check "16b. installer relinks previous<-old current, current<-new" 0; }
 
 echo "---"
 echo "passed=$pass failed=$fail"

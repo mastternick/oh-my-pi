@@ -91,20 +91,39 @@ fi
 
 # 1. Discover the newest published custom release (paginating across all releases,
 #    filtering out drafts and prereleases, and sorting globally by semver components).
-tag="$(gh api "repos/$REPO/releases" --paginate --jq '
-  .[] | select(.draft == false and .prerelease == false and (.tag_name | test("^custom-v[0-9]+\\.[0-9]+\\.[0-9]+(-c[0-9]+)?$"))) | .tag_name' | jq -R -s -r '
-  split("\n") | map(select(length > 0))
-  | map({
-      tag: .,
-      ver: (capture("^custom-v(?<maj>[0-9]+)\\.(?<min>[0-9]+)\\.(?<patch>[0-9]+)(-c(?<custom>[0-9]+))?$")
-        | [ (.maj|tonumber), (.min|tonumber), (.patch|tonumber), ((.custom // "0")|tonumber) ])
-    })
-  | sort_by(.ver)
-  | last | .tag // empty')" || die "could not list releases for $REPO"
+discover_release() {
+  gh api "repos/$REPO/releases" --paginate --jq '
+    .[] | select(.draft == false and .prerelease == false and (.tag_name | test("^custom-v[0-9]+\\.[0-9]+\\.[0-9]+(-c[0-9]+)?$"))) | .tag_name' | jq -R -s -r '
+    split("\n") | map(select(length > 0))
+    | map({
+        tag: .,
+        ver: (capture("^custom-v(?<maj>[0-9]+)\\.(?<min>[0-9]+)\\.(?<patch>[0-9]+)(-c(?<custom>[0-9]+))?$")
+          | [ (.maj|tonumber), (.min|tonumber), (.patch|tonumber), ((.custom // "0")|tonumber) ])
+      })
+    | sort_by(.ver)
+    | last | .tag // empty'
+}
+
+# gh can fail transiently (network, rate limit): retry before reporting failure.
+listed=0
+for attempt in 1 2 3; do
+  if tag="$(discover_release)"; then listed=1; break; fi
+  if (( attempt < 3 )); then sleep 5; fi
+done
+[[ $listed -eq 1 ]] || die "could not list releases for $REPO after 3 attempts"
 [[ -n "$tag" ]] || die "no published custom-v* release found on $REPO"
 
-# 2. Idempotency & regression guard: skip when already current; refuse older releases.
 installed_marker="$STATE/installed-tag"
+
+# 2a. Already on the newest release without a marker (e.g. installed by hand): record it and
+#     skip install.sh, which would relink previous to current and destroy the rollback target.
+if [[ "$(readlink "$ROOT/current" 2>/dev/null || true)" == "versions/${tag#custom-v}" ]]; then
+  printf '%s\n' "$tag" > "$installed_marker"
+  echo "newest release $tag is already current; nothing to do"
+  exit 0
+fi
+
+# 2. Idempotency & regression guard: skip when already current; refuse older releases.
 if [[ -f "$installed_marker" ]]; then
   installed_tag="$(tr -d '[:space:]' < "$installed_marker")"
   if [[ "$installed_tag" == "$tag" ]]; then

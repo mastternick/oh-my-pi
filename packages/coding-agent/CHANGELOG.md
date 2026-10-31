@@ -191,6 +191,7 @@
 - Fixed language servers keeping every file omp ever opened loaded for the whole session; files unused for 5 minutes are now closed when omp opens another, so the server can free that memory ([#15418](https://github.com/can1357/oh-my-pi/pull/15418) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed `write` turning a CRLF file into LF and dropping its UTF-8 BOM when it replaces the file; it now keeps both, as `edit` does ([#16575](https://github.com/can1357/oh-my-pi/pull/16575) by [@will-bogusz](https://github.com/will-bogusz))
 
+- `/usage` details no longer treats unreported quota windows as empty usage: accounts missing from a window now show as `not reported` columns, the aggregate line counts only real reports (e.g. `0% free · 1/6 reported`), columns stay aligned across reported/sparse windows, and widths under the placeholder render a compact `?` with one `? = not reported` legend. Accounts without any quota keep their single `-- no limits` row and are excluded from those columns and the reported count.
 ## [18.12.6] - 2026-10-21
 
 ### Added

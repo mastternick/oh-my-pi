@@ -2371,7 +2371,7 @@ function formatResetShort(limit: UsageLimit, nowMs: number): string | undefined 
 }
 
 function formatAccountHeaderRow(
-	limits: UsageLimit[],
+	limits: (UsageLimit | undefined)[],
 	reports: UsageReport[],
 	peers: readonly UsageReport[],
 	nowMs: number,
@@ -2379,11 +2379,14 @@ function formatAccountHeaderRow(
 	uiTheme: Theme,
 	activeAccount?: OAuthAccountIdentity,
 ): string[] {
-	const parts = limits.map((limit, index) => {
-		const reset = formatResetShort(limit, nowMs);
-		const report = reports[index];
-		const active = report !== undefined && limitMatchesActiveAccount(report, limit, activeAccount);
-		const label = formatAccountLabel(limit, report, peers, index);
+	const parts = reports.map((report, index) => {
+		const limit = limits[index];
+		const reset = limit ? formatResetShort(limit, nowMs) : undefined;
+		const identityLimit = limit ?? report.limits[0];
+		const active = identityLimit !== undefined && limitMatchesActiveAccount(report, identityLimit, activeAccount);
+		const label = identityLimit
+			? formatAccountLabel(identityLimit, report, peers, index)
+			: formatUnlimitedReportLabel(report, peers, index);
 		return {
 			label: active ? `● ${label}` : label,
 			suffix: reset ? `(${reset})` : "",
@@ -2749,37 +2752,54 @@ export function renderUsageReports(
 			// so accounts tied on pressure keep their discovery order.
 			accountRank.set(report, -worst * 1000 + position);
 		});
+		// Zero-limit reports get their own `-- no limits` row below; they never
+		// become "not reported" placeholder columns or enter the N/M denominator.
+		const quotaReports = providerReports.filter(report => report.limits.length > 0);
 
 		const renderableGroups = Array.from(limitGroups.values()).map(group => {
-			const entries = group.limits.map((limit, index) => ({
-				limit,
-				report: group.reports[index],
-				index,
-			}));
+			const entries: { limit: UsageLimit | undefined; report: UsageReport; index: number }[] = group.limits.map(
+				(limit, index) => ({ limit, report: group.reports[index], index }),
+			);
+			let reportedCount = 0;
+			providerReports.forEach((report, index) => {
+				if (report.limits.length === 0) return;
+				if (group.reports.includes(report)) {
+					reportedCount++;
+				} else {
+					// Like the CLI's row templates, absence is not zero usage.
+					entries.push({ limit: undefined, report, index });
+				}
+			});
 			entries.sort((a, b) => {
 				const aRank = accountRank.get(a.report) ?? a.index;
 				const bRank = accountRank.get(b.report) ?? b.index;
 				if (aRank !== bRank) return aRank - bRank;
 				return a.index - b.index;
 			});
-			const sortedLimits = entries.map(entry => entry.limit);
+			const columnLimits = entries.map(entry => entry.limit);
+			const sortedLimits = columnLimits.filter((limit): limit is UsageLimit => limit !== undefined);
 			const sortedReports = entries.map(entry => entry.report);
-			return { group, sortedLimits, sortedReports, amountText: formatAggregateAmount(sortedLimits) };
+			const amount = formatAggregateAmount(sortedLimits);
+			const coverage =
+				reportedCount < quotaReports.length ? `${reportedCount}/${quotaReports.length} reported` : "";
+			const amountText = coverage ? `${amount}${amount ? " · " : ""}${coverage}` : amount;
+			return { group, columnLimits, sortedLimits, sortedReports, amountText, coverage };
 		});
 
-		const sectionCount = renderableGroups.reduce((max, g) => Math.max(max, g.sortedLimits.length), 0);
+		const sectionCount = renderableGroups.reduce((max, g) => Math.max(max, g.columnLimits.length), 0);
 		const sectionTrailing = renderableGroups.reduce((max, g) => Math.max(max, visibleWidth(g.amountText)), 0);
 		const sectionColumnWidth = resolveColumnWidth(sectionCount, availableWidth, sectionTrailing);
+		const missingLimitText = sectionColumnWidth >= "not reported".length ? "not reported" : "?";
 		const sectionBarWidth = Math.min(sectionColumnWidth, BAR_WIDTH_MAX);
 
-		for (const { group, sortedLimits, sortedReports, amountText } of renderableGroups) {
+		for (const { group, columnLimits, sortedLimits, sortedReports, amountText, coverage } of renderableGroups) {
 			const status = resolveAggregateStatus(sortedLimits);
 			const statusIcon = resolveStatusIcon(status, uiTheme);
 
 			const windowSuffix = formatWindowSuffix(group.label, group.windowLabel, uiTheme);
 			lines.push(`${statusIcon} ${uiTheme.bold(group.label)} ${windowSuffix}`.trim());
 			const accountLabels = formatAccountHeaderRow(
-				sortedLimits,
+				columnLimits,
 				sortedReports,
 				providerReports,
 				nowMs,
@@ -2788,11 +2808,17 @@ export function renderUsageReports(
 				activeAccount,
 			);
 			lines.push(`  ${accountLabels.join(" ")}`.trimEnd());
-			const bars = sortedLimits.map(limit =>
-				padColumn(renderUsageBar(limit, uiTheme, sectionBarWidth), sectionColumnWidth),
+			const bars = columnLimits.map(limit =>
+				padColumn(
+					limit ? renderUsageBar(limit, uiTheme, sectionBarWidth) : uiTheme.fg("dim", missingLimitText),
+					sectionColumnWidth,
+				),
 			);
 			lines.push(`  ${bars.join(" ")} ${amountText}`.trimEnd());
-			const resetText = sortedLimits.length <= 1 ? resolveResetRange(sortedLimits, nowMs) : null;
+			if (coverage && missingLimitText === "?") {
+				lines.push(`  ${uiTheme.fg("dim", "? = not reported")}`);
+			}
+			const resetText = columnLimits.length <= 1 ? resolveResetRange(sortedLimits, nowMs) : null;
 			if (resetText) {
 				lines.push(`  ${uiTheme.fg("dim", resetText)}`.trimEnd());
 			}

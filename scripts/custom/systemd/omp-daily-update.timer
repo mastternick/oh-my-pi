@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the omp-custom daily release installer
+Documentation=file:%h/tmp/omp-daily-update/README.md
+
+[Timer]
+# Daily at 05:40 local time; RandomizedDelaySec spreads the load across a
+# two-hour window so a resume-from-suspend burst does not hit GitHub at once.
+OnCalendar=*-*-* 05:40:00
+RandomizedDelaySec=2h
+Persistent=true
+AccuracySec=10min
+
+[Install]
+WantedBy=timers.target

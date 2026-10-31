@@ -12,7 +12,7 @@ KillMode=mixed
 ProtectSystem=full
 NoNewPrivileges=true
 ProtectKernelTunables=true
-ProtectKernelModules=true
+# ProtectKernelModules is omitted: user managers cannot drop CAP_SYS_MODULE here (218/CAPABILITIES).
 ReadWritePaths=-%h/.bun/bin
 # Logs land in journalctl --user -u omp-daily-update.
 

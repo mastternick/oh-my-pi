@@ -35,6 +35,9 @@ jobs:
           scripts/custom/test-bundle-verify.sh
           scripts/custom/test-sync-upstream.sh scripts/custom/sync-upstream.sh
           scripts/custom/test-omp-daily-update.sh scripts/custom/omp-daily-update.sh
+          scripts/custom/test-ai-conflict-controller.sh
+          scripts/custom/test-ai-conflict-install.sh
+          bun test scripts/custom/test-ai-conflict-model.test.ts
       - name: Upstream full check
         run: bun run ci:check:full
   test:

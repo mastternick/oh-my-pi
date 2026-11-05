@@ -16,9 +16,14 @@
 # version already contains the upstream tag, the run is a no-op unless a new custom
 # release is explicitly requested (OMP_SYNC_FORCE_RELEASE=1).
 #
-# A red, cancelled, timed-out, wrong-SHA, conflicting, or concurrently-advanced run
-# never advances custom and never publishes a tag or release. Every failure writes a
-# GitHub step summary when GITHUB_STEP_SUMMARY is set.
+# A red, cancelled, timed-out, wrong-SHA, conflicting, or divergently advanced run never
+# advances custom and never publishes a tag or release. custom may advance concurrently
+# only to a commit that still contains the exact tested candidate: that run pushes
+# nothing, keeps the concurrent tip, and publishes that tested commit. A reviewed base
+# that moved anywhere else is stale or diverged and fails closed. When publishing the tag
+# succeeded but its release run did not, the next release-only run reuses that unpublished
+# tag at the tested candidate instead of tagging the newer, ungated tip. Every failure
+# writes a GitHub step summary when GITHUB_STEP_SUMMARY is set.
 #
 #   sync-upstream.sh [vX.Y.Z]     (default: newest stable upstream tag, or $UPSTREAM_TAG)
 #
@@ -32,6 +37,26 @@
 #   OMP_SYNC_POLL            seconds between run polls (default 30)
 #   OMP_SYNC_FORCE_RELEASE   1 = release the current custom HEAD even when this
 #                            upstream version is already merged and released
+#   OMP_SYNC_EXPECTED_BASE_SHA full commit SHA of origin/<base> that a reviewed
+#                            conflicted merge was resolved against
+#   OMP_SYNC_EXPECTED_TREE_SHA full tree SHA the refreshed candidate must have
+#
+# Review guards: a controller that had a model resolve a merge conflict supplies both
+# values so this script can prove it is about to push and gate exactly the candidate
+# that was reviewed. The pair is required together, must be full git SHAs, must match
+# the fetched origin/<base> before a candidate is built and the final refreshed
+# candidate tree before it is pushed; the base must also still be origin/<base> when
+# the gate passes. They are rejected in the already-merged/release-only path instead
+# of being accepted and ignored. Without them the daily clean sync is unchanged.
+#
+# Review certificate: ai-conflict-controller.sh writes its reviewed merge commit with these
+# trailers (metadata computed outside the model): OMP-AI-Conflict-Review: v1,
+# OMP-AI-Reviewed-Base: <base SHA>, OMP-AI-Reviewed-Tree: <tree SHA>, and
+# OMP-AI-Model: opencode-go/deepseek-v4.1-flash. When an existing sync branch carries exactly
+# one well-formed certificate in origin/$BASE..<branch> (also when buried under refresh
+# merges), the pair is taken from it, or checked against explicit guards when those are given.
+# Malformed, ambiguous, or tree-mismatched certificates fail before any push, CI, tag, or
+# release. A branch without OMP-AI-* trailers keeps the normal manual/clean path.
 #
 # Requires: git, gh (authenticated), jq.
 # shellcheck disable=SC2016 # jq programs use $name for their own arguments on purpose
@@ -45,10 +70,13 @@ REL_WF="${OMP_SYNC_RELEASE_WORKFLOW:-custom-release.yml}"
 TIMEOUT="${OMP_SYNC_TIMEOUT:-7200}"
 POLL="${OMP_SYNC_POLL:-30}"
 FORCE_RELEASE="${OMP_SYNC_FORCE_RELEASE:-0}"
+EXPECTED_BASE="${OMP_SYNC_EXPECTED_BASE_SHA:-}"
+EXPECTED_TREE="${OMP_SYNC_EXPECTED_TREE_SHA:-}"
 
 tag=""
 candidate=""
 mode=""
+reuse_tag=""
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
@@ -77,6 +105,20 @@ fail() {
 for cmd in git gh jq; do
   command -v "$cmd" >/dev/null || die "missing required command: $cmd"
 done
+
+# Review guards are validated before the first fetch or merge: a malformed or
+# half-supplied pair must never fall through as "no guards were requested".
+review_guards=0
+if [[ -n "$EXPECTED_BASE" || -n "$EXPECTED_TREE" ]]; then
+  if [[ -z "$EXPECTED_BASE" || -z "$EXPECTED_TREE" ]]; then
+    fail "OMP_SYNC_EXPECTED_BASE_SHA and OMP_SYNC_EXPECTED_TREE_SHA must be supplied together (base: '${EXPECTED_BASE:-}', tree: '${EXPECTED_TREE:-}')"
+  fi
+  [[ "$EXPECTED_BASE" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] \
+    || fail "OMP_SYNC_EXPECTED_BASE_SHA is not a full git commit SHA: '$EXPECTED_BASE'"
+  [[ "$EXPECTED_TREE" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] \
+    || fail "OMP_SYNC_EXPECTED_TREE_SHA is not a full git tree SHA: '$EXPECTED_TREE'"
+  review_guards=1
+fi
 
 git remote get-url upstream >/dev/null 2>&1 || git remote add upstream "$UPSTREAM_URL"
 git fetch --quiet --no-tags upstream '+refs/tags/v*:refs/tags/upstream/v*'
@@ -127,12 +169,17 @@ run_json() { # run-id
 # of paying for the same test matrix twice. Only push runs (the pushed commit is the
 # tested commit) and dispatches (the ref tip is the tested commit) qualify.
 successful_run_exists() { # workflow-file commit
-  fetch_runs "$1" | jq -e --arg wf "$1" --arg sha "$2" '
+  # Exit 2 marks an unreadable run list so callers can tell "no green run" from "cannot
+  # know": the gate may dispatch and let the poll fail closed, but the release retry must
+  # never read an API error as "this tag was never tested" and tag another commit.
+  local data
+  data="$(fetch_runs "$1")" || return 2
+  jq -e --arg wf "$1" --arg sha "$2" '
     any(.workflow_runs[]?;
       .path == (".github/workflows/" + $wf)
       and .head_sha == $sha
       and .status == "completed" and .conclusion == "success"
-      and (.event == "workflow_dispatch" or .event == "push"))' >/dev/null
+      and (.event == "workflow_dispatch" or .event == "push"))' >/dev/null <<<"$data"
 }
 
 # Poll until the dispatched run reaches a terminal state. The run must be the one
@@ -195,6 +242,54 @@ release_contains_upstream() { # version upstream-commit
   return 1
 }
 
+# An unpublished tag can already name the reviewed and tested release commit: a previous
+# run may have pushed the tag and then died dispatching or waiting for custom-release (for
+# example a guarded sync whose concurrent advance contained the tested candidate). The tag
+# is the release artifact, so a release-only rerun must publish that exact tag instead of
+# tagging the newer origin/$BASE tip, which was never gated as the release commit.
+# Selection is deterministic: the highest unpublished cN whose annotated tag commit is
+# contained in origin/$BASE, contains the upstream tag commit, carries this version, and
+# has a successful $CI_WF run for that exact commit. Anything less is never selected.
+find_reusable_release_tag() { # version upstream-commit base-tip
+  local version="$1" commit="$2" base_tip="$3"
+  local existing n tag_commit tag_version_at ci_rc tag_list best="" best_c=0 published
+  published="$(released_tags)" || exit 1
+  # An unreadable tag listing is not "no reusable tag": tagging the tip on that guess is
+  # exactly what this path exists to prevent.
+  tag_list="$(git ls-remote --tags --refs origin "refs/tags/custom-v${version}-c*" \
+    | awk '{print $2}' | sed 's#^refs/tags/##')" \
+    || fail "could not list custom-v${version} tags in $REPO; refusing to tag a different commit on an unreadable tag list"
+  while IFS= read -r existing; do
+    [[ -n "$existing" ]] || continue
+    [[ "$existing" =~ ^custom-v${version//./\\.}-c([0-9]+)$ ]] || continue
+    n="${BASH_REMATCH[1]}"
+    if grep -qxF "$existing" <<<"$published"; then continue; fi
+    # custom-release rejects a lightweight tag, so it can never be the release artifact.
+    git fetch --quiet --force origin "+refs/tags/$existing:refs/tags/$existing" 2>/dev/null \
+      || fail "could not fetch tag $existing to verify it for reuse; refusing to tag a different commit"
+    [[ "$(git cat-file -t "refs/tags/$existing" 2>/dev/null || true)" == "tag" ]] || continue
+    tag_commit="$(git rev-parse --verify --quiet "refs/tags/$existing^{commit}" || true)"
+    [[ -n "$tag_commit" ]] || continue
+    git merge-base --is-ancestor "$tag_commit" "$base_tip" 2>/dev/null || continue
+    git merge-base --is-ancestor "$commit" "$tag_commit" 2>/dev/null || continue
+    tag_version_at="$(git show "$tag_commit:packages/coding-agent/package.json" 2>/dev/null \
+      | jq -r '.version // empty' || true)"
+    [[ "$tag_version_at" == "$version" ]] || continue
+    ci_rc=0
+    successful_run_exists "$CI_WF" "$tag_commit" || ci_rc=$?
+    case "$ci_rc" in
+      0) ;;
+      2) fail "could not read $CI_WF runs for $tag_commit while checking $existing for reuse; refusing to guess whether it was gated" ;;
+      *) continue ;;
+    esac
+    if (( n > best_c )); then
+      best_c=$n
+      best="$existing"
+    fi
+  done <<<"$tag_list"
+  printf '%s\n' "$best"
+}
+
 open_sync_pr() { # branch
   local branch="$1" body number
   body="$(mktemp)"
@@ -214,9 +309,83 @@ EOF
   rm -f "$body"
 }
 
+# AI review certificate on an existing sync branch. ai-conflict-controller.sh records its
+# reviewed merge as OMP-AI-* trailers, and a later refresh merge can bury that commit under
+# others, so every commit in origin/$BASE..<ref> is checked. The trailers are controller
+# metadata, never model output. Any OMP-AI-* line outside the trailer block, malformed,
+# duplicated, unsupported, or repeated on a second commit fails closed. Sets CERT_COMMIT,
+# CERT_BASE and CERT_TREE (all empty when the branch has no certificate). These are globals,
+# not stdout: a call inside $(...) would turn fail() into an empty result.
+CERT_MODEL="opencode-go/deepseek-v4.1-flash"
+CERT_COMMIT=""
+CERT_BASE=""
+CERT_TREE=""
+review_certificate() { # ref
+  local ref="$1" revs c body raw_n trailer_n lines line key value rb="" rt="" actual
+  local found=0
+  declare -A seen=()
+  CERT_COMMIT=""
+  CERT_BASE=""
+  CERT_TREE=""
+  revs="$(git rev-list "refs/remotes/origin/$BASE..$ref")" \
+    || fail "could not list the commits of $ref for an AI review certificate"
+  while IFS= read -r c; do
+    [[ -n "$c" ]] || continue
+    body="$(git log -1 --format=%B "$c")" || fail "could not read the message of $c"
+    raw_n="$(grep -ic '^OMP-AI-' <<<"$body" || true)"
+    (( raw_n > 0 )) || continue
+    lines="$(git interpret-trailers --parse <<<"$body" | grep -i '^OMP-AI-' || true)"
+    trailer_n="$(grep -c . <<<"$lines" || true)"
+    (( trailer_n == raw_n )) \
+      || fail "$c has OMP-AI-* lines outside its trailer block; refusing to guess the certificate"
+    found=$((found + 1))
+    CERT_COMMIT="$c"
+    rb=""
+    rt=""
+    seen=()
+    while IFS= read -r line; do
+      [[ "$line" =~ ^(OMP-AI-[A-Za-z-]+):\ (.+)$ ]] \
+        || fail "malformed AI review trailer on $c: '$line'"
+      key="${BASH_REMATCH[1]}"
+      value="${BASH_REMATCH[2]}"
+      [[ -z "${seen[$key]:-}" ]] || fail "AI review trailer $key appears twice on $c"
+      seen[$key]=1
+      case "$key" in
+        OMP-AI-Conflict-Review)
+          [[ "$value" == v1 ]] || fail "unsupported AI review certificate version '$value' on $c" ;;
+        OMP-AI-Reviewed-Base)
+          [[ "$value" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || fail "AI review base on $c is not a full commit SHA"
+          rb="$value" ;;
+        OMP-AI-Reviewed-Tree)
+          [[ "$value" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || fail "AI review tree on $c is not a full tree SHA"
+          rt="$value" ;;
+        OMP-AI-Model)
+          [[ "$value" == "$CERT_MODEL" ]] || fail "AI review on $c was produced by '$value', not $CERT_MODEL" ;;
+        *) fail "unsupported AI review trailer $key on $c" ;;
+      esac
+    done <<<"$lines"
+    for key in OMP-AI-Conflict-Review OMP-AI-Reviewed-Base OMP-AI-Reviewed-Tree OMP-AI-Model; do
+      [[ -n "${seen[$key]:-}" ]] || fail "AI review certificate on $c is missing $key"
+    done
+    actual="$(git rev-parse "$c^{tree}")" || fail "could not read the tree of $c"
+    [[ "$actual" == "$rt" ]] \
+      || fail "AI review certificate on $c names tree $rt but the commit tree is $actual"
+    CERT_BASE="$rb"
+    CERT_TREE="$rt"
+  done <<<"$revs"
+  (( found <= 1 )) \
+    || fail "$found commits on $ref carry AI review certificates; the certificate is ambiguous"
+}
+
 # --- Decide: sync a new upstream tag, gate current custom, or no-op ----------------
 
 if git merge-base --is-ancestor "$up_commit" "refs/remotes/origin/$BASE"; then
+  if (( review_guards )); then
+    # The guards describe a conflicted merge this run would not build. Accepting them
+    # here would let a caller believe the reviewed candidate was gated when only the
+    # current custom HEAD is.
+    fail "OMP_SYNC_EXPECTED_BASE_SHA/OMP_SYNC_EXPECTED_TREE_SHA describe a reviewed conflicted merge, but upstream $tag is already merged into origin/$BASE; refusing to accept guards this run would ignore (re-run the release-only sync without them)"
+  fi
   if [[ "$FORCE_RELEASE" != "1" ]] && release_contains_upstream "$tag_version" "$up_commit"; then
     echo "$tag is already merged into $BASE and released; nothing to do"
     summary_line "- no-op: upstream \`$tag\` is already merged and released."
@@ -224,15 +393,57 @@ if git merge-base --is-ancestor "$up_commit" "refs/remotes/origin/$BASE"; then
   fi
   mode="release"
   candidate="$(git rev-parse "refs/remotes/origin/$BASE")"
-  echo "$tag is already merged into $BASE; gating $candidate for a release"
+  # A tag left unpublished by an earlier failed release names a commit that was gated at
+  # exactly that SHA and is already contained in $BASE; that is the release artifact a
+  # retry must publish, not a fresh cN at the newer tip. OMP_SYNC_FORCE_RELEASE asks for a
+  # new release of the current tip, so it is never redirected to an older tag.
+  if [[ "$FORCE_RELEASE" != "1" ]]; then
+    # The helper exits through fail() (which writes the summary) on an unreadable release,
+    # tag, or CI view; the explicit || keeps that failure from being read as "no tag".
+    reuse_tag="$(find_reusable_release_tag "$tag_version" "$up_commit" "$candidate")" || exit 1
+  fi
+  if [[ -n "$reuse_tag" ]]; then
+    candidate="$(git rev-parse --verify "refs/tags/$reuse_tag^{commit}")"
+    echo "$tag is already merged into $BASE; reusing unpublished tag $reuse_tag at $candidate instead of tagging the newer tip"
+  else
+    echo "$tag is already merged into $BASE; gating $candidate for a release"
+  fi
 else
   mode="sync"
+  # The sync branch is inspected before anything is built or pushed. An AI-reviewed branch
+  # (see ai-conflict-controller.sh) carries its own certificate: explicit guards must agree
+  # with it, and without explicit guards it supplies the pair, so the scheduled run honours
+  # the review without a model call. A failed query is never read as "no branch".
   branch="sync/upstream-$tag"
   remote_ref="refs/remotes/origin/$branch"
   have_remote=0
-  if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
-    git fetch --quiet --force origin "+refs/heads/$branch:$remote_ref"
-    have_remote=1
+  ls_rc=0
+  git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1 || ls_rc=$?
+  case "$ls_rc" in
+    0)
+      git fetch --quiet --force origin "+refs/heads/$branch:$remote_ref"
+      have_remote=1 ;;
+    2) ;;
+    *) fail "could not query origin for $branch; refusing to build a candidate without knowing whether it carries a review certificate" ;;
+  esac
+  if (( have_remote )); then
+    review_certificate "$remote_ref"
+    if [[ -n "$CERT_COMMIT" ]]; then
+      if (( review_guards )); then
+        [[ "$EXPECTED_BASE" == "$CERT_BASE" && "$EXPECTED_TREE" == "$CERT_TREE" ]] \
+          || fail "the explicit review guards ($EXPECTED_BASE, $EXPECTED_TREE) do not match the AI review certificate on $branch at $CERT_COMMIT (base $CERT_BASE, tree $CERT_TREE); refusing to accept guards the certificate does not support"
+      fi
+      EXPECTED_BASE="$CERT_BASE"
+      EXPECTED_TREE="$CERT_TREE"
+      review_guards=1
+      echo "AI review certificate on $branch at $CERT_COMMIT binds base $CERT_BASE and tree $CERT_TREE"
+    fi
+  fi
+  # The reviewed base must still be origin/$BASE before any candidate is built: a base
+  # that moved after the resolution makes the reviewed tree describe the wrong merge.
+  origin_base="$(git rev-parse "refs/remotes/origin/$BASE")"
+  if (( review_guards )) && [[ "$origin_base" != "$EXPECTED_BASE" ]]; then
+    fail "reviewed base $EXPECTED_BASE does not match origin/$BASE at $origin_base; refusing to build a candidate from an unreviewed base"
   fi
   git checkout --quiet -B "$branch" "refs/remotes/origin/$BASE"
   if (( have_remote )); then
@@ -251,6 +462,14 @@ else
     fi
   fi
   candidate="$(git rev-parse HEAD)"
+  if (( review_guards )); then
+    # The refresh merge can pull in work pushed to the sync branch after the review; the
+    # tree is the reviewed artifact, so it must still match before the push and gate.
+    candidate_tree="$(git rev-parse "$candidate^{tree}")"
+    if [[ "$candidate_tree" != "$EXPECTED_TREE" ]]; then
+      fail "refreshed candidate $candidate has tree $candidate_tree, not the reviewed tree $EXPECTED_TREE; refusing to push or gate it"
+    fi
+  fi
   git push --quiet origin "HEAD:refs/heads/$branch" \
     || fail "could not update $branch without force; another run may have changed it"
   open_sync_pr "$branch"
@@ -285,14 +504,26 @@ if [[ "$now" == "$candidate" ]]; then
   git push --quiet origin "$candidate:refs/heads/$BASE" \
     || fail "non-fast-forward push to $BASE was refused; retry next cycle"
 elif [[ "$mode" == "sync" ]] && git merge-base --is-ancestor "$candidate" "$now"; then
-  # A concurrent actor already landed the tested commit; nothing to advance.
+  # A concurrent actor already landed the tested commit, possibly with more work on top
+  # of it. The exact reviewed and gated commit is contained in origin/$BASE, so there is
+  # nothing to push and nothing to rewrite; publishing continues for that same tested
+  # commit. A reviewed base that advanced to such a strict descendant is therefore not
+  # stale, while a divergent tip still falls through to the guards below.
   echo "origin/$BASE already contains the tested commit $candidate"
+elif [[ -n "$reuse_tag" ]] && git merge-base --is-ancestor "$candidate" "$now"; then
+  # The reused tag names the tested release commit and $BASE already contains it: the
+  # concurrent tip stays untouched and nothing is published for it.
+  echo "origin/$BASE already contains the tagged commit $candidate"
+elif (( review_guards )) && [[ "$now" != "$EXPECTED_BASE" ]]; then
+  # The reviewed candidate descends from the reviewed base; a base that moved under the
+  # gate would fast-forward a merge nobody reviewed against the new tip.
+  fail "origin/$BASE moved to $now while the gate ran; the reviewed base $EXPECTED_BASE is stale or $BASE diverged from it (retry next cycle)"
 elif [[ "$mode" == "sync" ]] && git merge-base --is-ancestor "$now" "$candidate"; then
   # The normal fast-forward: custom is still at the merge base the candidate descends from.
   git push --quiet origin "$candidate:refs/heads/$BASE" \
     || fail "non-fast-forward push to $BASE was refused; retry next cycle"
 else
-  fail "origin/$BASE moved to $now while the gate ran; refusing to publish an untested merge (retry next cycle)"
+  fail "origin/$BASE moved to $now while the gate ran; the base is stale or diverged from the tested commit, so refusing to publish an untested merge (retry next cycle)"
 fi
 
 # --- Tag the tested commit and publish ------------------------------------------------
@@ -331,7 +562,10 @@ published="$(released_tags)" || exit 1
 is_published() { grep -qxF "$1" <<<"$published"; }
 
 tag_label=""
-if [[ -n "$tag_at_candidate" ]]; then
+if [[ -n "$reuse_tag" ]]; then
+  tag_label="$reuse_tag"
+  echo "reusing existing unpublished tag $tag_label at $candidate"
+elif [[ -n "$tag_at_candidate" ]]; then
   if is_published "$tag_at_candidate" && [[ "$FORCE_RELEASE" == "1" ]]; then
     echo "$tag_at_candidate is already published; creating an explicitly requested new release"
   else

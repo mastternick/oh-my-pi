@@ -8,7 +8,11 @@
 #   5. the installed @oh-my-pi packages match the bundle tarballs byte-for-byte (a stale install is refused)
 #
 # After a successful install the deployed updater, installer, scripts, and systemd units are
-# refreshed from the same verified commit, so the daily service applies the same gate.
+# refreshed from the same verified commit, so the daily service applies the same gate. The AI
+# conflict resolver's assets (controller, model adapter, opt-in helper, unit and drop-in
+# sources) are copied there on every install regardless of opt-in; deploying them enables
+# nothing. Only the AI unit file and the daily drop-in are (re)applied, and only when this
+# user's opt-in marker exists — with no marker the helper just removes its own stale drop-in.
 #
 # The existing omp launcher is kept. Only its config is rewritten to point at the current version,
 # and the legacy preset-fallback guard is disabled. Sessions started under an older binary keep it
@@ -179,6 +183,25 @@ refresh_deployed_tooling() {
   for f in omp-daily-update.service omp-daily-update.timer; do
     copy_from_commit "scripts/custom/systemd/$f" "$units/$f" 644
   done
+  # Opt-in AI conflict resolver assets: the controller, its adapter, the helper, and the
+  # unit/drop-in sources the helper installs from. Deploying them enables nothing.
+  copy_from_commit scripts/custom/ai-conflict-controller.sh "$libexec/ai-conflict-controller.sh" 755
+  copy_from_commit scripts/custom/ai-conflict-model.ts "$libexec/ai-conflict-model.ts" 644
+  copy_from_commit scripts/custom/install-ai-conflicts.sh "$libexec/install-ai-conflicts.sh" 755
+  mkdir -p "$libexec/systemd/omp-daily-update.service.d"
+  copy_from_commit scripts/custom/systemd/omp-ai-conflicts.service \
+    "$libexec/systemd/omp-ai-conflicts.service" 644
+  copy_from_commit scripts/custom/systemd/omp-daily-update.service.d/10-ai-conflicts.conf \
+    "$libexec/systemd/omp-daily-update.service.d/10-ai-conflicts.conf" 644
+  # Re-apply an existing opt-in; with no marker this only removes its own stale drop-in.
+  # The helper takes no lock — this install holds it — and a failure here must not fail
+  # an install that already passed every gate.
+  if [[ -x "$libexec/install-ai-conflicts.sh" ]]; then
+    OMP_CUSTOM_HOME="$ROOT" OMP_CUSTOM_LIBEXEC="$libexec" \
+      "$libexec/install-ai-conflicts.sh" --refresh \
+      || printf 'warning: could not refresh the opt-in AI conflict wiring; run %s --refresh by hand\n' \
+        "$libexec/install-ai-conflicts.sh" >&2
+  fi
   if command -v systemctl >/dev/null 2>&1 && [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
     systemctl --user daemon-reload >/dev/null 2>&1 \
       || printf 'warning: systemctl --user daemon-reload failed; run it by hand\n' >&2

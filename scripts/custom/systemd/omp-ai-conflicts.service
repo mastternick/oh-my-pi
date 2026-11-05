@@ -1,0 +1,28 @@
+[Unit]
+Description=omp-custom AI conflict resolver (hands one reviewed candidate to custom-sync)
+Documentation=https://github.com/mastternick/oh-my-pi/blob/custom/docs/UPDATING.md
+# Opt-in. The daily installer starts this unit through
+# omp-daily-update.service.d/10-ai-conflicts.conf, which install-ai-conflicts.sh --enable
+# installs; nothing else starts it. Its result is reported on this unit alone.
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/libexec/omp-custom/ai-conflict-controller.sh
+Environment="PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+# Account and repository settings only (for example OMP_AI_CONFLICTS_GH_USER). Tokens
+# come from the existing gh login; this file must never hold one.
+EnvironmentFile=-%h/.config/omp-custom/ai-conflicts.env
+# 75 is deferred (install lock busy, or not enough free space on the RAM work root), not a failure.
+SuccessExitStatus=75
+# Two 900 s adapter calls plus the 7200 s CI wait, with headroom: under 3 h.
+TimeoutStartSec=9600
+TimeoutStopSec=2min
+KillMode=mixed
+ProtectSystem=full
+NoNewPrivileges=true
+ProtectKernelTunables=true
+# No Restart=: the daily timer is the retry, so a failure never loops on its own.
+# No [Install] section on purpose: the only intended trigger is the daily service's
+# Wants=/After= drop-in (or a manual `systemctl --user start`). `systemctl --user enable`
+# therefore refuses this unit instead of turning it into a login-time job.
+# Logs land in journalctl --user -u omp-ai-conflicts.

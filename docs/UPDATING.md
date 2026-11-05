@@ -60,6 +60,8 @@ The existing launcher is kept. The installer:
 
 The installer also refreshes the deployed tooling from the installed tag: `scripts/custom/*.sh` and `launcher/` into `~/.local/libexec/omp-custom/`, `omp-daily-update.sh` into `~/.local/bin/`, and the systemd units into `~/.config/systemd/user/`, then runs `systemctl --user daemon-reload` when a user session is available. Files missing from an older tag are skipped, so old releases stay installable.
 
+The same refresh carries the opt-in AI conflict resolver: `ai-conflict-controller.sh`, `ai-conflict-model.ts`, and `install-ai-conflicts.sh` into the libexec directory, plus the unit and drop-in sources the helper installs from. Deploying them enables nothing. The unit and the daily drop-in are only (re)applied when this user's opt-in marker exists, so an install never turns the resolver on and never leaves the wiring behind for a user who did not ask for it.
+
 Bootstrap: an install deployed before this change keeps running the previously deployed updater and timer, which never refresh themselves. Run `scripts/custom/install.sh --tag custom-v<X.Y.Z>-c<N>` once from a tag that carries the new installer; from then on each install refreshes the deployed tooling, so later releases reach the new updater and the single-slot timer without manual steps.
 
 `~/.local/bin/omp` and `~/.bun/bin/omp` are repointed at the launcher. Original entrypoint links are recorded in `state/entrypoints.tsv`. The installer refuses to replace an entrypoint that is a regular file.
@@ -79,12 +81,66 @@ Sessions already running keep the binary they started with until they exit. New 
 
 Layout: the service runs `~/.local/bin/omp-daily-update.sh`. The wrapper finds the installer at `~/.local/libexec/omp-custom/install.sh`, so the installer suite (`scripts/custom/*.sh` and `launcher/`) is copied there. The units go in `~/.config/systemd/user/`. Timers run while logged out only if linger is enabled (`loginctl enable-linger <user>`).
 
+With the opt-in AI conflict resolver enabled, this same service also starts it first (next section). The installer still runs when the resolver fails, and the resolver reports on its own unit.
+
+Enable only the timer. `omp-daily-update.service` also carries `WantedBy=default.target`, so enabling the service would run the daily update (and, once enabled, the resolver) at every login instead of on the timer.
+
 ```
 systemctl --user daemon-reload
-systemctl --user enable --now omp-daily-update.timer
-systemctl --user start omp-daily-update.service   # run once now
+systemctl --user enable --now omp-daily-update.timer   # the only unit to enable
+systemctl --user start omp-daily-update.service        # run once now; keep it disabled
 journalctl --user -u omp-daily-update.service
 ```
+
+## AI conflict resolution (opt-in)
+
+A conflicting upstream merge is the one case the scheduled sync cannot finish, because a resolution is a decision. `scripts/custom/ai-conflict-controller.sh` makes that decision on a narrow model boundary and hands one reviewed candidate to the existing pipeline. It never publishes on its own; the CI gate, the fast-forward, the tag, the release, and the install are unchanged.
+
+What it does, and what stops it:
+
+1. It probes the newest upstream stable tag against `custom` in a fresh blobless clone under the RAM work root. A clean merge is left to the existing GitHub run: the job ends successfully with no model call.
+2. A conflicting merge is refused unless every unmerged path is a regular UTF-8 text file in one of the ordinary classes: modify/modify, add/add (no merge base, both sides present), or modify/delete (base present and exactly one side present, with content or an allowlisted deletion). Binary or non-UTF-8 files, symlinks, submodules, mode disagreements, a path absent on both sides, and a one-sided add/rename half without a merge base stop the job instead of being guessed at.
+3. For exactly those paths it stages base/ours/theirs (an absent stage is sent as JSON `null`, never as empty text), asks `ai-conflict-model.ts` to resolve them, and then asks it for an independent review. Both turns run as bounded subprocesses: a timeout, a rejected review, an unusable answer, or output over the size cap stops the job.
+4. It applies only the allowlisted results, runs deterministic checks, commits the merge, re-checks that the base branch did not move, and pushes the non-force branch `sync/upstream-<tag>`.
+5. It dispatches `custom-sync` with the expected base and tree and waits for the run. Everything after that is the normal path.
+
+Enable it per user (an install never does this):
+
+```
+scripts/custom/install-ai-conflicts.sh --enable     # from a checkout, or ~/.local/libexec/omp-custom/
+```
+
+That writes:
+
+- `~/.local/share/omp-custom/state/ai-conflicts/enabled`, the opt-in marker;
+- `~/.config/systemd/user/omp-ai-conflicts.service`, a `Type=oneshot` unit with `SuccessExitStatus=75`, a start bound under 3 h, and no `Restart=` (the daily timer is the retry);
+- `~/.config/systemd/user/omp-daily-update.service.d/10-ai-conflicts.conf`, which adds `Wants=` and `After=` for that unit to the daily installer. There is still exactly one timer.
+
+`Wants=` is weak on purpose: the resolver runs first, but a failed or deferred resolver never stops the release installer, and it reports on its own unit:
+
+```
+systemctl --user status omp-ai-conflicts.service
+journalctl --user -u omp-ai-conflicts.service
+```
+
+Disable it again with `--disable`. That removes only `10-ai-conflicts.conf` and the marker: the daily service, the daily timer, other drop-ins, installed versions, the unit file, and the env file are left untouched (the unit is inert once the drop-in is gone). Every later install re-applies the wiring while the marker exists, so an enabled user keeps current assets without repeating the step.
+
+An interrupted hand-off resumes safely. If the controller has already pushed `sync/upstream-<tag>` and its dispatch dies (reboot, timeout, killed run), the next scheduled `custom-sync` run picks that branch up. The controller stamps the certificate into the merge commit it creates — `OMP-AI-Conflict-Review: v1`, `OMP-AI-Reviewed-Base: <sha>`, `OMP-AI-Reviewed-Tree: <sha>`, `OMP-AI-Model: opencode-go/deepseek-v4.1-flash` — and the scheduled run scans `base..remote-branch` for that block even when it is buried under later commits, requires exactly one complete and valid block with those exact keys and model, and checks that its tree is the branch tip. With no explicit `expected_base_sha`/`expected_tree_sha` (the scheduled case) the guards are inferred from the certificate, so a resume needs no manual step; when guards are supplied they must match it. An incomplete, duplicated, or stale certificate — one whose base moved or whose tree is not the tip — fails before any push, CI run, or publication, and a branch with no certificate is never treated as reviewed: it takes the ordinary manual path, which still publishes only through the ordinary CI gate. **A certified AI branch cannot be refreshed into the gate with a different, unreviewed tree.**
+
+Requirements and settings:
+
+- `bun`, `git`, `gh`, `jq`, `flock`, `iconv`, and a writable RAM work root (`OMP_AI_CONFLICTS_TMPDIR`, default `/dev/shm`) with at least 2 GiB free. A missing or unwritable work root fails the run; a busy install/controller lock or too little free space defers it with exit 75.
+- `gh` must be logged in with write access to the fork. When the host's active `gh` account is not the fork owner, set `OMP_AI_CONFLICTS_GH_USER` to the account that is (`mastternick` for `mastternick/oh-my-pi` on this host): its existing token is exported to the controller's child processes and stripped from the model subprocess, no global account is switched, and no secret is stored.
+- Non-secret settings live in `~/.config/omp-custom/ai-conflicts.env` (for example `OMP_AI_CONFLICTS_GH_USER`, `OMP_CUSTOM_REPO`, `OMP_CUSTOM_BRANCH`). Credentials are never stored there: the job uses the existing `gh` login, and `GH_TOKEN`/`GITHUB_TOKEN` are stripped from the model subprocess.
+- The model is pinned: `opencode-go/deepseek-v4.1-flash`. The adapter resolves the installed OMP's public SDK and the existing credentials for that provider without touching the global config, and the controller refuses a turn whose proof reports any other provider or model, so a reconfigured fallback fails closed instead of resolving with an unverified model. Sessions run in `state/ai-conflicts/sessions` (mode 700), not in the interactive session store. Changing the provider is outside this feature.
+- Logs, staged conflict files, and the marker live under `~/.local/share/omp-custom/state/ai-conflicts/`.
+
+Failure boundaries, stated plainly:
+
+- There is no timing guarantee. The job is started by the daily timer (local time, 05:40 plus up to 2 h of jitter) while the sync publishes at 06:17 UTC, so which calendar day a conflict is resolved on depends on the machine's UTC offset. One run at a time is enforced by locks; a busy lock defers.
+- Only plain-text conflicts are resolved. Anything else, a provider outage, a model answer that fails the deterministic checks or the review, or a base branch that moved while the job worked leaves `custom` and the releases untouched, and the job fails with the reason in the journal.
+- Exit 75 (lock busy, low space) is a deferred success for systemd, not a failure; the next daily run tries again.
+- Cleanup covers only the transient work: the temporary RAM work directory is removed when a run ends, and `OMP_AI_CONFLICTS_KEEP_WORK=1` keeps it for inspection instead (not used in service). Persisted sessions, the run log, and the state directory are not rotated or deleted automatically, and `--disable` removes only the daily drop-in and the marker, so it deletes none of them.
 
 ## Rollback
 

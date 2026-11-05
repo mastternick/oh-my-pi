@@ -15,6 +15,14 @@ on:
         type: boolean
         required: false
         default: false
+      expected_base_sha:
+        description: 'Full commit SHA of origin/custom the conflicted merge was resolved against. Supply together with expected_tree_sha, only for an already-resolved conflicted merge.'
+        required: false
+        default: ''
+      expected_tree_sha:
+        description: 'Full tree SHA the refreshed candidate must have before it is pushed and gated. Supply together with expected_base_sha.'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -34,6 +42,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       UPSTREAM_TAG: ${{ inputs.upstream_tag }}
       OMP_SYNC_FORCE_RELEASE: ${{ inputs.force_release && '1' || '0' }}
+      OMP_SYNC_EXPECTED_BASE_SHA: ${{ inputs.expected_base_sha }}
+      OMP_SYNC_EXPECTED_TREE_SHA: ${{ inputs.expected_tree_sha }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:

@@ -16,6 +16,7 @@ The project is MIT-licensed. The upstream `LICENSE` is kept verbatim and must st
 
 - `scripts/custom/launcher/omp`: a self-locating tmux launcher wrapper. Its data directory is set by `OMP_LAUNCHER_DIR`, and the preset-fallback guard is off unless `OMP_LAUNCHER_PFB_ENSURE` is set.
 - `scripts/custom/`: pack, smoke, privacy, sync, install, and rollback tooling.
+- `scripts/custom/ai-conflict-controller.sh`, `ai-conflict-model.ts`, and `install-ai-conflicts.sh`: an opt-in resolver for a conflicting upstream merge. A clean merge is left to the existing sync; a conflicting one is decided only where it can be proven — plain-text conflicts only, one model resolution plus an independent review, deterministic checks, and a non-force hand-off to the existing CI/FF/tag/release gate — and it is started by the daily installer service through a weak `Wants=`/`After=` drop-in, so its failure is reported on `omp-ai-conflicts.service` and it never stops or fails the installer (the installer runs after the resolver finishes or times out).
 - `.github/workflows/custom-*.yml`: CI, tag-driven release with build attestation, and a daily upstream sync that fast-forwards `custom`, tags, and dispatches the release once CI passes on the exact commit. `custom` is the default branch, so scheduled sync runs from it.
 - `docs/`: this file, `UPDATING.md` (operator runbook), and `PRIVACY.md` (what is never published).
 

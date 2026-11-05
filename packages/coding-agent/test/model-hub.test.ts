@@ -105,6 +105,8 @@ interface HubHarness {
 	onLoginRequest: ReturnType<typeof vi.fn>;
 	onCancel: ReturnType<typeof vi.fn>;
 	onFallbackChainChange: Mock<(role: string, chain: string[]) => void>;
+	/** The component's repaint request, to assert a closed hub stays silent. */
+	requestRender: ReturnType<typeof vi.fn>;
 }
 
 const openHubs: ModelHubComponent[] = [];
@@ -122,7 +124,8 @@ function createHub(options: {
 	const modelsFn = typeof options.models === "function" ? options.models : () => options.models as Model[];
 	const settings = options.settings ?? Settings.isolated({});
 	const registry = makeRegistry(modelsFn, options.registry);
-	const ui = { requestRender: vi.fn(), terminal: { rows: options.terminalRows ?? 40 } } as unknown as TUI;
+	const requestRender = vi.fn();
+	const ui = { requestRender, terminal: { rows: options.terminalRows ?? 40 } } as unknown as TUI;
 	const onAssign = vi.fn();
 	const onUnassign = vi.fn();
 	const onLoginRequest = vi.fn();
@@ -155,7 +158,7 @@ function createHub(options: {
 		options.hub,
 	);
 	openHubs.push(hub);
-	return { hub, onAssign, onUnassign, onLoginRequest, onCancel, onFallbackChainChange };
+	return { hub, onAssign, onUnassign, onLoginRequest, onCancel, onFallbackChainChange, requestRender };
 }
 
 const DOWN = "\x1b[B";
@@ -167,6 +170,9 @@ const OPTION_RIGHT_MAC = "\x1bf";
 const CTRL_LEFT = "\x1b[1;5D";
 const CTRL_RIGHT = "\x1b[1;5C";
 const ESC = "\x1b";
+const F1 = "\x1bOP";
+const F2 = "\x1bOQ";
+const SHIFT_UP = "\x1b[1;2A";
 
 describe("ModelHub", () => {
 	beforeAll(async () => {
@@ -557,7 +563,7 @@ describe("ModelHub", () => {
 	});
 
 	describe("quick-switch cycle and custom roles", () => {
-		test("c toggles cycle membership, [ reorders, and the preview tracks the order", () => {
+		test("c toggles cycle membership, shift+↑ reorders, and the preview tracks the order", () => {
 			const model = makeModel("test", "cycle-model");
 			const settings = Settings.isolated({});
 			const changes: string[][] = [];
@@ -583,8 +589,8 @@ describe("ModelHub", () => {
 			// …c again re-appends it at the end…
 			hub.handleInput("c");
 			expect(changes[1]).toEqual(["smol", "slow", "default"]);
-			// …and [ moves it one slot earlier.
-			hub.handleInput("[");
+			// …and shift+↑ moves it one slot earlier.
+			hub.handleInput(SHIFT_UP);
 			expect(changes[2]).toEqual(["smol", "default", "slow"]);
 
 			// The preview line renders the resulting ctrl+p track in order.
@@ -1237,7 +1243,7 @@ describe("ModelHub", () => {
 			expect(normalize(hub.render(220))).not.toContain("↳");
 		});
 
-		test("] moves a chain entry later and the cursor follows it", () => {
+		test("F2 lowers a fallback entry and the cursor follows it", () => {
 			const a = makeModel("test", "model-a");
 			const b = makeModel("test", "model-b");
 			const settings = Settings.isolated({
@@ -1247,12 +1253,287 @@ describe("ModelHub", () => {
 
 			enterRolesView(hub);
 			hub.handleInput(DOWN); // first chain entry (model-a)
-			hub.handleInput("]");
+			hub.handleInput(F2);
 			expect(onFallbackChainChange).toHaveBeenLastCalledWith("default", ["test/model-b", "test/model-a"]);
 
 			// Cursor followed the moved entry: x removes model-a, not model-b.
 			hub.handleInput("x");
 			expect(onFallbackChainChange).toHaveBeenLastCalledWith("default", ["test/model-b"]);
+		});
+
+		test("F1 raises an interior fallback entry one slot and the cursor follows it", () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const c = makeModel("test", "model-c");
+			const settings = Settings.isolated({
+				"retry.fallbackChains": { default: ["test/model-a", "test/model-b", "test/model-c"] },
+			});
+			const { hub, onFallbackChainChange } = createHub({ models: [a, b, c], scoped: true, settings });
+
+			enterRolesView(hub);
+			hub.handleInput(DOWN);
+			hub.handleInput(DOWN); // second chain entry (model-b)
+			hub.handleInput(F1);
+			expect(onFallbackChainChange).toHaveBeenLastCalledWith("default", [
+				"test/model-b",
+				"test/model-a",
+				"test/model-c",
+			]);
+
+			// The cursor followed model-b to the top: F2 lowers it back.
+			hub.handleInput(F2);
+			expect(onFallbackChainChange).toHaveBeenLastCalledWith("default", [
+				"test/model-a",
+				"test/model-b",
+				"test/model-c",
+			]);
+		});
+
+		test("F1 on the first fallback is inert while the primary is auto-selected", () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const settings = Settings.isolated({
+				"retry.fallbackChains": { default: ["test/model-a", "test/model-b"] },
+			});
+			const { hub, onAssign, onFallbackChainChange } = createHub({ models: [a, b], scoped: true, settings });
+
+			enterRolesView(hub);
+			hub.handleInput(DOWN);
+			hub.handleInput(F1);
+			expect(onAssign).not.toHaveBeenCalled();
+			expect(onFallbackChainChange).not.toHaveBeenCalled();
+		});
+
+		test("F2 on the primary swaps it with the first fallback; F1 on that fallback restores it", () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const c = makeModel("test", "model-c");
+			const settings = Settings.isolated({
+				modelRoles: { default: "test/model-a" },
+				"retry.fallbackChains": { default: ["test/model-b", "test/model-c"] },
+			});
+			const assign = vi.fn((_model: Model, role: string, _level: unknown, selector: string) => {
+				settings.setModelRole(role, selector);
+			});
+			const { hub, onFallbackChainChange } = createHub({
+				models: [a, b, c],
+				scoped: true,
+				settings,
+				callbacks: { onAssign: assign },
+			});
+
+			enterRolesView(hub); // cursor on the default primary
+			hub.handleInput(F2);
+			const promoted = assign.mock.calls.at(-1) ?? [];
+			expect((promoted[0] as Model).id).toBe("model-b");
+			expect(promoted[1]).toBe("default");
+			expect(promoted[3]).toBe("test/model-b");
+			expect(onFallbackChainChange).toHaveBeenLastCalledWith("default", ["test/model-a", "test/model-c"]);
+
+			// The cursor followed model-a into the chain: F1 on it promotes it back.
+			hub.handleInput(F1);
+			const restored = assign.mock.calls.at(-1) ?? [];
+			expect((restored[0] as Model).id).toBe("model-a");
+			expect(restored[3]).toBe("test/model-a");
+			expect(onFallbackChainChange).toHaveBeenLastCalledWith("default", ["test/model-b", "test/model-c"]);
+		});
+
+		test("a refused primary assignment leaves the fallback chain untouched", () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const settings = Settings.isolated({
+				modelRoles: { default: "test/model-a" },
+				"retry.fallbackChains": { default: ["test/model-b"] },
+			});
+			const { hub, onFallbackChainChange } = createHub({
+				models: [a, b],
+				scoped: true,
+				settings,
+				callbacks: { onAssign: vi.fn(() => false) },
+			});
+
+			enterRolesView(hub);
+			hub.handleInput(F2);
+			expect(onFallbackChainChange).not.toHaveBeenCalled();
+		});
+
+		test("an async accepted swap still writes the chain after the hub is disposed", async () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const settings = Settings.isolated({
+				modelRoles: { default: "test/model-a" },
+				"retry.fallbackChains": { default: ["test/model-b"] },
+			});
+			const assignment = Promise.withResolvers<boolean>();
+			const assign = vi.fn(() => assignment.promise);
+			const { hub, onFallbackChainChange, requestRender } = createHub({
+				models: [a, b],
+				scoped: true,
+				settings,
+				callbacks: { onAssign: assign },
+			});
+
+			enterRolesView(hub);
+			hub.handleInput(F2); // Esc-style close while the assignment is still in flight.
+			hub.dispose();
+			const renders = requestRender.mock.calls.length;
+			assignment.resolve(true);
+			await Promise.resolve();
+
+			expect(onFallbackChainChange).toHaveBeenCalledWith("default", ["test/model-a"]);
+			expect(requestRender.mock.calls.length).toBe(renders);
+		});
+
+		test("an async refused or rejected assignment leaves the chain untouched", async () => {
+			for (const outcome of ["refused", "rejected"] as const) {
+				const a = makeModel("test", "model-a");
+				const b = makeModel("test", "model-b");
+				const settings = Settings.isolated({
+					modelRoles: { default: "test/model-a" },
+					"retry.fallbackChains": { default: ["test/model-b"] },
+				});
+				const assign = vi.fn(() =>
+					outcome === "refused" ? Promise.resolve(false) : Promise.reject(new Error("assignment failed")),
+				);
+				const { hub, onFallbackChainChange } = createHub({
+					models: [a, b],
+					scoped: true,
+					settings,
+					callbacks: { onAssign: assign },
+				});
+
+				enterRolesView(hub);
+				hub.handleInput(F2);
+				await Promise.resolve();
+
+				expect(onFallbackChainChange).not.toHaveBeenCalled();
+				expect(settings.getModelRole("default")).toBe("test/model-a");
+			}
+		});
+
+		test("a refused or failed chain write restores the promoted primary", () => {
+			for (const outcome of ["refused", "failed"] as const) {
+				const a = makeModel("test", "model-a");
+				const b = makeModel("test", "model-b");
+				const settings = Settings.isolated({
+					modelRoles: { default: "test/model-a" },
+					"retry.fallbackChains": { default: ["test/model-b"] },
+				});
+				const assign = vi.fn((_model: Model, role: string, _level: unknown, selector: string) => {
+					settings.setModelRole(role, selector);
+					return true;
+				});
+				const writeChain = vi.fn(() => {
+					if (outcome === "failed") throw new Error("settings locked");
+					return false;
+				});
+				const { hub } = createHub({
+					models: [a, b],
+					scoped: true,
+					settings,
+					callbacks: { onAssign: assign, onFallbackChainChange: writeChain },
+				});
+
+				enterRolesView(hub);
+				hub.handleInput(F2);
+
+				expect(writeChain).toHaveBeenCalledWith("default", ["test/model-a"]);
+				expect(assign).toHaveBeenCalledTimes(2);
+				expect((assign.mock.calls[1]?.[0] as Model).id).toBe("model-a");
+				expect(assign.mock.calls[1]?.[1]).toBe("default");
+				expect(assign.mock.calls[1]?.[3]).toBe("test/model-a");
+				expect(settings.getModelRole("default")).toBe("test/model-a");
+				expect(cfgRetryFallbackChains.get(settings).default).toEqual(["test/model-b"]);
+			}
+		});
+
+		test("a failed chain write restores the role value as the user wrote it", () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const settings = Settings.isolated({
+				modelRoles: { default: "TEST/Model-A" },
+				"retry.fallbackChains": { default: ["test/model-b"] },
+			});
+			const assign = vi.fn((_model: Model, role: string, _level: unknown, selector: string) => {
+				settings.setModelRole(role, selector);
+				return true;
+			});
+			const { hub } = createHub({
+				models: [a, b],
+				scoped: true,
+				settings,
+				callbacks: { onAssign: assign, onFallbackChainChange: () => false },
+			});
+
+			enterRolesView(hub);
+			hub.handleInput(F2);
+
+			// The rollback is not canonicalized to the registry's lowercase id.
+			expect(assign.mock.calls[1]?.[3]).toBe("TEST/Model-A");
+			expect(settings.getModelRole("default")).toBe("TEST/Model-A");
+		});
+
+		test("a --models scope does not promote an out-of-scope chain entry", () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const outside = makeModel("test", "model-outside");
+			const catalog = [a, b, outside];
+			const settings = Settings.isolated({
+				modelRoles: { smol: "test/model-a" },
+				"retry.fallbackChains": { smol: ["test/model-outside", "test/model-b"] },
+			});
+			const { hub, onAssign, onFallbackChainChange } = createHub({
+				models: [a, b],
+				scoped: true,
+				settings,
+				registry: { getAll: () => catalog, getAvailable: () => catalog },
+			});
+
+			enterRolesView(hub);
+			hub.handleInput(DOWN); // default → smol
+			hub.handleInput(F2); // no swap: the first entry is outside the scope
+			expect(onAssign).not.toHaveBeenCalled();
+
+			// Raw chain editing still reorders the out-of-scope entry's neighbours.
+			hub.handleInput(DOWN); // model-outside
+			hub.handleInput(DOWN); // model-b
+			hub.handleInput(SHIFT_UP);
+			expect(onFallbackChainChange).toHaveBeenCalledWith("smol", ["test/model-b", "test/model-outside"]);
+		});
+
+		test("F2 on the primary is inert when the first fallback is a wildcard", () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const settings = Settings.isolated({
+				modelRoles: { default: "test/model-a" },
+				"retry.fallbackChains": { default: ["test/*", "test/model-b"] },
+			});
+			const { hub, onAssign, onFallbackChainChange } = createHub({ models: [a, b], scoped: true, settings });
+
+			enterRolesView(hub);
+			hub.handleInput(F2);
+			expect(onAssign).not.toHaveBeenCalled();
+			expect(onFallbackChainChange).not.toHaveBeenCalled();
+		});
+
+		test("boundary moves and Shift+arrows never promote or overrun the list", () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const c = makeModel("test", "model-c");
+			const settings = Settings.isolated({
+				modelRoles: { default: "test/model-a" },
+				"retry.fallbackChains": { default: ["test/model-b", "test/model-c"] },
+			});
+			const { hub, onAssign, onFallbackChainChange } = createHub({ models: [a, b, c], scoped: true, settings });
+
+			enterRolesView(hub);
+			hub.handleInput(F1); // primary: nothing above it
+			hub.handleInput(DOWN); // model-b
+			hub.handleInput(SHIFT_UP); // plain neighbour move: nothing above model-b
+			hub.handleInput(DOWN); // model-c, the last entry
+			hub.handleInput(F2); // nothing below it
+			expect(onAssign).not.toHaveBeenCalled();
+			expect(onFallbackChainChange).not.toHaveBeenCalled();
 		});
 
 		test("windows the roles list so model-keyed chains past the panel height stay reachable", () => {

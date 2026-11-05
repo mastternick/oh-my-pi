@@ -7,6 +7,10 @@
 - Added the native Judge view to Agent Hub (`Alt+A`, then `3`), showing per-session and descendant-scope Judge activity, actual questions and typed answers (with confidence when returned), raw automatic choices versus applied levels, and measured paid calls, tokens, cost, and reused cached-question counts.
 - Added a daily `omp-custom` updater (`omp-daily-update.sh` with a systemd user timer) that installs the newest release tag, keeps the previous version for rollback, and skips the install when disk space is low.
 
+### Changed
+
+- The Roles view's `[` / `]` reorder keys are now F1 (up) and F2 (down), which order a role's primary model and its fallback chain as one list. F2 on a primary swaps it with its first fallback, and F1 on that first fallback swaps back. The cursor follows the moved model. The primary assignment runs first, so a refused assignment leaves the chain untouched; the chain write is issued through the host callback rather than the view, so it still lands when the overlay closes while the assignment is in flight. A refused or failed chain write restores the previous primary instead of leaving the demoted model out of the chain, and a `--models` scope never promotes a fallback outside the scope. The demoted primary keeps only the thinking level and `@upstream` route its configured value spelled out. Wildcard, unresolvable, or auto-selected primaries have nothing to swap, so those moves do nothing. Shift+↑/↓ keep their cycle-order move on role rows and their neighbour move on fallback entries.
+
 ### Fixed
 
 - `/memory enqueue` no longer captures a raw transcript when `mnemopi.autoRetain` is off. Manual consolidation now passes the configured auto-retention setting to `consolidate()`, matching disposal. Explicit `xd://retain` and `/memory` writes are unchanged, and `autoRetain: true` still retains the transcript on enqueue.

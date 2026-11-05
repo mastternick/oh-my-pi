@@ -1125,8 +1125,10 @@ export class SelectorController {
 								? `${roleInfo?.tag ?? roleInfo?.name ?? role} fallbacks: ${chain.join(" → ")}`
 								: `${roleInfo?.tag ?? roleInfo?.name ?? role} fallbacks cleared`,
 						);
+						return true;
 					} catch (error) {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						return false;
 					}
 				},
 

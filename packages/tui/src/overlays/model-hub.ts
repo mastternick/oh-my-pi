@@ -23,6 +23,7 @@ import type {
 import type { KeysApi, Model } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
+import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { providerEntry } from "@oh-my-pi/pi-catalog/compat/providers";
 import { MODEL_KINDS, modelKind, type ModelKind } from "@oh-my-pi/pi-catalog/types";
 import type { Component, TUI } from "../tui";
@@ -157,8 +158,11 @@ export interface ModelHubCallbacks {
 	) => void | boolean | Promise<void | boolean>;
 	/** Clear a configured role back to auto-selection. */
 	onUnassign: (role: string, scope?: ModelRoleSelectionScope) => void;
-	/** Persist a `retry.fallbackChains` entry — keyed by a role, `provider/model-id`, or `provider/*`; an empty chain clears the key. */
-	onFallbackChainChange?: (role: string, chain: string[]) => void;
+	/**
+	 * Persist a `retry.fallbackChains` entry — keyed by a role, `provider/model-id`, or `provider/*`; an empty chain clears the key.
+	 * `false` reports a refused/failed write (the host has already surfaced it), which a compound trade rolls back.
+	 */
+	onFallbackChainChange?: (role: string, chain: string[]) => void | boolean;
 	/** Locked provider activation: forward to the /login flow. */
 	onLoginRequest?: (providerId: string) => void;
 	/** Save the current role assignments and default thinking level as a named model preset. */
@@ -271,6 +275,8 @@ type RolesAction =
 	| "cycle"
 	| "earlier"
 	| "later"
+	| "raise"
+	| "lower"
 	| "new"
 	| "thinking"
 	| "compaction"
@@ -283,8 +289,6 @@ const ROLES_ACTION_KEYS: Record<string, RolesAction> = {
 	x: "clear",
 	f: "fallback",
 	c: "cycle",
-	"[": "earlier",
-	"]": "later",
 	n: "new",
 	t: "thinking",
 	k: "compaction",
@@ -983,8 +987,9 @@ export class ModelHubComponent implements Component {
 		this.#requestRender();
 	}
 
-	/** Re-sync after an asynchronous callback finishes mutating settings. */
+	/** Re-sync after an asynchronous callback finishes mutating settings; a closed overlay has nothing to show. */
 	refreshAfterExternalMutation(): void {
+		if (this.#disposed) return;
 		this.#refreshAfterMutation();
 	}
 
@@ -1250,21 +1255,33 @@ export class ModelHubComponent implements Component {
 		const resolved = this.#roleForScope(role, scope);
 		return resolved.explicitThinkingLevel ? (resolved.thinkingLevel ?? ThinkingLevel.Inherit) : ThinkingLevel.Inherit;
 	}
-	#finishAssignment(result: void | boolean | Promise<void | boolean>, onSuccess: () => void): void {
+	/**
+	 * Settle an assignment result. `persist` owns the non-view half of a
+	 * compound mutation and runs as soon as the assignment is accepted — after
+	 * `dispose` too, so closing the overlay mid-flight cannot drop it; a failed
+	 * `persist` skips `onSuccess`, which only touches the view.
+	 */
+	#finishAssignment(
+		result: void | boolean | Promise<void | boolean>,
+		onSuccess: () => void,
+		persist?: () => boolean,
+	): void {
+		const settle = (applied: boolean): void => {
+			this.#assignmentPending = false;
+			if (!applied || (persist && !persist())) {
+				if (!this.#disposed) this.#requestRender();
+				return;
+			}
+			if (!this.#disposed) onSuccess();
+		};
 		if (!(result instanceof Promise)) {
-			if (result !== false) onSuccess();
-			else this.#requestRender();
+			settle(result !== false);
 			return;
 		}
 		this.#assignmentPending = true;
 		this.#requestRender();
 		void result.then(
-			applied => {
-				this.#assignmentPending = false;
-				if (this.#disposed) return;
-				if (applied !== false) onSuccess();
-				else this.#requestRender();
-			},
+			applied => settle(applied !== false),
 			() => {
 				this.#assignmentPending = false;
 				if (!this.#disposed) this.#requestRender();
@@ -1771,6 +1788,168 @@ export class ModelHubComponent implements Component {
 		this.#roleIndex += delta;
 	}
 
+	/** Whether `role` has an explicit primary to trade with; an auto-selected primary has no selector to demote. */
+	#hasExplicitPrimary(role: string): boolean {
+		const assignment = this.#roles[role];
+		return assignment !== undefined && !assignment.autoSelected;
+	}
+
+	/**
+	 * The first chain entry F2-on-primary and F1-on-first-fallback trade with:
+	 * a concrete, role-accepted model under an explicit primary. Wildcards,
+	 * unknown or rejected models, and auto primaries have no swap.
+	 */
+	#primarySwapTarget(role: string) {
+		if (!this.#hasExplicitPrimary(role)) return undefined;
+		const resolved = this.#resolveFallbackEntry(role, 0);
+		if (!resolved || !this.#settings.getRoleInfo(role).accepts(resolved.item.model)) return undefined;
+		// A `--models` scope resolves roles against the scoped pool only; promoting
+		// a chat model outside it would persist a primary that pool then drops.
+		if (
+			this.#scopedModels.length > 0 &&
+			!this.#availableItems.some(candidate => modelsAreEqual(candidate.model, resolved.item.model))
+		) {
+			return undefined;
+		}
+		return resolved;
+	}
+
+	/** What F1 does on a Roles row (footer and action labels); undefined where it does nothing. */
+	#raiseLabel(row: RolesRow): string | undefined {
+		if (row.kind !== "fallback") return undefined;
+		if (row.chainIndex > 0) return "raise";
+		return this.#primarySwapTarget(row.role) ? "promote" : undefined;
+	}
+
+	/** What F2 does on a Roles row: swap with the first fallback on a role row, else a neighbour move. */
+	#lowerLabel(row: RolesRow): string | undefined {
+		if (row.kind === "role") return this.#primarySwapTarget(row.role) ? "swap with fallback" : undefined;
+		if (row.kind !== "fallback") return undefined;
+		return row.chainIndex < (this.#fallbackChains()[row.role]?.length ?? 0) - 1 ? "lower" : undefined;
+	}
+
+	/** Footer fragment for F1/F2 on `row`; each hint leads with " · ". */
+	#reorderFooterHint(row: RolesRow | undefined): string {
+		if (!row) return "";
+		const raise = this.#raiseLabel(row);
+		const lower = this.#lowerLabel(row);
+		return (raise ? ` · ${formatKeyHint("f1")} ${raise}` : "") + (lower ? ` · ${formatKeyHint("f2")} ${lower}` : "");
+	}
+
+	/**
+	 * Trade `role`'s primary with its first fallback: the promoted entry becomes
+	 * the primary and the old primary re-enters the chain at slot 0. The primary
+	 * goes through the existing assignment flow first; the chain is written only
+	 * once that is accepted, so a refused assignment changes nothing — and it is
+	 * written even if the overlay closes meanwhile, because the host owns both
+	 * settings mutations. `from` is the row the cursor started on, which it
+	 * follows to the moved model once the trade is committed.
+	 */
+	#swapPrimaryWithFallback(role: string, from: "primary" | "fallback"): void {
+		const target = this.#primarySwapTarget(role);
+		const primary = this.#roles[role];
+		if (!target || !primary) return;
+		const { item, upstream: promotedUpstream, thinkingLevel } = target;
+		const promotedLevel =
+			thinkingLevel === undefined || thinkingLevel === AUTO_THINKING ? ThinkingLevel.Inherit : thinkingLevel;
+		const level = this.#thinkingOptionsFor(item.model).includes(promotedLevel)
+			? promotedLevel
+			: ThinkingLevel.Inherit;
+		const promotedSelector = promotedUpstream ? `${item.selector}@${promotedUpstream}` : item.selector;
+
+		// The demoted primary keeps the effort and any `@upstream` routing its raw role value spelled out.
+		const rawPrimary = this.#settings.getModelRole(role);
+		const parsedPrimary = rawPrimary ? this.#parseFallbackEntry(rawPrimary) : undefined;
+		const primaryUpstream =
+			parsedPrimary && parsedPrimary.provider === primary.model.provider && parsedPrimary.id === primary.model.id
+				? parsedPrimary.upstream
+				: undefined;
+		const primaryBase = `${primary.model.provider}/${primary.model.id}`;
+		// A failed chain write rolls the role back to the value the user wrote —
+		// its casing, alias, and `@upstream` route — not the canonical id it resolved to.
+		const primaryConfiguredBase = parsedPrimary ? `${parsedPrimary.provider}/${parsedPrimary.id}` : primaryBase;
+		const rollbackSelector = primaryUpstream ? `${primaryConfiguredBase}@${primaryUpstream}` : primaryConfiguredBase;
+		// Only an effort the raw role value spelled out survives the demotion; the
+		// resolved display level of a bare primary is inherited, not pinned.
+		const primaryIsConfigured =
+			parsedPrimary !== undefined &&
+			parsedPrimary.provider === primary.model.provider &&
+			parsedPrimary.id === primary.model.id;
+		const demotedLevel = (primaryIsConfigured ? parsedPrimary.thinkingLevel : undefined) ?? ThinkingLevel.Inherit;
+		const demoted = formatModelSelectorValue(
+			primaryUpstream ? `${primaryBase}@${primaryUpstream}` : primaryBase,
+			demotedLevel,
+		);
+		const chain = this.#fallbackChains()[role] ?? [];
+		const nextChain = [demoted, ...chain.slice(1).filter(entry => entry !== demoted)];
+
+		const source = this.#settings.getModelRoleSource(role);
+		const scope = this.#settings.modelRoleStorage === "project" && source !== "default" ? source : undefined;
+		const result = this.#callbacks.onAssign(item.model, role, level, promotedSelector, scope);
+		this.#finishAssignment(
+			result,
+			() => {
+				this.#refreshAfterMutation();
+				const index = this.#rolesRows.findIndex(row =>
+					from === "primary"
+						? row.kind === "fallback" && row.role === role && row.chainIndex === 0
+						: row.kind === "role" && row.role === role,
+				);
+				if (index >= 0) this.#roleIndex = index;
+			},
+			() =>
+				this.#writeSwapChain(role, nextChain, () =>
+					this.#restorePrimary(role, primary.model, rollbackSelector, demotedLevel, scope),
+				),
+		);
+	}
+
+	/**
+	 * Write the chain half of a trade. A refused or failed write re-assigns the
+	 * old primary — settings and live session both — through the normal
+	 * assignment flow, so the demoted model never drops out of the chain.
+	 */
+	#writeSwapChain(role: string, chain: string[], restore: () => void): boolean {
+		try {
+			if (this.#callbacks.onFallbackChainChange?.(role, chain) === false) {
+				restore();
+				return false;
+			}
+			return true;
+		} catch (error) {
+			restore();
+			this.#configError = error instanceof Error ? error.message : String(error);
+			return false;
+		}
+	}
+
+	/** Re-assign the previous primary after a refused chain write, then refresh the rows if still open. */
+	#restorePrimary(
+		role: string,
+		model: Model,
+		selector: string,
+		level: ConfiguredThinkingLevel,
+		scope?: ModelRoleSelectionScope,
+	): void {
+		const settle = (applied: boolean): void => {
+			// Refresh first: a re-sync rebuilds `#configError`, so the message below must follow it.
+			if (!this.#disposed) this.#refreshAfterMutation();
+			if (applied) return;
+			// A refused rollback leaves the demoted primary live, so say so instead of silently keeping it.
+			if (!this.#configError) {
+				this.#configError = `Could not restore ${role}'s previous primary after the fallback chain write failed.`;
+			}
+			if (!this.#disposed) this.#requestRender();
+		};
+		const result = this.#callbacks.onAssign(model, role, level, selector, scope);
+		if (result instanceof Promise)
+			void result.then(
+				applied => settle(applied !== false),
+				() => settle(false),
+			);
+		else settle(result !== false);
+	}
+
 	#cancelAssign(): void {
 		this.#assigning = null;
 		this.#browser.setQuery("");
@@ -2232,8 +2411,17 @@ export class ModelHubComponent implements Component {
 			this.#runRolesAction("clear");
 			return;
 		}
-		// Reordering: [ / shift+↑ moves the row earlier, ] / shift+↓ later —
-		// cycle order on a role row, chain order on a fallback row.
+		// F1/F2 raise and lower a row within its role's primary-plus-fallback list;
+		// F1 on the first fallback promotes it. Shift+↑/↓ keep their existing moves:
+		// cycle order on a role row, a plain neighbour move on a fallback row.
+		if (matchesKey(data, "f1")) {
+			this.#runRolesAction("raise");
+			return;
+		}
+		if (matchesKey(data, "f2")) {
+			this.#runRolesAction("lower");
+			return;
+		}
 		if (matchesKey(data, "shift+up")) {
 			this.#runRolesAction("earlier");
 			return;
@@ -2275,6 +2463,20 @@ export class ModelHubComponent implements Component {
 				const delta = action === "earlier" ? -1 : 1;
 				if (role) this.#moveCycleMembership(role, delta);
 				else if (row?.kind === "fallback") this.#moveFallback(row, delta);
+				return;
+			}
+			case "raise":
+			case "lower": {
+				if (row?.kind === "role") {
+					if (action === "lower") this.#swapPrimaryWithFallback(row.role, "primary");
+					return;
+				}
+				if (row?.kind !== "fallback") return;
+				if (action === "raise" && row.chainIndex === 0 && this.#primarySwapTarget(row.role)) {
+					this.#swapPrimaryWithFallback(row.role, "fallback");
+					return;
+				}
+				this.#moveFallback(row, action === "raise" ? -1 : 1);
 				return;
 			}
 			case "new":
@@ -2818,7 +3020,7 @@ export class ModelHubComponent implements Component {
 				// action would be inert there.
 				const editable = this.#resolveFallbackEntry(row.role, row.chainIndex) !== undefined;
 				const thinking = editable ? ` · ${formatKeyHint("t")} thinking` : "";
-				return `${upDown} rows · ${enter} replace · ${formatKeyHint("f")} add another · ${formatKeyHint("x")} remove${thinking}${compaction} · [/] reorder · ${left} providers`;
+				return `${upDown} rows · ${enter} replace · ${formatKeyHint("f")} add another · ${formatKeyHint("x")} remove${thinking}${compaction}${this.#reorderFooterHint(row)} · ${left} providers`;
 			}
 			if (row?.kind === "chainKey") {
 				return `${upDown} rows · ${formatKeyHints(["enter", "f"])} add fallback · ${formatKeyHint("x")} clear chain · ${left} providers`;
@@ -2832,7 +3034,7 @@ export class ModelHubComponent implements Component {
 			const thinking = editable ? ` · ${formatKeyHint("t")} thinking` : "";
 			const savePreset = this.#callbacks.onSavePreset ? ` · ${formatKeyHint("s")} save preset` : "";
 			const switchPreset = this.#presets().names.length > 0 ? ` · ${formatKeyHints(["p", "shift+p"])} preset` : "";
-			return `${upDown} rows · ${enter} pick · ${formatKeyHint("f")} fallback · ${formatKeyHint("x")} clear${thinking}${compaction} · ${formatKeyHint("c")} cycle · [/] reorder · ${formatKeyHint("n")} new${savePreset}${switchPreset}`;
+			return `${upDown} rows · ${enter} pick · ${formatKeyHint("f")} fallback · ${formatKeyHint("x")} clear${thinking}${compaction} · ${formatKeyHint("c")} cycle${this.#reorderFooterHint(row)} · ${formatKeyHints(["shift+up", "shift+down"])} cycle order · ${formatKeyHint("n")} new${savePreset}${switchPreset}`;
 		}
 		if (entry.kind === "provider" && entry.locked) {
 			return entry.oauth
@@ -3578,6 +3780,8 @@ export class ModelHubComponent implements Component {
 				this.#callbacks.onCompactionPointChange && this.#roleRowModel()
 					? roleAction("compaction", "Compaction limit", "k")
 					: undefined;
+			const raise = row ? this.#raiseLabel(row) : undefined;
+			const lower = row ? this.#lowerLabel(row) : undefined;
 			switch (row?.kind) {
 				case "role": {
 					const assigned = this.#roles[row.role];
@@ -3585,6 +3789,7 @@ export class ModelHubComponent implements Component {
 						roleAction("pick", "Pick model", "enter", true),
 						roleAction("fallback", "Add fallback", "f"),
 						assigned && !assigned.autoSelected ? roleAction("clear", "Clear", "x") : undefined,
+						this.#primarySwapTarget(row.role) ? roleAction("lower", "Swap with fallback", "f2") : undefined,
 						this.#roleThinkingTarget(row.role) ? roleAction("thinking", "Thinking", "t") : undefined,
 						compaction,
 						roleAction("cycle", this.#cycleOrder().includes(row.role) ? "Leave cycle" : "Add to cycle", "c"),
@@ -3603,8 +3808,8 @@ export class ModelHubComponent implements Component {
 							? roleAction("thinking", "Thinking", "t")
 							: undefined,
 						compaction,
-						roleAction("earlier", "Earlier", "["),
-						roleAction("later", "Later", "]"),
+						raise ? roleAction("raise", raise === "promote" ? "Promote" : "Raise", "f1") : undefined,
+						lower ? roleAction("lower", "Lower", "f2") : undefined,
 					);
 					break;
 				case "chainKey":
@@ -4086,7 +4291,6 @@ export class ModelHubComponent implements Component {
 		const upDown = (label: string) => actionHint(["tui.select.up", "tui.select.down"], label);
 		const search = keys("type to search");
 		const kind = keys("kind", "alt+left", "alt+right");
-		const reorder = keys("reorder", "[", "]");
 		const strip = this.#strip;
 		if (strip) {
 			switch (strip.kind) {
@@ -4146,6 +4350,8 @@ export class ModelHubComponent implements Component {
 				];
 			}
 			const row = this.#rolesRows[this.#roleIndex];
+			const raise = row ? this.#raiseLabel(row) : undefined;
+			const lower = row ? this.#lowerLabel(row) : undefined;
 			const compaction =
 				this.#callbacks.onCompactionPointChange && this.#roleRowModel() ? keys("compaction limit", "k") : undefined;
 			if (row?.kind === "fallback") {
@@ -4158,7 +4364,8 @@ export class ModelHubComponent implements Component {
 					keys("remove", "x"),
 					editable ? keys("thinking", "t") : undefined,
 					compaction,
-					reorder,
+					raise ? keys(raise, "f1") : undefined,
+					lower ? keys(lower, "f2") : undefined,
 					keys("providers", "left"),
 				];
 			}
@@ -4182,7 +4389,8 @@ export class ModelHubComponent implements Component {
 				editable ? keys("thinking", "t") : undefined,
 				compaction,
 				keys("cycle", "c"),
-				reorder,
+				lower ? keys(lower, "f2") : undefined,
+				keys("cycle order", "shift+up", "shift+down"),
 				keys("new", "n"),
 				this.#callbacks.onSavePreset ? keys("save preset", "s") : undefined,
 				this.#presets().names.length > 0 ? keys("preset", "ctrl+left", "ctrl+right", "p", "shift+p") : undefined,

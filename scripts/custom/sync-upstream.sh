@@ -205,9 +205,9 @@ The \`custom-sync\` workflow gates this exact commit with \`custom-ci\` and, onl
 green run, fast-forwards \`$BASE\` and publishes the release from the same commit.
 This pull request is informational; close it once the release exists.
 EOF
-  number="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)"
+  number="$(gh pr list --repo "$REPO" --head "$branch" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)"
   if [[ -z "$number" ]]; then
-    gh pr create --base "$BASE" --head "$branch" \
+    gh pr create --repo "$REPO" --base "$BASE" --head "$branch" \
       --title "Sync upstream $tag into $BASE" --body-file "$body" >/dev/null \
       || printf 'warning: could not open the sync PR; the workflow run is the gate\n' >&2
   fi
@@ -272,7 +272,8 @@ else
   before="$(max_run_id "$CI_WF")" || fail "could not read $CI_WF runs"
   ci_ref="$BASE"
   [[ "$mode" == "sync" ]] && ci_ref="$branch"
-  gh workflow run "$CI_WF" --ref "$ci_ref" || fail "could not dispatch $CI_WF on $ci_ref"
+  gh workflow run "$CI_WF" --repo "$REPO" --ref "$ci_ref" \
+    || fail "could not dispatch $CI_WF on $ci_ref in $REPO"
   wait_for_run "$CI_WF" "$ci_ref" "$before" "custom-ci"
 fi
 
@@ -351,8 +352,8 @@ if [[ -z "$tag_label" ]]; then
 fi
 
 before="$(max_run_id "$REL_WF")" || fail "could not read $REL_WF runs"
-gh workflow run "$REL_WF" --ref "$tag_label" -f tag="$tag_label" \
-  || fail "could not dispatch $REL_WF on $tag_label"
+gh workflow run "$REL_WF" --repo "$REPO" --ref "$tag_label" -f tag="$tag_label" \
+  || fail "could not dispatch $REL_WF on $tag_label in $REPO"
 wait_for_run "$REL_WF" "$tag_label" "$before" "custom-release"
 
 echo "custom-sync: $tag -> $tag_label at $candidate (release published)"

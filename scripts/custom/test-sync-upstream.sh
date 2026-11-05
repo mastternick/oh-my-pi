@@ -10,8 +10,10 @@
 # release; retrying a tag whose release failed; merge conflicts; reusing or
 # refreshing a pre-existing sync branch without force-pushing or exiting early;
 # refusing to reuse a lightweight tag at the candidate; a release API outage that must
-# fail closed instead of reading as "no releases"; and a script argument that arrives
-# relative, as CI passes it.
+# fail closed instead of reading as "no releases"; workflow dispatch and PR commands
+# that must name the fork explicitly because gh otherwise resolves the upstream project
+# from this fork checkout; a dispatch rejected for missing permissions that must publish
+# nothing; and a script argument that arrives relative, as CI passes it.
 #
 #   test-sync-upstream.sh [path/to/sync-upstream.sh]
 set -uo pipefail
@@ -146,11 +148,43 @@ resolve_ref() { # branch-or-tag -> commit sha (annotated tags peel to their comm
 }
 
 cmd="${1:-}"; shift || true
+
+# gh resolves the repository from the checkout when --repo/-R is absent. In a fork
+# checkout that resolution can land on the upstream project, which is exactly the bug
+# these tests pin: only an explicit --repo may reach the fixture fork.
+trusted_repo="${FAKE_GH_REPO:?}"
+implicit_repo="${FAKE_GH_IMPLICIT_REPO:-$trusted_repo}"
+repo=""
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -R|--repo) repo="${2:-}"; shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+if (( ${#args[@]} )); then
+  set -- "${args[@]}"
+else
+  set --
+fi
+target_repo="${repo:-$implicit_repo}"
+
+require_trusted_repo() { # surface -> dies like gh when the target is not the fork
+  [[ "$target_repo" == "$trusted_repo" ]] && return 0
+  echo "fake gh: HTTP 404: $1 not found in $target_repo (https://api.github.com/repos/$target_repo)" >&2
+  exit 1
+}
+
 case "$cmd" in
   workflow)
     sub="${1:-}"; shift
     [[ "$sub" == "run" ]] || { echo "fake gh: unsupported workflow $sub" >&2; exit 1; }
     wf="${1:-}"; shift
+    require_trusted_repo "workflow $wf"
+    if [[ -n "${FAKE_GH_DENY_DISPATCH:-}" ]]; then
+      echo "HTTP 403: Resource not accessible by integration (https://api.github.com/repos/$target_repo/actions/workflows/$wf/dispatches)" >&2
+      exit 1
+    fi
     ref=""; input=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
@@ -179,7 +213,8 @@ case "$cmd" in
     echo $((id + 1)) > "$counter"
     jq --argjson id "$id" --arg path ".github/workflows/$wf" --arg event workflow_dispatch \
       --arg branch "$ref" --arg sha "$sha" --arg status "$status" --arg conclusion "$conclusion" \
-      '. + [{id:$id, path:$path, event:$event, head_branch:$branch, head_sha:$sha, status:$status, conclusion:$conclusion}]' \
+      --arg repo "$target_repo" \
+      '. + [{id:$id, path:$path, event:$event, head_branch:$branch, head_sha:$sha, status:$status, conclusion:$conclusion, repo:$repo}]' \
       "$runs" > "$runs.tmp"
     mv "$runs.tmp" "$runs"
     if [[ "$wf" == "custom-release.yml" && "$result" == "success" && -n "$input" ]]; then
@@ -191,6 +226,8 @@ case "$cmd" in
     ;;
   api)
     path="${1:-}"; shift
+    [[ "$path" == "repos/$trusted_repo/"* ]] \
+      || { echo "fake gh: HTTP 404: Not Found (https://api.github.com/$path)" >&2; exit 1; }
     jqf=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
@@ -235,6 +272,7 @@ case "$cmd" in
     ;;
   pr)
     sub="${1:-}"; shift
+    require_trusted_repo "pull request $sub"
     case "$sub" in
       list)
         head=""; jqf=""
@@ -292,6 +330,8 @@ run_sync() { # dir origin [tag] [ENV=VAL...]
       PATH="$tmp/bin:$PATH" \
       FAKE_GH_STATE="$dir/state" \
       FAKE_ORIGIN="$origin" \
+      FAKE_GH_REPO=mastternick/oh-my-pi \
+      FAKE_GH_IMPLICIT_REPO=can1357/oh-my-pi \
       GITHUB_STEP_SUMMARY="$dir/summary.md" \
       OMP_UPSTREAM_URL="$up" \
       OMP_SYNC_POLL=0.2 \
@@ -334,6 +374,22 @@ expect_eq "clean: sync branch pushed" \
   "$(git --git-dir="$origin" rev-parse --verify --quiet refs/heads/sync/upstream-v18.16.0 >/dev/null && echo yes || echo no)" "yes"
 expect_eq "clean: sync PR opened" "$(jq 'length' "$d/state/prs.json")" 1
 expect_contains "clean: reports the release" "$d/out.log" "release published"
+expect_eq "clean: both dispatches recorded in the fork" \
+  "$(count_runs "$d/state" '.repo == "mastternick/oh-my-pi"')" 2
+expect_eq "clean: nothing dispatched to upstream" \
+  "$(count_runs "$d/state" '.repo == "can1357/oh-my-pi"')" 0
+# The fixture only catches unqualified dispatches if gh's implicit resolution lands on
+# upstream here (as it did on the real fork checkout), so pin that the refusal is live.
+if (FAKE_GH_STATE="$d/state" FAKE_ORIGIN="$origin" FAKE_GH_REPO=mastternick/oh-my-pi \
+  FAKE_GH_IMPLICIT_REPO=can1357/oh-my-pi \
+  "$tmp/bin/gh" workflow run custom-ci.yml --ref custom) >"$d/unqualified.log" 2>&1; then
+  bad "clean: unqualified dispatch is refused" "it succeeded"
+else
+  ok "clean: unqualified dispatch is refused"
+fi
+expect_contains "clean: refusal names the upstream repo" "$d/unqualified.log" "can1357/oh-my-pi"
+expect_eq "clean: refused dispatch recorded no run" "$(jq 'length' "$d/state/runs.json")" 2
+expect_eq "clean: refused dispatch recorded no release" "$(jq 'length' "$d/state/releases.json")" 1
 
 # --- 2. red CI ---------------------------------------------------------------------
 d="$tmp/cases/ci-failure"; origin="$tmp/o-ci-failure.git"
@@ -536,7 +592,27 @@ expect_eq "release api outage on sync: no tag published" \
 expect_eq "release api outage on sync: no release dispatched" \
   "$(count_runs "$d/state" '.path == ".github/workflows/custom-release.yml"')" 0
 
-# --- 16. a relative script argument resolves before the runner cds ------------------
+# --- 16. a dispatch rejected for missing permissions publishes nothing -------------
+# gh can refuse a dispatch (403) after the merge and sync-branch push; that refusal must
+# fail the run without advancing custom, tagging, or creating a release.
+d="$tmp/cases/dispatch-denied"; origin="$tmp/o-dispatch-denied.git"
+new_origin "$origin" v18.15.0 sync
+before="$(custom_sha "$origin")"
+run_sync "$d" "$origin" v18.16.0 FAKE_GH_DENY_DISPATCH=1
+expect_rc "dispatch denied: exits non-zero" 1 "$RC"
+expect_eq "dispatch denied: custom unchanged" "$(custom_sha "$origin")" "$before"
+expect_eq "dispatch denied: no tag published" \
+  "$(git --git-dir="$origin" tag -l 'custom-v*' | wc -l | tr -d ' ')" 0
+expect_eq "dispatch denied: no run recorded" "$(jq 'length' "$d/state/runs.json")" 0
+expect_eq "dispatch denied: no release recorded" "$(jq 'length' "$d/state/releases.json")" 0
+expect_eq "dispatch denied: no release dispatched" \
+  "$(count_runs "$d/state" '.path == ".github/workflows/custom-release.yml"')" 0
+expect_contains "dispatch denied: error names the workflow and repo" "$d/out.log" \
+  "could not dispatch custom-ci.yml on sync/upstream-v18.16.0 in mastternick/oh-my-pi"
+expect_contains "dispatch denied: summary is actionable" "$d/summary.md" \
+  "could not dispatch custom-ci.yml"
+
+# --- 17. a relative script argument resolves before the runner cds ------------------
 # CI calls this suite as `scripts/custom/test-sync-upstream.sh scripts/custom/sync-upstream.sh`
 # from the repository root, and the runner cds into each fixture clone, so the argument
 # has to be absolute before the first cd. The nested run uses the resolution-only mode,

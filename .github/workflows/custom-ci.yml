@@ -32,6 +32,7 @@ jobs:
       - name: Custom script tests
         run: |
           scripts/custom/test-install-gate.sh
+          scripts/custom/test-bundle-verify.sh
           scripts/custom/test-sync-upstream.sh scripts/custom/sync-upstream.sh
           scripts/custom/test-omp-daily-update.sh scripts/custom/omp-daily-update.sh
       - name: Upstream full check

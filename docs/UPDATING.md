@@ -19,6 +19,7 @@ Scripts live in `scripts/custom/`. Run them from a checkout of the verified tag,
   5. re-fetch `custom`. If it moved to a commit that does not contain the tested one, fail without publishing and retry next cycle. Otherwise fast-forward `custom` to the tested commit (`git push`, never forced) and push the annotated tag `custom-v<X.Y.Z>-c<N>`; an existing tag for the same commit is reused;
   6. dispatch `custom-release.yml` on that tag and wait for it.
 - A conflict, a red, cancelled, or timed-out gate, or a `custom` that moved leaves `custom` and the release list untouched. The run fails and the reason is written to the job summary.
+- Every `gh` command names the repository explicitly: the API calls use `repos/<owner>/<repo>/...` paths and the workflow dispatches and sync PR use `--repo mastternick/oh-my-pi`. In a fork checkout `gh` can otherwise resolve the upstream project, where `custom-ci.yml` does not exist, and the run dies with `HTTP 404: workflow custom-ci.yml not found` instead of gating the fork.
 - Reruns are idempotent: the sync branch, a successful CI run for the same commit, the tag, and the release are reused instead of duplicated. A tag whose release failed is retried.
 - The sync PR exists for visibility; nothing depends on merging it.
 
@@ -44,7 +45,7 @@ Checks, in order. Nothing becomes `current` unless every check passes:
 2. That commit is an ancestor of `origin/custom`.
 3. A `custom-release.yml` run for that tag and commit has conclusion `success`, with event `push` or `workflow_dispatch` and `head_branch` equal to the tag, checked through the Actions API.
 4. The bundle matches `SHA256SUMS.txt` (`sha256sum -c`).
-5. The bundle is extracted into a staging directory and installed with `bun install --frozen-lockfile --ignore-scripts` using a private bun cache that is deleted afterwards. A shared cache could reuse an older same-version tarball (`18.12.6-c2` vs `18.12.6-c3`), so it is not used. The installed `@oh-my-pi` packages are then compared byte-for-byte with the bundle tarballs, and the staged copy must pass the packaged smoke test (`--version`, `--help`, `--smoke-test`).
+5. The bundle is extracted into a staging directory and installed with `bun install --frozen-lockfile --ignore-scripts` using a private bun cache that is deleted afterwards. A shared cache could reuse an older same-version tarball (`18.12.6-c2` vs `18.12.6-c3`), so it is not used. The installed `@oh-my-pi` packages are then compared byte-for-byte with the bundle tarballs, and the staged copy must pass the packaged smoke test (`--version`, `--help`, `--smoke-test`). Bun writes its own `node_modules/<pkg>/.bun-tag` integrity marker during that install; it is exempt from the file-by-file comparison but, when present, must equal the bundle tarball's sha512, so an install of another tarball still fails, while an installer that writes no marker is accepted.
 
 Only then does `versions/<label>` appear and `current` move to it.
 

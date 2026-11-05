@@ -47,6 +47,10 @@ omp_custom_install_bundle() {
 # Checks that every @oh-my-pi package the bundle declares as file:./<tgz> is installed byte-for-byte under
 # node_modules (files and symlink targets). Prints each mismatch to stderr. Returns 1 on any mismatch,
 # missing package, or empty declaration list.
+# bun installs from a tarball write their own marker, <pkg>/.bun-tag, holding the sha512 integrity of that
+# tarball; it is installer state, not package content (the installer replaces it even when a tarball ships
+# that path). The marker is therefore compared against the bundle tarball's integrity instead of the packed
+# files, so an install of a different or stale tarball still fails. Only the package root is exempt.
 # usage: omp_custom_bundle_matches <install-dir>
 omp_custom_bundle_matches() {
   # shellcheck disable=SC2016 # the node program is single-quoted on purpose
@@ -65,6 +69,8 @@ const tree = root => {
 		for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
 			const full = path.join(current, entry.name);
 			const rel = path.relative(root, full);
+			// installer-owned marker written at the package root; its content is the tarball integrity checked below
+			if (rel === ".bun-tag") continue;
 			// a nested node_modules holds the deps of other packages, not the files of this package
 			if (entry.isDirectory()) { if (entry.name !== "node_modules") walk(full); }
 			else if (entry.isSymbolicLink()) out.set(rel, `symlink:${fs.readlinkSync(full)}`);
@@ -90,6 +96,12 @@ try {
 		const got = tree(installed);
 		const differ = [...new Set([...want.keys(), ...got.keys()])].filter(file => want.get(file) !== got.get(file));
 		if (differ.length > 0) bad.push(`${name}: ${differ.length} file(s) differ from ${spec.slice("file:./".length)}, first: ${differ[0]}`);
+		const marker = path.join(installed, ".bun-tag");
+		if (fs.existsSync(marker)) {
+			const integrity = `sha512-${crypto.createHash("sha512").update(fs.readFileSync(tarball)).digest("base64")}`;
+			const tagged = fs.readFileSync(marker, "utf8").trim();
+			if (tagged !== integrity) bad.push(`${name}: .bun-tag is ${tagged}, but ${spec.slice("file:./".length)} has integrity ${integrity}`);
+		}
 	}
 } finally {
 	fs.rmSync(tmp, { recursive: true, force: true });

@@ -16,6 +16,8 @@
 
 ### Fixed
 
+- `custom-sync` passes `--repo mastternick/oh-my-pi` to both workflow dispatches and to the sync PR lookup and creation. A fork checkout made `gh` resolve the upstream project, so the CI gate died after a successful merge with `HTTP 404: workflow custom-ci.yml not found`; a dispatch refused for permissions still fails the run without advancing `custom`, tagging, or releasing.
+- Bundle verification no longer fails on Bun's own `node_modules/<pkg>/.bun-tag` marker: it is excluded from the byte-for-byte file comparison and, when present, must equal the sha512 integrity of the bundle tarball (an installer that writes no marker is tolerated), so an install of a stale or different tarball still fails while every packaged file, checksum, attestation, and smoke check is unchanged.
 - Reinstalling an already installed `omp-custom` release no longer repoints `previous` at `current`; the rollback target stays distinct, so `rollback.sh` still works after a same-tag reinstall.
 - `/memory enqueue` no longer captures a raw transcript when `mnemopi.autoRetain` is off. Manual consolidation now passes the configured auto-retention setting to `consolidate()`, matching disposal. Explicit `xd://retain` and `/memory` writes are unchanged, and `autoRetain: true` still retains the transcript on enqueue.
 - Mnemopi startup no longer promotes working memory into regex episodes unless `mnemopi.autoRetain` is on. Only auto-retained transcripts need that pass before their 24h trim, so with auto-retention off, session start no longer rewrites explicit memories.

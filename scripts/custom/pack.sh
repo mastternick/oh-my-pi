@@ -24,7 +24,7 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/tarballs" "$work/bundle"
 
-(cd "$root" && bun run gen:tool-views && bun scripts/ci-release-publish.ts --pack-only "$work/tarballs")
+(cd "$root" && bun scripts/ci-release-publish.ts --pack-only "$work/tarballs")
 
 for tgz in "$work"/tarballs/*.tgz; do omp_custom_check_deps "$tgz"; done
 

@@ -10,7 +10,7 @@ This is an **unofficial** fork of [can1357/oh-my-pi](https://github.com/can1357/
 
 ## License
 
-The project is MIT-licensed. The upstream `LICENSE` and `THIRD-PARTY-NOTICES.txt` are kept verbatim and must stay in every release. Modifications made in this fork are offered under the same MIT terms.
+The project is MIT-licensed. The upstream `LICENSE` is kept verbatim and must stay in every release; the per-package `THIRD-PARTY-NOTICES.txt` files are carried as upstream ships them (upstream 18.16.0 dropped the repo-root copy). Modifications made in this fork are offered under the same MIT terms.
 
 ## What the fork adds
 

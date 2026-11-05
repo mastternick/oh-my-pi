@@ -81,5 +81,5 @@ journalctl --user -u omp-daily-update.service
 ## Notes
 
 - `omp update` is not used on the custom channel. Upgrade by installing a newer tag.
-- Requires bun ≥ 1.4 (`packageManager` floor in `package.json`). CI pins 1.4.2.
+- Requires bun ≥ 1.4.4 (`packageManager` floor in `package.json`). CI pins 1.4.4.
 - Requires `gh` with `api` and `release` support, and `git`. `gh attestation` is not needed to install.

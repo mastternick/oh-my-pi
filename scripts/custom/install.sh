@@ -41,7 +41,7 @@ asset="omp-custom-$label.tgz"
 for cmd in bun git gh sha256sum; do
   command -v "$cmd" >/dev/null || die "missing required command: $cmd"
 done
-[[ "$(printf '%s\n' "$(bun --version)" 1.4 | sort -V | head -n1)" == "1.4" ]] || die "bun >= 1.4 required (package.json packageManager floor)"
+[[ "$(printf '%s\n' "$(bun --version)" 1.4.4 | sort -V | head -n1)" == "1.4.4" ]] || die "bun >= 1.4.4 required (package.json packageManager floor)"
 
 mkdir -p "$ROOT"/{source,downloads,versions,state}
 omp_custom_lock "$ROOT"

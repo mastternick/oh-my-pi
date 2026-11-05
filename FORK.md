@@ -10,10 +10,10 @@ The `coding-agent-native` CI job keeps the existing timing limit and retries onl
 
 ## Provenance
 
-- Current upstream baseline: `can1357/oh-my-pi` tag `v18.12.6`, commit `45c35e40c46166dc726ccc52f5d27f40f2449f99`.
+- Current upstream baseline: `can1357/oh-my-pi` tag `v18.16.0`, commit `650f3a108229ee11bf68ba3377f4e8c3391cd424`.
 - Snapshot history: the initial customization audit was against installed `@oh-my-pi/*` 18.10.3 packages, applied onto upstream `v18.10.3` commit `81e1d8927a3c16cfaff2e9456baa8c060e1e0e9b`. That historical snapshot is not the current baseline.
 - The `v18.12.6` port keeps upstream `package.json` files as-is; publish-only rewrites from installed packages are not carried. See "Port to upstream v18.12.6" and "Verification status".
-- License: MIT. `LICENSE` and `THIRD-PARTY-NOTICES.txt` are retained unchanged from upstream.
+- License: MIT. `LICENSE` is retained unchanged from upstream. Upstream 18.16.0 no longer keeps a repo-root `THIRD-PARTY-NOTICES.txt`; the notices ship per package (`packages/coding-agent`, `packages/natives`, `python/robomp`).
 
 ## Scope of this snapshot
 
@@ -38,8 +38,6 @@ Classification:
 
 - **Custom source (manifest):** the 46 coding-agent entries, the agent, ai, catalog, and mnemopi entries, and `tui/src/overlays/agent-hub.ts`. Groups are listed below.
 - **Custom source (not in manifest):** `tui/src/overlays/agent-hub-judge.ts` (new). Its consumer is `coding-agent/src/modes/agent-hub-judge-source.ts`.
-- **Typecheck-only stubs (carried, do not treat as source of truth):** `coding-agent/src/export/html/template.d.ts` and `tool-views.generated.d.ts`. Both are the same one-line `declare const path: string; export default path;` shim.
-- **Generated, excluded:** `coding-agent/src/export/html/tool-views.generated.js`.
 - **Source-only divergence (not in the installed package):** `coding-agent/src/main.ts` and `coding-agent/src/cli/update-cli.ts`. The startup update check resolves the `omp` path on `PATH` before calling `managedInstallName`, and `resolveOmpPath` is exported. Requested to suppress the update nag under the custom launcher. **Unverified.**
 - **Typecheck workaround, not carried as separate source:** `catalog/src/effort.ts` (`const enum` → `enum`). It is in the commit because it is manifest-owned. Upstream 18.12.6 still has `const enum Effort`. Port only if monorepo typecheck needs it.
 
@@ -47,7 +45,7 @@ Non-src files compared against the installed package:
 
 - `coding-agent/CHANGELOG.md`: the installed file differs from upstream by 10 added lines, all in a new `[Unreleased]` section (one Added and three Fixed bullets). This section is now carried. The bullets are documentation. The Judge view is backed by `tui/src/overlays/agent-hub-judge.ts`. The mnemopi autoRetain and IMPORTED-tag behavior is backed by manifest rows in `coding-agent/src/mnemopi/`.
 - `package.json` (every package): publish transforms (`types`/`main`/`bin` pointing at `dist/`, `files` additions). Not carried.
-- `THIRD-PARTY-NOTICES.txt` appears only in the installed package. Upstream keeps `THIRD-PARTY-NOTICES.txt` at the repo root, which is carried.
+- `THIRD-PARTY-NOTICES.txt` appears only in the installed package. Upstream 18.16.0 removed the repo-root copy; the packaged file comes from `packages/coding-agent/THIRD-PARTY-NOTICES.txt`, which is carried as upstream ships it.
 - `dist/`: excluded.
 
 ## Excluded artifacts (never publish)
@@ -67,7 +65,7 @@ Group names match the local stage manifest (`judgment`, `session`, `experience`,
 | Group | Files |
 |---|---|
 | tool-loop | `agent/src/agent-loop.ts`, `ai/src/providers/openai-completions.ts`, `ai/src/utils/tool-call-loop-guard.ts`, `ai/acceptance/provider-tool-name.test.ts` |
-| typefix | `catalog/src/effort.ts`, `coding-agent/src/config/{model-presets,settings}.ts`, `coding-agent/src/export/html/template.d.ts`, `coding-agent/src/export/html/tool-views.generated.d.ts`, `coding-agent/src/lsp/workspace-diagnostics.ts`, `coding-agent/src/modes/controllers/selector-controller.ts`, `coding-agent/src/session/agent-session.ts` |
+| typefix | `catalog/src/effort.ts`, `coding-agent/src/config/{model-presets,settings}.ts`, `coding-agent/src/lsp/workspace-diagnostics.ts`, `coding-agent/src/modes/controllers/selector-controller.ts`, `coding-agent/src/session/agent-session.ts` |
 | judgment | `coding-agent/src/{auto-thinking/classifier,eval/judgment-bridge,judgment/index,modes/agent-hub-judge-source,modes/types,session/model-controls,session/session-manager,session/turn-recovery,session/unexpected-stop-classifier,slash-commands/builtin-session,tools/jfind/index}.ts`, `coding-agent/src/modes/controllers/selector-controller.ts`, `coding-agent/src/session/agent-session.ts` |
 | judgment (tui overlay, not in manifest) | `tui/src/overlays/agent-hub.ts` (modified), `tui/src/overlays/agent-hub-judge.ts` (new) |
 | identity | `coding-agent/src/mnemopi/{config,project-identity,project-identity.test}.ts` |
@@ -110,7 +108,7 @@ Source-only divergence: `coding-agent/src/cli/update-cli.ts` (see above). `codin
 
 ## Generated inputs required for a clean build
 
-- `packages/collab-web`: `bun --cwd=packages/collab-web run gen:tool-views` writes `packages/coding-agent/src/export/html/tool-views.generated.js`. The checked-in `tool-views.generated.d.ts` stub lets typecheck pass without it.
+- HTML export: upstream 18.16.0 uses the assets under `packages/coding-agent/src/export/html/`; the removed `gen:tool-views` command and declaration stubs are no longer required.
 - Docs index: generated by `coding-agent/scripts/generate-docs-index.ts` during `gen:bundle`. It reads repo `docs/`, not the installed package.
 - Stats client: `bun --cwd=packages/stats run gen:stats`.
 

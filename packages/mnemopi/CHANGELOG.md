@@ -16,6 +16,24 @@
 
 - Fixed dense-only recall dropping semantically matching memories that share no lexical token with the query. The 0.65 cosine gate applied to every embedding model, and nemotron and pplx embeddings score relevant passages around 0.3 to 0.5. Models with a calibrated floor now pass dense-only hits at or above it in both linear recall and the polyphonic vector voice: `nvidia/nemotron-3.5-embed-1b:free` and `nvidia/nemotron-3-embed-1b:free` at 0.18, `perplexity/pplx-embed-v1-0.6b` at 0.28. Other models keep 0.65. Lexical and FTS-matched ranking is unchanged.
 - Fixed Romanian function words (`pentru`, `de`, `cum`, `după`, ...) counting as keyword query terms, so memories sharing only those words ranked as lexical hits above correct results. Romanian function words are now stopwords in both plain and diacritic forms; English stopword behavior is unchanged.
+## [18.14.2] - 2026-10-31
+
+### Fixed
+
+- Fixed heuristic episodic facts storing word fragments (`Drafting is active.` → `ctive`), truncated multiword objects, or nothing for `has an …` sentences ([#17511](https://github.com/can1357/oh-my-pi/issues/17511))
+
+## [18.13.3] - 2026-10-28
+
+### Changed
+
+- Updated Bun engine requirement to ≥1.4.4
+
+## [18.13.2] - 2026-10-27
+
+### Fixed
+
+- Fixed local embeddings using one spinning CPU thread per core, so a single recall query cost several CPU-seconds on a many-core machine ([#17109](https://github.com/can1357/oh-my-pi/pull/17109) by [@sjawhar](https://github.com/sjawhar))
+
 ## [18.13.0] - 2026-10-26
 
 ### Fixed

@@ -29,6 +29,11 @@ jobs:
           for f in scripts/custom/*.sh; do bash -n "$f"; done
       - name: Shellcheck
         run: shellcheck -x scripts/custom/*.sh scripts/custom/launcher/omp
+      - name: Custom script tests
+        run: |
+          scripts/custom/test-install-gate.sh
+          scripts/custom/test-sync-upstream.sh scripts/custom/sync-upstream.sh
+          scripts/custom/test-omp-daily-update.sh scripts/custom/omp-daily-update.sh
       - name: Upstream full check
         run: bun run ci:check:full
   test:

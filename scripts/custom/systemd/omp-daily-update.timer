@@ -1,10 +1,15 @@
 [Unit]
 Description=Run the omp-custom daily release installer
-Documentation=file:%h/tmp/omp-daily-update/README.md
+Documentation=https://github.com/mastternick/oh-my-pi/blob/custom/docs/UPDATING.md
 
 [Timer]
-# Daily at 05:40 local time; RandomizedDelaySec spreads the load across a
-# two-hour window so a resume-from-suspend burst does not hit GitHub at once.
+# Daily at 05:40 local time, plus up to two hours of jitter. The sync publishes at
+# 06:17 UTC, so whether a release is installed on the same local day depends on the
+# machine's UTC offset; a release this window misses is installed by the next daily
+# cycle, and Persistent=true also fires a run missed while the machine was off.
+# RandomizedDelaySec spreads the load across a two-hour window so a resume-from-suspend
+# burst does not hit GitHub at once. Persistent=true catches up after downtime, and the
+# updater is idempotent, so a run without a new release only checks for one.
 OnCalendar=*-*-* 05:40:00
 RandomizedDelaySec=2h
 Persistent=true

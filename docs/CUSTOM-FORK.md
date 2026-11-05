@@ -16,7 +16,7 @@ The project is MIT-licensed. The upstream `LICENSE` is kept verbatim and must st
 
 - `scripts/custom/launcher/omp`: a self-locating tmux launcher wrapper. Its data directory is set by `OMP_LAUNCHER_DIR`, and the preset-fallback guard is off unless `OMP_LAUNCHER_PFB_ENSURE` is set.
 - `scripts/custom/`: pack, smoke, privacy, sync, install, and rollback tooling.
-- `.github/workflows/custom-*.yml`: CI, tag-driven release with build attestation, and weekly upstream sync PRs. `custom` is the default branch, so scheduled sync runs from it.
+- `.github/workflows/custom-*.yml`: CI, tag-driven release with build attestation, and a daily upstream sync that fast-forwards `custom`, tags, and dispatches the release once CI passes on the exact commit. `custom` is the default branch, so scheduled sync runs from it.
 - `docs/`: this file, `UPDATING.md` (operator runbook), and `PRIVACY.md` (what is never published).
 
 ## Not included

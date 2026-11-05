@@ -135,3 +135,19 @@ omp_custom_lock() {
   exec 9>"$1/.lock"
   flock -n 9 || die "another omp-custom install or rollback is running"
 }
+
+# Counts trusted release runs in a workflow-runs JSON document. A trusted run ran the
+# release workflow, tested exactly <commit>, completed successfully, and was triggered
+# by a push of <tag> or by a dispatch whose ref tip is <tag>. Schedule/PR runs, other
+# workflows, other commits, and non-successful conclusions do not count.
+# usage: omp_custom_trusted_release_runs <runs-json> <tag> <commit> <workflow-file>
+omp_custom_trusted_release_runs() {
+  # shellcheck disable=SC2016 # the jq program is single-quoted on purpose
+  jq -r --arg tag "$2" --arg commit "$3" --arg wf "$4" '
+    [ .workflow_runs[]?
+      | select(.path == (".github/workflows/" + $wf))
+      | select(.head_sha == $commit)
+      | select(.status == "completed" and .conclusion == "success")
+      | select((.event == "push" or .event == "workflow_dispatch") and .head_branch == $tag)
+    ] | length' <<<"$1"
+}

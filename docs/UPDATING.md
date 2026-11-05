@@ -9,17 +9,26 @@ Scripts live in `scripts/custom/`. Run them from a checkout of the verified tag,
 
 ## Sync upstream
 
-- `custom-sync.yml` runs weekly on the default branch and on `workflow_dispatch` with an optional `upstream_tag` (`vX.Y.Z`).
-- It merges the upstream stable tag into `sync/upstream-<tag>` with `--no-ff`, opens a PR against `custom`, and dispatches `custom-ci` on the sync branch with `gh workflow run custom-ci.yml --ref <branch>`. PRs opened with `GITHUB_TOKEN` do not trigger `pull_request` workflows, so this dispatch is the CI trigger.
-- A merge conflict fails the job. Resolve it locally on a branch and open the PR by hand.
-- The job never pushes to `custom` or `main`, never force-pushes, and never merges the PR.
+- `custom-sync.yml` runs daily at 06:17 UTC from the default branch, and on `workflow_dispatch` with an optional `upstream_tag` (`vX.Y.Z`; empty means newest stable) and `force_release`.
+- The workflow needs `contents: write`, `pull-requests: write`, and `actions: write`: it dispatches CI and the release workflow with the job token. Tags pushed with `GITHUB_TOKEN` do not start workflows, which is why the release is dispatched explicitly. Runs are serialized by a `custom-sync` concurrency group.
+- `scripts/custom/sync-upstream.sh` performs the whole cycle:
+  1. resolve the upstream stable tag (newest `v*`, or the requested one);
+  2. if that version is already merged into `custom` and a published `custom-v<X.Y.Z>-c<N>` release contains it, stop: there is nothing to do. `force_release=1` instead publishes a new `c<N>` for the current `custom` HEAD, which is how an already-merged version that never got a release is published;
+  3. otherwise merge the tag into `sync/upstream-<tag>` with `--no-ff`. An existing remote branch is reused and updated, so manually resolved commits are kept; a branch that no longer relates to `custom` is refreshed onto the current base;
+  4. dispatch `custom-ci` on that exact commit and wait for it (bounded by `OMP_SYNC_TIMEOUT`, default 7200 s, polling `OMP_SYNC_POLL`, default 30 s). Only a `success` run of `custom-ci.yml` whose `head_sha` is the tested commit and whose `head_branch` is the ref it was dispatched on counts: the sync branch in this case, `custom` in the already-merged recovery of step 2;
+  5. re-fetch `custom`. If it moved to a commit that does not contain the tested one, fail without publishing and retry next cycle. Otherwise fast-forward `custom` to the tested commit (`git push`, never forced) and push the annotated tag `custom-v<X.Y.Z>-c<N>`; an existing tag for the same commit is reused;
+  6. dispatch `custom-release.yml` on that tag and wait for it.
+- A conflict, a red, cancelled, or timed-out gate, or a `custom` that moved leaves `custom` and the release list untouched. The run fails and the reason is written to the job summary.
+- Reruns are idempotent: the sync branch, a successful CI run for the same commit, the tag, and the release are reused instead of duplicated. A tag whose release failed is retried.
+- The sync PR exists for visibility; nothing depends on merging it.
+
+Prerequisite: branch protection on `custom`, if enabled, must let the Actions token push to it. Otherwise the fast-forward is rejected and the run fails without publishing.
 
 ## Gate and release
 
-1. Merge the sync PR once `custom-ci` passes: privacy gate, shell checks, `bun run ci:check:full`, and pack plus smoke.
-2. Create an annotated tag on the `custom` commit and push it:
-   `git tag -a custom-v<X.Y.Z>-c<N> -m "omp-custom <X.Y.Z> c<N>" <commit>` then `git push origin custom-v<X.Y.Z>-c<N>`.
-3. `custom-release.yml` runs on the tag. It re-runs CI, checks that the tag is on `custom`, packs the bundle `omp-custom-<X.Y.Z>-c<N>.tgz`, writes `SHA256SUMS.txt` for that bundle, creates the GitHub release with `--verify-tag`, and attests the bundle and checksums with `actions/attest-build-provenance`. The attestation is extra evidence. The installer does not require it.
+`custom-release.yml` runs on a tag push and on `workflow_dispatch` with a required `tag` input. Its `validate` job rejects a dispatch unless the ref is `refs/tags/<tag>`, the input equals the ref name, the tag is annotated, its commit is `GITHUB_SHA`, and that commit is on `custom`. It then re-runs CI, packs `omp-custom-<X.Y.Z>-c<N>.tgz`, writes `SHA256SUMS.txt` for that bundle, creates or updates the GitHub release with `--verify-tag`, and attests the bundle and checksums with `actions/attest-build-provenance`. A rerun uploads the assets with `--clobber` instead of failing on an existing release. The attestation is extra evidence. The installer does not require it.
+
+The manual path still works: create the annotated tag on a `custom` commit and push it.
 
 The bundle holds `package.json`, `bun.lock`, and the packed workspace packages of `coding-agent`, `agent`, `ai`, `catalog`, `mnemopi`, and `tui`. `@oh-my-pi/pi-natives` is not bundled. It is installed from npm at the pinned version, because it is unmodified.
 
@@ -33,7 +42,7 @@ Checks, in order. Nothing becomes `current` unless every check passes:
 
 1. The tag resolves to a commit through the GitHub API. `git` in the local clone must resolve the same commit.
 2. That commit is an ancestor of `origin/custom`.
-3. The `custom-release.yml` run for that tag and commit has conclusion `success`, checked through the Actions API.
+3. A `custom-release.yml` run for that tag and commit has conclusion `success`, with event `push` or `workflow_dispatch` and `head_branch` equal to the tag, checked through the Actions API.
 4. The bundle matches `SHA256SUMS.txt` (`sha256sum -c`).
 5. The bundle is extracted into a staging directory and installed with `bun install --frozen-lockfile --ignore-scripts` using a private bun cache that is deleted afterwards. A shared cache could reuse an older same-version tarball (`18.12.6-c2` vs `18.12.6-c3`), so it is not used. The installed `@oh-my-pi` packages are then compared byte-for-byte with the bundle tarballs, and the staged copy must pass the packaged smoke test (`--version`, `--help`, `--smoke-test`).
 
@@ -48,15 +57,19 @@ The existing launcher is kept. The installer:
 - rewrites `OMP_REAL_BIN` to `current/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js` (stable across upgrades) and `OMP_REAL_RUNNER` to the bun path;
 - sets `OMP_PFB_GUARD_SKIP=1` to disable the legacy preset-fallback guard, which patches `~/node_modules` and is not used by the custom channel.
 
+The installer also refreshes the deployed tooling from the installed tag: `scripts/custom/*.sh` and `launcher/` into `~/.local/libexec/omp-custom/`, `omp-daily-update.sh` into `~/.local/bin/`, and the systemd units into `~/.config/systemd/user/`, then runs `systemctl --user daemon-reload` when a user session is available. Files missing from an older tag are skipped, so old releases stay installable.
+
+Bootstrap: an install deployed before this change keeps running the previously deployed updater and timer, which never refresh themselves. Run `scripts/custom/install.sh --tag custom-v<X.Y.Z>-c<N>` once from a tag that carries the new installer; from then on each install refreshes the deployed tooling, so later releases reach the new updater and the single-slot timer without manual steps.
+
 `~/.local/bin/omp` and `~/.bun/bin/omp` are repointed at the launcher. Original entrypoint links are recorded in `state/entrypoints.tsv`. The installer refuses to replace an entrypoint that is a regular file.
 
 Sessions already running keep the binary they started with until they exit. New sessions use `current`.
 
 ## Daily update
 
-`scripts/custom/omp-daily-update.sh` installs the newest published `custom-v*` release once a day. It never merges, tags, or publishes. The systemd user units are `scripts/custom/systemd/omp-daily-update.service` and `omp-daily-update.timer`.
+`scripts/custom/omp-daily-update.sh` installs the newest published `custom-v*` release. The timer runs it once a day; a run with nothing new to install only checks and exits. It never merges, tags, or publishes. The systemd user units are `scripts/custom/systemd/omp-daily-update.service` and `omp-daily-update.timer`.
 
-- The timer fires at 05:40 with up to a 2 h random delay (`OnCalendar=*-*-* 05:40:00`, `RandomizedDelaySec=2h`, `Persistent=true`).
+- The timer fires once a day, at 05:40 local time, with up to a 2 h random delay (`OnCalendar=*-*-* 05:40:00`, `RandomizedDelaySec=2h`, `Persistent=true`). The timer runs on local time while the sync publishes at 06:17 UTC, so whether a release is installed on the same day depends on the machine's UTC offset; a release the window misses is installed by the next daily cycle, and `Persistent=true` also fires a run missed while the machine was off.
 - Discovery reads every release page and picks the newest non-draft, non-prerelease `custom-v*` tag by semver.
 - If that tag is already `current`, the run does nothing. A tag older than `current` is refused.
 - A run is refused when free space on the install root is below `OMP_DAILY_MIN_FREE` (default 1.5 GiB).

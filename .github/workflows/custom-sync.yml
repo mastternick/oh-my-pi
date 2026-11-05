@@ -10,20 +10,33 @@ on:
         description: 'Upstream stable tag (vX.Y.Z). Empty = newest stable tag.'
         required: false
         default: ''
+      force_release:
+        description: 'Release the current custom HEAD even if this upstream version is already released.'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
   pull-requests: write
+  actions: write
+
+# One sync at a time: a second run must not race the gate or the custom branch.
+concurrency:
+  group: custom-sync
+  cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
     env:
       GH_TOKEN: ${{ github.token }}
       UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+      OMP_SYNC_FORCE_RELEASE: ${{ inputs.force_release && '1' || '0' }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
-      - name: Open upstream sync PR
+      - name: Sync, gate, fast-forward, tag, and release
         run: scripts/custom/sync-upstream.sh

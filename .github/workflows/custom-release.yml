@@ -3,18 +3,87 @@ name: custom-release
 on:
   push:
     tags: ['custom-v*']
+  # GITHUB_TOKEN-created tags do not trigger push workflows, so custom-sync dispatches
+  # this workflow explicitly for the exact tag it pushed.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (custom-vX.Y.Z-cN); must match the dispatched tag ref.'
+        required: true
 
 permissions:
   contents: read
 
+# One attempt per tag: two overlapping runs would interleave the --clobber uploads and
+# publish assets from different builds, so runs for a tag are queued, not cancelled
+# (cancel-in-progress: false) — the last queued attempt still has to publish. A push
+# carries no tag input, so grouping falls back to the ref name; validate already rejects
+# a dispatch whose input differs from the dispatched tag.
+concurrency:
+  group: custom-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      label: ${{ steps.check.outputs.label }}
+    env:
+      EVENT_NAME: ${{ github.event_name }}
+      INPUT_TAG: ${{ inputs.tag }}
+      REF: ${{ github.ref }}
+      REF_NAME: ${{ github.ref_name }}
+      SHA: ${{ github.sha }}
+    steps:
+      - name: Require an explicit release tag identity
+        id: check
+        run: |
+          set -euo pipefail
+          tag="$REF_NAME"
+          case "$EVENT_NAME" in
+            push) ;;
+            workflow_dispatch)
+              [[ -n "$INPUT_TAG" ]] \
+                || { echo "::error::workflow_dispatch requires the tag input"; exit 1; }
+              [[ "$INPUT_TAG" == "$tag" ]] \
+                || { echo "::error::tag input '$INPUT_TAG' does not match the dispatched ref '$tag'"; exit 1; }
+              ;;
+            *) echo "::error::unsupported event $EVENT_NAME"; exit 1 ;;
+          esac
+          [[ "$REF" == "refs/tags/$tag" ]] || { echo "::error::$REF is not a tag ref"; exit 1; }
+          [[ "$tag" =~ ^custom-v[0-9]+\.[0-9]+\.[0-9]+-c[0-9]+$ ]] \
+            || { echo "::error::$tag is not a custom release tag"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "label=${tag#custom-v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+      - name: Require an annotated tag on the trusted custom commit
+        env:
+          TAG: ${{ steps.check.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet --force origin '+refs/tags/*:refs/tags/*'
+          git fetch --quiet origin '+refs/heads/custom:refs/remotes/origin/custom'
+          [[ "$(git cat-file -t "refs/tags/$TAG")" == "tag" ]] \
+            || { echo "::error::$TAG is not an annotated tag"; exit 1; }
+          [[ "$(git rev-parse "refs/tags/$TAG^{commit}")" == "$SHA" ]] \
+            || { echo "::error::tag commit does not match the run commit"; exit 1; }
+          git merge-base --is-ancestor "$SHA" origin/custom \
+            || { echo "::error::tag commit is not on custom"; exit 1; }
+
   ci:
+    needs: validate
     uses: ./.github/workflows/custom-ci.yml
     permissions:
       contents: read
 
   release:
-    needs: ci
+    needs: [validate, ci]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -22,16 +91,12 @@ jobs:
       attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.validate.outputs.tag }}
+      LABEL: ${{ needs.validate.outputs.label }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
-      - name: Require tag on custom
-        run: |
-          git fetch --quiet origin '+refs/heads/custom:refs/remotes/origin/custom'
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/custom \
-            || { echo "tag commit is not on custom"; exit 1; }
-          echo "LABEL=${GITHUB_REF_NAME#custom-v}" >> "$GITHUB_ENV"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.4
@@ -56,9 +121,19 @@ jobs:
             dist/SHA256SUMS.txt
       - name: Publish release
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            "dist/omp-custom-$LABEL.tgz" \
-            dist/SHA256SUMS.txt \
-            --verify-tag \
-            --title "omp-custom $LABEL" \
-            --notes "Unofficial fork of can1357/oh-my-pi. See docs/CUSTOM-FORK.md."
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A previous attempt already created the release: upload the freshly built
+            # assets over it instead of failing, and make sure it is published.
+            gh release upload "$TAG" "dist/omp-custom-$LABEL.tgz" dist/SHA256SUMS.txt --clobber
+            if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" == "true" ]]; then
+              gh release edit "$TAG" --draft=false
+            fi
+          else
+            gh release create "$TAG" \
+              "dist/omp-custom-$LABEL.tgz" \
+              dist/SHA256SUMS.txt \
+              --verify-tag \
+              --title "omp-custom $LABEL" \
+              --notes "Unofficial fork of can1357/oh-my-pi. See docs/CUSTOM-FORK.md."
+          fi

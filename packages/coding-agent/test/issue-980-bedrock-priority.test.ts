@@ -1,11 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import {
-	resolveCliModel,
-	resolveModelFromSettings,
-	resolveModelRoleValue,
-} from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { resolveCliModel, resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 
 function model(provider: string, id: string): Model<"anthropic-messages"> {
@@ -30,9 +26,9 @@ describe("issue #980 provider-qualified model resolution", () => {
 			modelRoles: { default: "anthropic/claude-3-7-sonnet" },
 		});
 
-		const resolved = resolveModelFromSettings({ settings, availableModels });
-		expect(resolved?.provider).toBe("anthropic");
-		expect(resolved?.id).toBe("claude-3-7-sonnet");
+		const roleResolved = resolveModelRoleValue(settings.getModelRole("default"), availableModels, { settings });
+		expect(roleResolved.model?.provider).toBe("anthropic");
+		expect(roleResolved.model?.id).toBe("claude-3-7-sonnet");
 	});
 
 	test("does not silently fall back to bedrock when a provider-qualified role misses", () => {
@@ -44,9 +40,6 @@ describe("issue #980 provider-qualified model resolution", () => {
 		const roleValue = settings.getModelRole("default");
 		const roleResolved = resolveModelRoleValue(roleValue, availableModels, { settings });
 		expect(roleResolved.model).toBeUndefined();
-
-		const settingsResolved = resolveModelFromSettings({ settings, availableModels });
-		expect(settingsResolved).toBeUndefined();
 
 		const cliResolved = resolveCliModel({
 			cliModel: "anthropic/claude-3-7-sonnet",

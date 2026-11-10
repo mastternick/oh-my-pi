@@ -3,8 +3,8 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model, ModelKind } from "@oh-my-pi/pi-catalog/types";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
-	expandDefaultRetryFallbackChains,
 	findRetryFallbackCandidates,
+	getRetryFallbackChains,
 	type RetryFallbackResolutionContext,
 	parseRetryFallbackSelector,
 	resolveRetryFallbackChainKey,
@@ -34,7 +34,7 @@ function createContext(
 }
 
 describe("retry fallback selector resolution", () => {
-	it("resolves chain keys by exact model, longest wildcard, role, then default", () => {
+	it("resolves chain keys by exact model, then longest wildcard, then the hinted role", () => {
 		const selector = "openrouter/google/gemini-3.5-flash";
 		const exactContext = createContext(
 			{
@@ -65,11 +65,16 @@ describe("retry fallback selector resolution", () => {
 		);
 		expect(resolveRetryFallbackChainKey(roleContext, selector, undefined, "task")).toBe("task");
 
+		// Without a role identity only model-oriented keys apply: no terminal default.
 		const defaultContext = createContext({ default: ["openai/gpt-4o-mini"] });
-		expect(resolveRetryFallbackChainKey(defaultContext, selector)).toBe("default");
+		expect(resolveRetryFallbackChainKey(defaultContext, selector)).toBeUndefined();
+		// The default chain stays reachable through the default identity itself.
+		expect(resolveRetryFallbackChainKey(defaultContext, selector, undefined, "default")).toBeUndefined();
+		const assignedDefault = createContext({ default: ["openai/gpt-4o-mini"] }, { default: selector });
+		expect(resolveRetryFallbackChainKey(assignedDefault, selector, undefined, "default")).toBe("default");
 	});
 
-	it("does not let a later shared-assignment role steal the default chain", () => {
+	it("never selects another role's chain because it shares the live model", () => {
 		const selector = "openrouter/google/gemini-3.5-flash";
 		const context = createContext(
 			{
@@ -78,9 +83,14 @@ describe("retry fallback selector resolution", () => {
 			},
 			{ default: selector, vision: selector },
 		);
-		expect(resolveRetryFallbackChainKey(context, selector)).toBe("default");
+		// No hint: neither shared assignment is eligible.
+		expect(resolveRetryFallbackChainKey(context, selector)).toBeUndefined();
+		// A hint still wins for its own role, and only its own chain is returned.
 		expect(resolveRetryFallbackChainKey(context, selector, undefined, "default")).toBe("default");
 		expect(resolveRetryFallbackChainKey(context, selector, undefined, "vision")).toBe("vision");
+		expect(findRetryFallbackCandidates(context, "vision", selector).map(candidate => candidate.raw)).toEqual([
+			"openai/gpt-4o-mini",
+		]);
 	});
 
 	it("uses a hinted role chain when its unqualified primary cannot resolve", () => {
@@ -157,17 +167,37 @@ describe("retry fallback selector resolution", () => {
 		expect(resolveRetryFallbackChainKey(context, "anthropic/claude-sonnet-4-5:high", model)).toBe(auto);
 	});
 
-	it("inherits the default chain only for chat roles and preserves explicit empty kind chains", () => {
-		const defaultChain = ["openai/gpt-4o-mini"];
-		const expanded = expandDefaultRetryFallbackChains(
-			{ default: defaultChain, slow: ["google/gemini-3.5-flash"], judge: [] },
-			["default", "task", "slow", "judge", "image", "web"],
+	it("returns the configured chain record unchanged, without lending default to any role", () => {
+		const settings = Settings.isolated({
+			modelRoles: { default: "openai/gpt-4o-mini", task: "google/gemini-3.5-flash", judge: "openai/gpt-4o-mini" },
+			"retry.fallbackChains": {
+				default: ["openai/gpt-4o-mini"],
+				slow: ["google/gemini-3.5-flash"],
+				judge: [],
+			},
+		});
+		const chains = getRetryFallbackChains(settings);
+		expect(chains).toEqual({
+			default: ["openai/gpt-4o-mini"],
+			slow: ["google/gemini-3.5-flash"],
+			judge: [],
+		});
+		// A configured role with no chain of its own resolves no key at all.
+		expect(resolveRetryFallbackChainKey(createContext(chains), "google/gemini-3.5-flash", undefined, "task")).toBe(
+			undefined,
 		);
-		expect(expanded.task).toBe(defaultChain);
-		expect(expanded.slow).toEqual(["google/gemini-3.5-flash"]);
-		expect(expanded.judge).toEqual([]);
-		expect(expanded.image).toBeUndefined();
-		expect(expanded.web).toBeUndefined();
+		// A hint only wins for a role that still owns the live model.
+		expect(resolveRetryFallbackChainKey(createContext(chains), "google/gemini-3.5-flash", undefined, "slow")).toBe(
+			undefined,
+		);
+		expect(
+			resolveRetryFallbackChainKey(
+				createContext(chains, { slow: "google/gemini-3.5-flash" }),
+				"google/gemini-3.5-flash",
+				undefined,
+				"slow",
+			),
+		).toBe("slow");
 	});
 
 	it("prefers an exact model+effort key over a different-effort key regardless of object order", () => {
@@ -209,10 +239,20 @@ describe("retry fallback selector resolution", () => {
 		expect(resolveRetryFallbackChainKey(maxOnly, low, model)).toBeUndefined();
 
 		const maxWithDefault = createContext({ [max]: ["openai/gpt-4o-mini:max"], default: ["openai/gpt-4o-mini"] });
-		expect(resolveRetryFallbackChainKey(maxWithDefault, low, model)).toBe("default");
+		expect(resolveRetryFallbackChainKey(maxWithDefault, low, model)).toBeUndefined();
 
-		const maxWithHint = createContext({ [max]: ["openai/gpt-4o-mini:max"], smol: ["openai/gpt-4o-mini:medium"] });
+		// The hinted role only owns a chain while its assignment names the live
+		// model; an unassigned role (or another role's chain) is never lent.
+		const maxWithHint = createContext(
+			{ [max]: ["openai/gpt-4o-mini:max"], smol: ["openai/gpt-4o-mini:medium"] },
+			{ smol: "google/gemini-3.5-flash" },
+		);
 		expect(resolveRetryFallbackChainKey(maxWithHint, low, model, "smol")).toBe("smol");
+		const maxWithUnassignedHint = createContext({
+			[max]: ["openai/gpt-4o-mini:max"],
+			smol: ["openai/gpt-4o-mini:medium"],
+		});
+		expect(resolveRetryFallbackChainKey(maxWithUnassignedHint, low, model, "smol")).toBeUndefined();
 	});
 
 	it("treats effort aliases as equivalent to their canonical form when matching keys", () => {
@@ -245,7 +285,7 @@ describe("retry fallback selector resolution", () => {
 		expect(resolveRetryFallbackChainKey(exactHigh, high, model)).toBe(high);
 	});
 
-	it("uses the default chain when the live model matches no role primary (#12421)", () => {
+	it("uses the default chain only for the default role identity that owns the live model (#12421)", () => {
 		const live = "openrouter/google/gemini-3.5-flash";
 		const context = createContext(
 			{
@@ -254,32 +294,42 @@ describe("retry fallback selector resolution", () => {
 			},
 			{ default: "google/gemini-3.5-flash", slow: "openai/gpt-4o-mini" },
 		);
-		expect(resolveRetryFallbackChainKey(context, live)).toBe("default");
-		// The effective chain leads with `default`'s primary, then the configured entries.
-		expect(findRetryFallbackCandidates(context, "default", live).map(candidate => candidate.raw)).toEqual([
-			"google/gemini-3.5-flash",
+		// No identity: a /model switch or an ephemeral hop owns no chain.
+		expect(resolveRetryFallbackChainKey(context, live)).toBeUndefined();
+		// The default identity owns nothing for a model its configured primary
+		// does not name: it never lends its chain to another route.
+		expect(resolveRetryFallbackChainKey(context, live, undefined, "default")).toBeUndefined();
+		// Once the default role is assigned the live model, its chain begins with
+		// that model and only its configured entries follow.
+		const owned = createContext({ default: ["openai/gpt-4o-mini", "google/gemini-3.5-flash"] }, { default: live });
+		expect(resolveRetryFallbackChainKey(owned, live, undefined, "default")).toBe("default");
+		expect(findRetryFallbackCandidates(owned, "default", live).map(candidate => candidate.raw)).toEqual([
 			"openai/gpt-4o-mini",
+			"google/gemini-3.5-flash",
 		]);
 	});
 
-	it("keeps a role's chain when the live effort differs from the role's explicit effort (#13789)", () => {
+	it("keeps a role's own chain when the live effort differs from the role's explicit effort (#13789)", () => {
 		const model = getBundledModel("xai-oauth", "grok-4.7");
 		const high = "xai-oauth/grok-4.7:high";
 		const xhigh = "xai-oauth/grok-4.7:xhigh";
 
-		// A spawn `effort` or `/thinking` moved the session off the role's effort.
+		// A spawn `effort` or `/thinking` moved the session off the role's effort;
+		// the hinted role still owns its chain.
 		const roleOnly = createContext({ task: ["openai/gpt-4o-mini"] }, { task: high });
-		expect(resolveRetryFallbackChainKey(roleOnly, xhigh, model)).toBe("task");
+		expect(resolveRetryFallbackChainKey(roleOnly, xhigh, model, "task")).toBe("task");
 		expect(findRetryFallbackCandidates(roleOnly, "task", xhigh, model).map(candidate => candidate.raw)).toEqual([
 			"openai/gpt-4o-mini",
 		]);
+		// Without the hint, another role assigned a matching effort is not eligible.
+		expect(resolveRetryFallbackChainKey(roleOnly, xhigh, model)).toBeUndefined();
 
-		// A role assigned the live effort still outranks one assigned another effort.
 		const exactRole = createContext(
 			{ task: ["openai/gpt-4o-mini"], slow: ["openai/gpt-4o-mini:high"] },
 			{ task: high, slow: xhigh },
 		);
-		expect(resolveRetryFallbackChainKey(exactRole, xhigh, model)).toBe("slow");
+		expect(resolveRetryFallbackChainKey(exactRole, xhigh, model, "slow")).toBe("slow");
+		expect(resolveRetryFallbackChainKey(exactRole, xhigh, model)).toBeUndefined();
 
 		// Model-selector keys stay effort-exact.
 		const modelKey = createContext({ [high]: ["openai/gpt-4o-mini"] });

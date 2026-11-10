@@ -264,8 +264,32 @@ describe("STTController preflight", () => {
 		expect(isCached).toHaveBeenCalledTimes(2);
 	});
 
-	it("falls back to the full parakeet id when the dictation chain is empty", async () => {
+	it("fails closed when a configured dictation model is unavailable", async () => {
 		settings.setModelRole("dictation", "missing/model");
+		const emptyRegistry: STTControllerDependencies["registry"] = {
+			getError: () => undefined,
+			getAvailable: () => [],
+			getAll: () => [],
+			resolver: () => () => "test-key",
+		};
+		const isCached = vi.spyOn(downloader, "isSttModelCached").mockResolvedValue(true);
+		const download = vi.spyOn(downloader, "downloadSttModel").mockReturnValue(new Promise<void>(() => {}));
+		controller = new STTController(() => ({ stop: vi.fn() }), { settings, registry: emptyRegistry });
+
+		const options = makeOptions();
+		await controller.toggle(makeEditor(), options);
+
+		expect(controller.state).toBe("idle");
+		expect(isCached).not.toHaveBeenCalled();
+		expect(download).not.toHaveBeenCalled();
+		expect(asrClient.sttClient.startStream).not.toHaveBeenCalled();
+		expect(options.showWarning).toHaveBeenCalledWith(
+			"Dictation model missing/model is unavailable; dictation stays off until it resolves or modelRoles.dictation is cleared",
+		);
+	});
+
+	it("bootstraps the bundled parakeet model when the dictation role is unconfigured", async () => {
+		settings.setModelRole("dictation", undefined);
 		const emptyRegistry: STTControllerDependencies["registry"] = {
 			getError: () => undefined,
 			getAvailable: () => [],
@@ -276,14 +300,11 @@ describe("STTController preflight", () => {
 		vi.spyOn(downloader, "downloadSttModel").mockReturnValue(new Promise<void>(() => {}));
 		controller = new STTController(() => ({ stop: vi.fn() }), { settings, registry: emptyRegistry });
 
-		const options = makeOptions();
-		await controller.toggle(makeEditor(), options);
+		await controller.toggle(makeEditor(), makeOptions());
 
+		expect(controller.state).toBe("recording");
 		expect(isCached).toHaveBeenCalledWith("parakeet-tdt-0.6b-v3");
 		expect(asrClient.sttClient.startStream).toHaveBeenCalledWith("parakeet-tdt-0.6b-v3", expect.anything());
-		expect(options.showWarning).toHaveBeenCalledWith(
-			"Dictation model missing/model not found; using the built-in local model",
-		);
 	});
 
 	it("stops recording and surfaces asynchronous microphone failures", async () => {

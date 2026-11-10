@@ -56,13 +56,13 @@ describe("online tiny fallback candidates", () => {
 		expect(candidates({ tiny: [fallbackSelector] }, false)).toEqual([primary]);
 	});
 
-	it("still selects the first resolvable role when model fallback is disabled", () => {
+	it("treats an unresolvable configured role as authoritative when model fallback is disabled", () => {
 		const settings = Settings.isolated({ "retry.modelFallback": false });
 		settings.setModelRole("tiny", "missing/unavailable");
 		settings.setModelRole("smol", secondarySelector);
-		expect(collectOnlineTinyCandidates(["tiny", "smol"], settings, models)).toEqual([
-			{ role: "smol", model: secondary },
-		]);
+		// A configured role that cannot resolve yields nothing: the later role's
+		// model is never substituted for it, with or without model fallback.
+		expect(collectOnlineTinyCandidates(["tiny", "smol"], settings, models)).toEqual([]);
 	});
 
 	it("keeps role primaries ahead of configured fallback hops and deduplicates models", () => {
@@ -100,8 +100,8 @@ describe("online tiny fallback candidates", () => {
 		]);
 	});
 
-	it("inherits default for a role without its own chain", () => {
-		expect(candidates({ tiny: [], default: [fallbackSelector] })).toEqual(models);
+	it("does not lend the default chain to a role without its own chain", () => {
+		expect(candidates({ tiny: [], default: [fallbackSelector] })).toEqual([primary, secondary]);
 	});
 
 	it("preserves distinct role chains when their primaries are the same model", () => {

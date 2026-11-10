@@ -15,6 +15,17 @@ Package-specific references:
 - [MCP server/tool authoring](../../docs/mcp-server-tool-authoring.md)
 - [DEVELOPMENT](./DEVELOPMENT.md)
 
+## Model routing and fallback chains
+
+`retry.fallbackChains` maps a model role, an exact model selector (`provider/model-id`), or a provider wildcard (`provider/*`) to an ordered list of fallback selectors. Model resolution is explicit-only (this is unrelated to the `explicit-only` extension-root mode):
+
+- A chain applies only to the key that literally names it. The `default` chain belongs to the `default` role alone; another role never borrows it, and a role is never selected because another role happens to run the same model.
+- A configured role is authoritative: it is attempted as exactly its configured primary plus its own `fallbackChains[role]` entries. A configured role without a chain fails closed on its first failure rather than continuing through the catalog priority list, so an empty `[]` entry is not needed to express "no fallback".
+- A configured model that is unavailable or cannot authenticate surfaces a visible role/request error instead of being replaced by another catalog model, a parent session's model, or a bundled local model. A configured `image` role errors when its model cannot serve, and configured `speech`/`dictation` roles stay off instead of falling back to the bundled local model.
+- Exact model-selector and `provider/*` wildcard chains still apply to whatever model or provider they name, across roles.
+
+Catalog priority defaults are bootstrap only: a role with no `modelRoles` entry resolves from the catalog list, which is distinct from substituting a model that the user did configure. The rule lives in the central role resolver used at startup, retry, subagent dispatch, and preset application, so already saved presets and future ones follow it without rewriting their stored chains.
+
 ## Memory backends
 
 The agent supports three mutually-exclusive memory backends, selected via the `memory.backend` setting (Settings → Memory tab, or `~/.omp/config.yml`):

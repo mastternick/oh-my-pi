@@ -833,7 +833,7 @@ describe("ChainJudge", () => {
 		expect(chat).not.toHaveBeenCalled();
 	});
 
-	it("uses a capable session model when image filtering removes every native candidate", async () => {
+	it("fails instead of substituting a capable session model for a configured judge role", async () => {
 		const settings = Settings.isolated({
 			modelRoles: { judge: "typesafe/jev-preview" },
 			"retry.fallbackChains": {
@@ -844,6 +844,27 @@ describe("ChainJudge", () => {
 			[VISION_CHAT.provider]: "vision-key",
 		});
 		const native = vi.spyOn(globalThis, "fetch").mockImplementation(asGlobalFetch(async () => Response.json({})));
+		const chat = vi.spyOn(ai, "completeSimple");
+
+		// A configured judge role is authoritative: the session's own model is not
+		// a candidate for its image judgments, so the gap surfaces as an error.
+		await expect(
+			new ChainJudge({ settings, registry, purpose: "test", sessionModel: VISION_CHAT }).judge({
+				state: "look at this",
+				questions: { visible: { type: "noul", instructions: "Is an object visible?" } },
+				images: [IMAGE_ONE],
+			}),
+		).rejects.toThrow("judgment: no compatible judge candidate supports images");
+
+		expect(native).not.toHaveBeenCalled();
+		expect(chat).not.toHaveBeenCalled();
+	});
+
+	it("uses a capable session model when the judge role is unconfigured", async () => {
+		const settings = Settings.isolated();
+		const registry = makeRegistry([JEV_PREVIEW, OPENROUTER_TEXT_ONLY], {
+			[VISION_CHAT.provider]: "vision-key",
+		});
 		const chat = vi.spyOn(ai, "completeSimple").mockImplementation(async (model, _context, options) => {
 			const response = reply(model, "visible: yes");
 			options?.onAttempt?.(response);
@@ -862,7 +883,6 @@ describe("ChainJudge", () => {
 		});
 
 		expect(result.answers.visible.noul).toBe(1);
-		expect(native).not.toHaveBeenCalled();
 		expect(chat).toHaveBeenCalledTimes(1);
 	});
 

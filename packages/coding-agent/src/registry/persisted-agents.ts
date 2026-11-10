@@ -5,7 +5,11 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { ADVISOR_TRANSCRIPT_FILENAME, isAdvisorTranscriptName } from "../advisor/transcript-recorder";
 import { resolveExplicitModelRole } from "../config/model-resolver";
 import { assistantTurnProducedOutput } from "../session/messages";
-import { EPHEMERAL_MODEL_CHANGE_ROLE, PREWALK_MODEL_CHANGE_ROLE } from "../session/session-entries";
+import {
+	EPHEMERAL_MODEL_CHANGE_ROLE,
+	EXPLICIT_MODEL_CHANGE_ROLE,
+	PREWALK_MODEL_CHANGE_ROLE,
+} from "../session/session-entries";
 import { visitEntriesFromFileStream } from "../session/session-loader";
 import { loadBundledAgents } from "../task/agents";
 import { isReadOnlyAgent } from "../task/read-only-policy";
@@ -270,7 +274,8 @@ async function readPersistedAgentHistory(
 			if (
 				modelChange.role &&
 				modelChange.role !== EPHEMERAL_MODEL_CHANGE_ROLE &&
-				modelChange.role !== PREWALK_MODEL_CHANGE_ROLE
+				modelChange.role !== PREWALK_MODEL_CHANGE_ROLE &&
+				modelChange.role !== EXPLICIT_MODEL_CHANGE_ROLE
 			) {
 				modelRole ??= modelChange.role;
 			}
@@ -373,7 +378,8 @@ async function readPersistedAgentMetadata(
 					if (
 						typeof record.role === "string" &&
 						record.role !== EPHEMERAL_MODEL_CHANGE_ROLE &&
-						record.role !== PREWALK_MODEL_CHANGE_ROLE
+						record.role !== PREWALK_MODEL_CHANGE_ROLE &&
+						record.role !== EXPLICIT_MODEL_CHANGE_ROLE
 					) {
 						history.modelRole = record.role;
 					}

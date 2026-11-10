@@ -769,9 +769,12 @@ export class ChainJudge implements Judge {
 				candidate => nativeJudgmentSupportsBoxes(candidate.model) && nativeTakesImages(candidate.model, images),
 			);
 		}
-		if (images.length > 0) return withSessionFallback(imageJudgeRoleChain(roleChain, images), sessionModel, true);
+		// A configured `judge` role is authoritative: the session's own model is
+		// an unrelated selection and never stands in for an unavailable judge.
+		const fallbackModel = settings.getModelRole("judge") === undefined ? sessionModel : undefined;
+		if (images.length > 0) return withSessionFallback(imageJudgeRoleChain(roleChain, images), fallbackModel, true);
 		if (chain === this.#candidates?.chain) return this.#candidates.list;
-		const list = withSessionFallback(chain, sessionModel);
+		const list = withSessionFallback(chain, fallbackModel);
 		this.#candidates = { chain, list };
 		return list;
 	}

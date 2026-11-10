@@ -47,9 +47,9 @@ class SkillDescriptionLengthError extends Error {}
 
 /**
  * Resolve the fast role for each background request the way `/models` shows it — configured `smol`,
- * the inherited `default` when `smol` is unset, then the built-in chain — before a configured `tiny`.
- * Never uses the session's foreground model. `getTelemetry` supplies the telemetry handle for each
- * request's chat span.
+ * then the built-in fast chain when `smol` is unset — before a configured `tiny`. Another role's
+ * configured selector is never adopted. Never uses the session's foreground model.
+ * `getTelemetry` supplies the telemetry handle for each request's chat span.
  */
 export function createSkillDescriptionCompressor(
 	registry: ModelRegistry,
@@ -79,10 +79,11 @@ export function createSkillDescriptionCompressor(
 			}
 		}
 		const available = registry.getAvailable();
-		return (
-			resolveRoleChain("smol", settings, available)[0]?.model ??
-			resolveRoleSelection(["tiny"], settings, available)?.model
-		);
+		const smol = resolveRoleChain("smol", settings, available)[0]?.model;
+		// A configured `smol` role is authoritative: `tiny` is consulted only while
+		// `smol` is unconfigured, never as a stand-in for an unavailable smol.
+		if (smol || settings.getModelRole("smol") !== undefined) return smol;
+		return resolveRoleSelection(["tiny"], settings, available)?.model;
 	};
 	return {
 		modelKey() {

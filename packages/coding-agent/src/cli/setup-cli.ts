@@ -15,7 +15,7 @@ import { checkPythonKernelAvailability } from "../eval/py/kernel";
 import { discoverAuthStorage } from "../sdk";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import { downloadSttModel, isSttModelCached } from "../stt/downloader";
-import { isSttModelKey, STT_MODEL_OPTIONS } from "../stt/models";
+import { DEFAULT_STT_MODEL_KEY, isSttModelKey, STT_MODEL_OPTIONS } from "../stt/models";
 import { downloadTtsModel, isTtsLocalModelKey, isTtsModelCached, TTS_LOCAL_MODELS } from "../tts";
 import { selectSetupModel } from "@oh-my-pi/pi-tui/apps/setup-model-picker";
 
@@ -166,36 +166,55 @@ interface SpeechComponent {
 	ensure(onProgress: (progress: { stage: string; percent?: number }) => void): Promise<void>;
 }
 
-function resolveLocalSpeechModelId(role: "speech" | "dictation", settings: Settings, registry: ModelRegistry): string {
+/**
+ * Local backend the role currently resolves to, mirroring the runtime:
+ * the role chain's first `local-inference` candidate, else the bundled local
+ * bootstrap while the role is unconfigured.
+ *
+ * A role pinned to a non-local model resolves to `undefined` instead of
+ * throwing: `omp setup speech` still offers the full local catalog so the user
+ * can pick one, and setup never rewrites the runtime role on its own.
+ */
+export function configuredLocalModelId(
+	role: "speech" | "dictation",
+	settings: Settings,
+	registry: ModelRegistry,
+): string | undefined {
 	const candidate = resolveRoleChain(role, settings, roleCandidatePool(role, settings, registry)).find(
-		entry => entry.model.provider === "local",
+		entry => entry.model.api === "local-inference",
 	);
-	if (!candidate) throw new Error(`No local model is available for the ${role} role.`);
-	return candidate.model.id;
+	if (candidate) return candidate.model.id;
+	if (settings.getModelRole(role) !== undefined) return undefined;
+	return role === "speech" ? TTS_LOCAL_MODELS[0].key : DEFAULT_STT_MODEL_KEY;
+}
+
+/** Local setup cannot proceed for `role`: a configured cloud model is not replaced behind the user's back. */
+function missingLocalModelMessage(role: "speech" | "dictation"): string {
+	const kind = role === "speech" ? "text-to-speech" : "speech-to-text";
+	const configured = role === "speech" ? "modelRoles.speech" : "modelRoles.dictation";
+	return `No local ${kind} model is selected (${configured} points at a non-local model). Pick a local model to install it.`;
 }
 
 function buildSpeechComponents(settings: Settings, registry: ModelRegistry): SpeechComponent[] {
-	const localRoleModelIds = (role: "speech" | "dictation") =>
-		new Set(
-			roleCandidatePool(role, settings, registry)
-				.filter(model => model.provider === "local")
-				.map(model => model.id),
-		);
-	const sttOptions = STT_MODEL_OPTIONS.filter(option => localRoleModelIds("dictation").has(option.value));
-	const ttsOptions = TTS_LOCAL_MODELS.filter(model => localRoleModelIds("speech").has(model.key)).map(
-		({ key, label, description }) => ({ value: key, label, description }),
-	);
+	// Options come from the local catalogs, never the runtime role pool: a role
+	// configured to a cloud model must not empty the picker before it renders.
+	const sttOptions = STT_MODEL_OPTIONS;
+	const ttsOptions = TTS_LOCAL_MODELS.map(({ key, label, description }) => ({ value: key, label, description }));
 
 	return [
 		{
 			name: "Speech-to-Text model",
-			isReady: () => isSttModelCached(resolveLocalSpeechModelId("dictation", settings, registry)),
+			isReady: async () => {
+				const key = configuredLocalModelId("dictation", settings, registry);
+				return key !== undefined && (await isSttModelCached(key));
+			},
 			status: async () => {
-				const key = resolveLocalSpeechModelId("dictation", settings, registry);
+				const key = configuredLocalModelId("dictation", settings, registry);
+				if (key === undefined) return "no local model selected";
 				return (await isSttModelCached(key)) ? key : `${key} — not downloaded`;
 			},
 			pick: async () => {
-				const current = resolveLocalSpeechModelId("dictation", settings, registry);
+				const current = configuredLocalModelId("dictation", settings, registry) ?? sttOptions[0].value;
 				const chosen = await selectSetupModel("Speech-to-Text model", sttOptions, current);
 				if (chosen === null) return false;
 				if (isSttModelKey(chosen)) {
@@ -204,20 +223,27 @@ function buildSpeechComponents(settings: Settings, registry: ModelRegistry): Spe
 				}
 				return true;
 			},
-			ensure: onProgress =>
-				downloadSttModel(resolveLocalSpeechModelId("dictation", settings, registry), progress =>
+			ensure: async onProgress => {
+				const key = configuredLocalModelId("dictation", settings, registry);
+				if (key === undefined) throw new Error(missingLocalModelMessage("dictation"));
+				await downloadSttModel(key, progress =>
 					onProgress({ stage: `Downloading ${progress.label} model`, percent: progress.percent }),
-				),
+				);
+			},
 		},
 		{
 			name: "Text-to-Speech model",
-			isReady: () => isTtsModelCached(resolveLocalSpeechModelId("speech", settings, registry)),
+			isReady: async () => {
+				const key = configuredLocalModelId("speech", settings, registry);
+				return key !== undefined && (await isTtsModelCached(key));
+			},
 			status: async () => {
-				const key = resolveLocalSpeechModelId("speech", settings, registry);
+				const key = configuredLocalModelId("speech", settings, registry);
+				if (key === undefined) return "no local model selected";
 				return (await isTtsModelCached(key)) ? key : `${key} — model/runtime not installed`;
 			},
 			pick: async () => {
-				const current = resolveLocalSpeechModelId("speech", settings, registry);
+				const current = configuredLocalModelId("speech", settings, registry) ?? ttsOptions[0].value;
 				const chosen = await selectSetupModel("Text-to-Speech model", ttsOptions, current);
 				if (chosen === null) return false;
 				if (isTtsLocalModelKey(chosen)) {
@@ -227,7 +253,9 @@ function buildSpeechComponents(settings: Settings, registry: ModelRegistry): Spe
 				return true;
 			},
 			ensure: async onProgress => {
-				const ok = await downloadTtsModel(resolveLocalSpeechModelId("speech", settings, registry), progress =>
+				const key = configuredLocalModelId("speech", settings, registry);
+				if (key === undefined) throw new Error(missingLocalModelMessage("speech"));
+				const ok = await downloadTtsModel(key, progress =>
 					onProgress({ stage: progress.stage, percent: progress.percent }),
 				);
 				if (!ok) throw new Error("Failed to download the local text-to-speech model.");

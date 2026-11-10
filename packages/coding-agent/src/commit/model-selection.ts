@@ -59,6 +59,14 @@ export async function resolvePrimaryModel(
 	};
 }
 
+/**
+ * Resolve the `smol` role for commit inference.
+ *
+ * A configured `smol` role is authoritative: when it cannot serve, the caller
+ * gets a visible failure instead of the built-in fast chain or the pipeline's
+ * primary model (another role's selection). The fallback chain applies only
+ * while `smol` is unconfigured.
+ */
 export async function resolveSmolModel(
 	settings: Settings,
 	modelRegistry: CommitModelRegistry,
@@ -66,6 +74,7 @@ export async function resolveSmolModel(
 	fallbackApiKey: ApiKey,
 ): Promise<ResolvedCommitModel> {
 	const available = modelRegistry.getAvailable();
+	const configuredSmol = settings.getModelRole("smol")?.trim();
 	const resolvedSmol = resolveRoleSelection(["smol"], settings, available);
 	if (resolvedSmol?.model) {
 		const apiKey = await modelRegistry.getApiKey(resolvedSmol.model);
@@ -76,6 +85,9 @@ export async function resolveSmolModel(
 				thinkingLevel: concreteThinkingLevel(resolvedSmol.thinkingLevel),
 			};
 		}
+	}
+	if (configuredSmol) {
+		throw new Error(`Configured smol model ${configuredSmol} is unavailable for commit generation`);
 	}
 
 	const matchPreferences = getModelMatchPreferences(settings);

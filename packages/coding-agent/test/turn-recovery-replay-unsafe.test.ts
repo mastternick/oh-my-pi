@@ -1039,7 +1039,7 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		});
 	});
 
-	it("maps an ephemeral fallback hop to the default chain instead of a shared later-listed role", () => {
+	it("records no role for an ephemeral-only provenance instead of a shared later-listed role", () => {
 		const vision = getBundledModel("openai", "gpt-4o-mini");
 		if (!vision) throw new Error("Expected bundled model gpt-4o-mini");
 		const selector = `${model.provider}/${model.id}`;
@@ -1056,7 +1056,9 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 				},
 			}),
 		);
-		expect(recovery.resolveRetryFallbackRole(selector, model)).toBe("default");
+		// An unresolved ephemeral hop owns no role identity: no role chain, and no
+		// shared role that happens to list the same model may capture it.
+		expect(recovery.resolveRetryFallbackRole(selector, model)).toBeUndefined();
 	});
 
 	it("uses the live vision role when that role shares a model with default", () => {
@@ -1079,7 +1081,7 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		expect(recovery.resolveRetryFallbackRole(selector, model)).toBe("vision");
 	});
 
-	it("ignores a recorded role whose assignment no longer matches the active model", () => {
+	it("does not infer the default identity when the recorded role no longer matches the active model", () => {
 		const vision = getBundledModel("openai", "gpt-4o-mini");
 		if (!vision) throw new Error("Expected bundled model gpt-4o-mini");
 		const selector = `${model.provider}/${model.id}`;
@@ -1096,10 +1098,12 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 				},
 			}),
 		);
-		expect(recovery.resolveRetryFallbackRole(selector, model)).toBe("default");
+		// The recorded role owns another model now, and it is not the default
+		// identity: the turn routes by model selector and provider wildcard only.
+		expect(recovery.resolveRetryFallbackRole(selector, model)).toBeUndefined();
 	});
 
-	it("attaches the default chain to an ephemeral-hopped model that is not default's primary (#12421)", () => {
+	it("does not attach the default chain to an ephemeral-hopped model that is not default's primary (#12421)", () => {
 		const other = getBundledModel("openai", "gpt-4o-mini");
 		if (!other) throw new Error("Expected bundled model gpt-4o-mini");
 		const recovery = new TurnRecovery(
@@ -1113,12 +1117,11 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 				},
 			}),
 		);
-		// Resolving no chain let a wait past retry.maxDelayMs fail-fast with no
-		// walk (#12421), for `/model`-chosen models and ephemeral hops alike. A
-		// walk that produced the hop stays reachable first through
-		// retryFallbackChainKeys' pinned `#activeRetryFallback.role`, so
-		// attaching `default` here cannot displace the owning chain.
-		expect(recovery.resolveRetryFallbackRole(`${other.provider}/${other.id}`, other)).toBe("default");
+		// A /model-chosen model or ephemeral hop owns no role chain: the default
+		// chain belongs to the default role and would otherwise switch this turn
+		// onto the default role's model. A hop that produced a walk stays
+		// reachable through retryFallbackChainKeys' pinned `#activeRetryFallback.role`.
+		expect(recovery.resolveRetryFallbackRole(`${other.provider}/${other.id}`, other)).toBeUndefined();
 	});
 
 	// Gemini reports MALFORMED_FUNCTION_CALL when the model transcribes the call

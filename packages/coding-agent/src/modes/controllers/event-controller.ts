@@ -374,6 +374,16 @@ export class EventController {
 					})
 				: null,
 		);
+		// Local speech resolves the `speech` role from this session's live
+		// settings and registry at every utterance, so preset/role changes apply
+		// without re-wiring. A configured role with no local backend pauses speech
+		// instead of falling back to the bundled voice; the status line says why.
+		vocalizer.setModelSource(
+			session?.modelRegistry && session.settings
+				? { settings: session.settings, registry: session.modelRegistry }
+				: null,
+		);
+		vocalizer.setUnavailableReporter(message => this.ctx.showStatus(message, { dim: true }));
 		this.#streamingReveal = new StreamingRevealController({
 			// Extension text renderers get the full text so far on each drawn update (deltas within one
 			// frame are coalesced), never a partly revealed prefix from the typing reveal.

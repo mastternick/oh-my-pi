@@ -62,13 +62,22 @@ export interface VocalizerModelSource {
 	registry: ModelBrowserRegistry;
 }
 
-/** Resolve the first speech-role candidate that the local streaming worker can run. */
-export function resolveLocalSpeechModelId(source: VocalizerModelSource): string {
+/**
+ * Resolve the first speech-role candidate that the local streaming worker can
+ * run, or `undefined` when the configured role has none.
+ *
+ * The bundled local model is bootstrap for an unconfigured role only: a
+ * configured `speech` role that names no local backend is authoritative, so
+ * local streaming reports the gap instead of synthesizing with a model the
+ * user never selected.
+ */
+export function resolveLocalSpeechModelId(source: VocalizerModelSource): string | undefined {
 	const pool = roleCandidatePool("speech", source.settings, source.registry);
 	const local = resolveRoleChain("speech", source.settings, pool).find(
 		candidate => candidate.model.api === "local-inference",
 	);
-	return local?.model.id ?? TTS_LOCAL_MODELS[0].key;
+	if (local) return local.model.id;
+	return source.settings.getModelRole("speech") === undefined ? TTS_LOCAL_MODELS[0].key : undefined;
 }
 
 export interface VocalizerPlayer {
@@ -111,6 +120,10 @@ export class Vocalizer {
 	#enhancer: SpeechEnhancer | null = null;
 	/** Live per-session settings and registry used to resolve the speech role. */
 	#modelSource: VocalizerModelSource | null = null;
+	/** User-visible channel for speech that cannot start (wired by the interactive host). */
+	#reportUnavailable: ((message: string) => void) | null = null;
+	/** Whether the configured speech role lacking a local backend has been reported. */
+	#warnedNoLocalModel = false;
 	/** Fires when the delta stream goes quiet mid-sentence; speaks the partial. */
 	#idleTimer: NodeJS.Timeout | null = null;
 	/** Abort controllers of every not-yet-finished utterance; all aborted on {@link clear}. */
@@ -137,9 +150,20 @@ export class Vocalizer {
 		this.#enhancer = enhancer;
 	}
 
-	/** Wire (or drop) the live per-session model source used by local speech synthesis. */
+	/**
+	 * Wire (or drop) the live per-session model source used by local speech
+	 * synthesis. Settings and registry are read at every utterance, so role and
+	 * preset changes apply without re-wiring; re-wiring re-arms the missing-model
+	 * report for a new session.
+	 */
 	setModelSource(source: VocalizerModelSource | null): void {
 		this.#modelSource = source;
+		this.#warnedNoLocalModel = false;
+	}
+
+	/** Wire (or drop) the user-visible reporter for speech that cannot start. */
+	setUnavailableReporter(reporter: ((message: string) => void) | null): void {
+		this.#reportUnavailable = reporter;
 	}
 
 	/**
@@ -329,6 +353,7 @@ export class Vocalizer {
 			const segments = utterance.speakable.push(spoken.endsWith("\n") ? spoken : `${spoken}\n`);
 			if (segments.length === 0) return;
 			if (!utterance.handle) utterance.handle = this.#openSession(utterance.abort);
+			if (!utterance.handle) return;
 			for (const segment of segments) utterance.handle.push(segment);
 		});
 	}
@@ -367,8 +392,10 @@ export class Vocalizer {
 		if (segments.length === 0) return;
 		if (!this.#handle) {
 			const abort = new AbortController();
-			this.#liveAborts.add(abort);
 			this.#handle = this.#openSession(abort);
+			// The session registers its abort only once a model resolved; don't
+			// leave an orphan that would keep isSpeaking() true forever.
+			if (!this.#handle) return;
 		}
 		for (const segment of segments) this.#handle.push(segment);
 	}
@@ -377,9 +404,22 @@ export class Vocalizer {
 	 * Open a streaming-synthesis session and chain its playback after any
 	 * prior utterance's, so sequential utterances never overlap.
 	 */
-	#openSession(abort: AbortController): TtsStreamHandle {
+	#openSession(abort: AbortController): TtsStreamHandle | null {
 		const source = this.#modelSource;
 		const modelKey = source ? resolveLocalSpeechModelId(source) : TTS_LOCAL_MODELS[0].key;
+		if (modelKey === undefined) {
+			// Configured speech role with no local backend: fail visibly instead of
+			// synthesizing with the bundled local model behind the user's back.
+			if (!this.#warnedNoLocalModel) {
+				this.#warnedNoLocalModel = true;
+				const configured = source?.settings.getModelRole("speech") ?? "configured";
+				const message = `Speech is paused: modelRoles.speech (${configured}) has no local TTS backend. Pick a local speech model or clear modelRoles.speech.`;
+				logger.error(`vocalizer: ${message}`);
+				this.#reportUnavailable?.(message);
+			}
+			return null;
+		}
+		this.#warnedNoLocalModel = false;
 		const sessionSettings = source?.settings ?? settings;
 		const voice = cfgSpeechVoice.get(sessionSettings) || DEFAULT_TTS_VOICE;
 		const speed = cfgSpeechSpeed.get(sessionSettings);

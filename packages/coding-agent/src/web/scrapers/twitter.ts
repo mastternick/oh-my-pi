@@ -70,12 +70,20 @@ export const handleTwitter: SpecialHandler = async (url, timeout, signal, _stora
 			"X blocks automated access, and Grok's X tools only read posts, profiles, post searches, and hashtags.",
 		);
 	}
-	const models = modelRegistry ? xaiModelChain(modelRegistry, settings) : [];
-	if (!modelRegistry || models.length === 0) {
+	const credentialHint =
+		"X blocks automated access. Reading X goes through Grok's X tools, which need xAI credentials: log in to `xai-oauth` or set `XAI_API_KEY`.";
+	if (!modelRegistry) return unavailable(url, fetchedAt, credentialHint);
+	const models = xaiModelChain(modelRegistry, settings);
+	if (models.length === 0) {
+		const configured = settings.getModelRole("web");
+		// A configured `web` role is authoritative (no hidden xAI fallback), so its
+		// failure is a capability gap, not the unconfigured credential hint.
 		return unavailable(
 			url,
 			fetchedAt,
-			"X blocks automated access. Reading X goes through Grok's X tools, which need xAI credentials: log in to `xai-oauth` or set `XAI_API_KEY`.",
+			configured !== undefined
+				? `X blocks automated access. Reading X needs an xAI-grounded model, and modelRoles.web ("${configured}") did not resolve to one. Point it at an xAI model with credentials, or clear modelRoles.web.`
+				: credentialHint,
 		);
 	}
 

@@ -21,7 +21,6 @@ import {
 	resolveCliModel,
 	resolveConfiguredModelPatterns,
 	resolveExplicitModelRole,
-	resolveModelFromSettings,
 	resolveExactModelIdentity,
 	resolveModelFromString,
 	resolveModelOverride,
@@ -904,7 +903,7 @@ describe("role priorities and chains", () => {
 		).toBe("o4-mini");
 	});
 
-	test("appends non-explicit web defaults after a configured primary", () => {
+	test("does not append catalog web defaults after a configured primary", () => {
 		const exa = roleChainModel("web", "exa");
 		const parallel = roleChainModel("web", "parallel");
 		const duckduckgo = roleChainModel("web", "duckduckgo");
@@ -912,22 +911,29 @@ describe("role priorities and chains", () => {
 
 		const chain = resolveRoleChain("web", settings, [exa, parallel, duckduckgo]);
 
+		// A configured role is authoritative: its own selector only.
 		expect(chain.map(candidate => [formatModelStringWithRouting(candidate.model), candidate.explicit])).toEqual([
 			["web/exa", true],
-			["web/parallel", false],
-			["web/duckduckgo", false],
 		]);
 	});
 
-	test("marks the candidate that runs in place of an unresolved configured selector", () => {
+	test("keeps catalog defaults for a role that is not configured", () => {
+		const exa = roleChainModel("web", "exa");
+		const parallel = roleChainModel("web", "parallel");
+		const duckduckgo = roleChainModel("web", "duckduckgo");
+
+		const chain = resolveRoleChain("web", Settings.isolated(), [exa, parallel, duckduckgo]);
+
+		expect(chain.map(candidate => candidate.explicit).every(explicit => explicit === false)).toBe(true);
+		expect(chain.length).toBeGreaterThan(1);
+	});
+
+	test("stops a configured role at its own unresolved selector, with no catalog replacement", () => {
 		const exa = roleChainModel("web", "exa");
 		const parallel = roleChainModel("web", "parallel");
 		const settings = Settings.isolated({ modelRoles: { web: "web/exa-pro" } });
 
-		const chain = resolveRoleChain("web", settings, [exa, parallel]);
-
-		expect(chain[0]?.replaces).toBe("web/exa-pro");
-		expect(chain.slice(1).some(candidate => candidate.replaces !== undefined)).toBe(false);
+		expect(resolveRoleChain("web", settings, [exa, parallel])).toEqual([]);
 	});
 
 	test("leaves a resolved configured selector unmarked", () => {
@@ -944,11 +950,12 @@ describe("role priorities and chains", () => {
 		expect(resolveRoleChain("web", settings, [exa])[0]?.replaces).toBe("web/exa-pro");
 	});
 
-	test("marks the replacement when a configured role alias expands to a missing selector", () => {
+	test("resolves a configured role alias and stops when its target selector is missing", () => {
 		const parallel = roleChainModel("web", "parallel");
 		const settings = Settings.isolated({ modelRoles: { web: "@search", search: "web/exa-pro" } });
 
-		expect(resolveRoleChain("web", settings, [parallel])[0]?.replaces).toBe("web/exa-pro");
+		// The alias is the user's own indirection; the catalog is never a stand-in.
+		expect(resolveRoleChain("web", settings, [parallel])).toEqual([]);
 	});
 
 	test("marks the first qualified entry a list skipped before matching", () => {
@@ -1009,14 +1016,6 @@ describe("role priorities and chains", () => {
 		expect(chain.every(candidate => candidate.explicit)).toBe(true);
 	});
 
-	test("ignores configured kind roles during default chat-model resolution", () => {
-		const chat = roleChainModel("anthropic", "chat-model");
-		const image = roleChainModel("openai", "gpt-image-2");
-		const settings = Settings.isolated({ modelRoles: { image: "openai/gpt-image-2" } });
-
-		expect(resolveModelFromSettings({ settings, availableModels: [chat, image] })).toBe(chat);
-	});
-
 	test("judge defaults follow the @tiny/@smol/@default roles instead of matching Vertex `@default` ids", () => {
 		const vertex = roleChainModel("google-vertex", "claude-opus-4-8@default");
 		const small = roleChainModel("local", "qwen-small");
@@ -1031,7 +1030,7 @@ describe("role priorities and chains", () => {
 		]);
 	});
 
-	test("memory inherits configured tiny without kind roles inheriting configured default", () => {
+	test("unconfigured roles never adopt another role's configured model", () => {
 		const tiny = roleChainModel("local", "tiny-model");
 		const defaultModel = roleChainModel("local", "default-model");
 		const image = roleChainModel("openai", "gpt-image-2");
@@ -1042,7 +1041,9 @@ describe("role priorities and chains", () => {
 			},
 		});
 
-		expect(resolveRoleChain("memory", settings, [defaultModel, tiny])[0]?.model.id).toBe("tiny-model");
+		// memory aliases the built-in `smol` catalog list, not a configured tiny/default.
+		expect(resolveRoleChain("memory", settings, [defaultModel, tiny])).toEqual([]);
+		// image keeps its own built-in catalog list.
 		expect(resolveRoleChain("image", settings, [defaultModel, image])[0]?.model.id).toBe("gpt-image-2");
 	});
 });
@@ -1318,38 +1319,7 @@ describe("resolveAgentModelPatterns", () => {
 		expect(result).toEqual(["anthropic/claude-sonnet-4-6", "zai/glm-5.2:high"]);
 	});
 
-	test("uses default for unconfigured smol and slow agent roles before priority defaults", () => {
-		const settings = Settings.isolated({
-			modelRoles: { default: "local/llama" },
-		});
-
-		expect(resolveAgentModelPatterns({ agentModel: "@smol", settings })).toEqual(["local/llama"]);
-		expect(resolveAgentModelPatterns({ agentModel: "@slow", settings })).toEqual(["local/llama"]);
-	});
-
-	test("uses configured smol for unconfigured tiny before priority defaults", () => {
-		const settings = Settings.isolated({
-			modelRoles: {
-				default: "local/default",
-				smol: "baseten/custom-smol:max",
-			},
-		});
-
-		expect(resolveAgentModelPatterns({ agentModel: "@tiny", settings })).toEqual(["baseten/custom-smol:max"]);
-	});
-
-	test("uses configured slow for unconfigured advisor before priority defaults", () => {
-		const settings = Settings.isolated({
-			modelRoles: {
-				default: "local/default",
-				slow: "baseten/custom-slow:max",
-			},
-		});
-
-		expect(resolveAgentModelPatterns({ agentModel: "@advisor", settings })).toEqual(["baseten/custom-slow:max"]);
-	});
-
-	test("expands nested role aliases from the configured slow fallback", () => {
+	test("does not adopt a configured slow role for an unset advisor", () => {
 		const settings = Settings.isolated({
 			modelRoles: {
 				default: "openrouter/qwen/qwen3-coder:exacto",
@@ -1357,16 +1327,16 @@ describe("resolveAgentModelPatterns", () => {
 				slow: "@smol",
 			},
 		});
+		const exacto = allModels.filter(model => model.id === "qwen/qwen3-coder:exacto");
 
-		const result = resolveModelRoleValue("@advisor", allModels, { settings });
-
-		expect(result.model?.provider).toBe("openrouter");
-		expect(result.model?.id).toBe("qwen/qwen3-coder:exacto");
+		// The advisor bootstraps from the built-in slow list, never from a
+		// configured slow/smol/default selector.
+		expect(resolveModelRoleValue("@advisor", exacto, { settings }).model).toBeUndefined();
 	});
 
-	test("outer advisor thinking level overrides the inherited slow effort", () => {
+	test("outer advisor thinking level overrides the configured role effort", () => {
 		const settings = Settings.isolated({
-			modelRoles: { slow: "nanogpt/coding-router:max" },
+			modelRoles: { advisor: "nanogpt/coding-router:max" },
 		});
 
 		const result = resolveModelRoleValue("@advisor:high", [mockMaxSuffixModels[0]], { settings });
@@ -1376,9 +1346,9 @@ describe("resolveAgentModelPatterns", () => {
 		expect(result.explicitThinkingLevel).toBe(true);
 	});
 
-	test("outer advisor thinking level preserves an inherited literal suffix model id", () => {
+	test("outer advisor thinking level preserves a literal suffix model id", () => {
 		const settings = Settings.isolated({
-			modelRoles: { slow: "nanogpt/coding-router:max" },
+			modelRoles: { advisor: "nanogpt/coding-router:max" },
 		});
 
 		const result = resolveModelRoleValue("@advisor:high", mockMaxSuffixModels, { settings });
@@ -1412,21 +1382,15 @@ describe("resolveAgentModelPatterns", () => {
 		expect(smol).toEqual(tiny);
 	});
 
-	test("preserves thinking suffix when breaking the smol fallback cycle", () => {
-		const settings = Settings.isolated({ modelRoles: { smol: "@tiny:high" } });
-		const baseline = resolveAgentModelPatterns({ agentModel: "@smol", settings: Settings.isolated() });
-
-		const tiny = resolveAgentModelPatterns({ agentModel: "@tiny", settings });
-
-		expect(tiny).toEqual(baseline.map(pattern => `${pattern}:high`));
-	});
-
-	test("expands cross-role default aliases when inheriting for an unset role", () => {
+	test("an unset role does not inherit the configured default or its aliases", () => {
 		const settings = Settings.isolated({
 			modelRoles: { default: "@slow", slow: "anthropic/claude-sonnet-4-5" },
 		});
 
-		expect(resolveAgentModelPatterns({ agentModel: "@smol", settings })).toEqual(["anthropic/claude-sonnet-4-5"]);
+		const patterns = resolveAgentModelPatterns({ agentModel: "@smol", settings });
+
+		expect(patterns).not.toContain("anthropic/claude-sonnet-4-5");
+		expect(patterns).toEqual(resolveAgentModelPatterns({ agentModel: "@smol", settings: Settings.isolated() }));
 	});
 
 	test("slow priority falls forward to Opus 4.8 before older Opus aliases", () => {

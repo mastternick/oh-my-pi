@@ -792,12 +792,11 @@ describe("AgentSession retry fallback", () => {
 		]);
 	});
 
-	it("walks the default chain when the live model matches no role primary (#12421)", async () => {
+	it("does not lend the default chain to an off-role model (#12421)", async () => {
 		// A lead session whose model belongs to no role (a `/model` switch onto a
-		// model no role names) resolved no chain at all, so a provider wait
-		// longer than `retry.maxDelayMs` aborted the session after one attempt
-		// instead of walking `default`. The walk starts at that role's primary,
-		// which is deliberately not the live model.
+		// model no role names) owns no role chain: the `default` chain must not
+		// re-route it onto another model. A provider wait longer than
+		// `retry.maxDelayMs` ends the turn visibly instead.
 		const liveModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const rolePrimary = getBundledModel("openai", "gpt-4o");
 		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
@@ -834,26 +833,19 @@ describe("AgentSession retry fallback", () => {
 			if (event.type === "retry_fallback_applied") fallbackAppliedEvents.push(event);
 		});
 
-		await session.prompt("Recover from a long provider wait on an off-role model");
+		await session.prompt("Fail visibly on an off-role model");
 		await session.waitForIdle();
 
-		expect(fallbackAppliedEvents).toEqual([
-			{
-				type: "retry_fallback_applied",
-				from: `${liveModel.provider}/${liveModel.id}`,
-				to: `${rolePrimary.provider}/${rolePrimary.id}`,
-				role: "default",
-				reason: expect.stringContaining("429 rate_limit_error retry-after-ms=11180001"),
-			},
-		]);
-		expect(requestedModels).toEqual([
-			`${liveModel.provider}/${liveModel.id}`,
-			`${rolePrimary.provider}/${rolePrimary.id}`,
-		]);
-		expect(session.model?.provider).toBe(rolePrimary.provider);
-		expect(session.model?.id).toBe(rolePrimary.id);
+		expect(fallbackAppliedEvents).toEqual([]);
+		expect(requestedModels).toEqual([`${liveModel.provider}/${liveModel.id}`]);
+		expect(session.model?.provider).toBe(liveModel.provider);
+		expect(session.model?.id).toBe(liveModel.id);
 		expect(retryEndEvents).toHaveLength(1);
-		expect(retryEndEvents[0]).toMatchObject({ success: true });
+		expect(retryEndEvents[0]).toMatchObject({
+			success: false,
+			finalError: expect.stringContaining("exceeds retry.maxDelayMs"),
+		});
+		expect(getLastAssistantMessage(session).stopReason).toBe("error");
 	});
 
 	it("keeps non-Gemini empty-body errors on the model-fallback path", async () => {
@@ -1144,7 +1136,10 @@ describe("AgentSession retry fallback", () => {
 	it("keeps a declined reserve fallback until the selected account recovers", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
-		if (!primaryModel || !fallbackModel) throw new Error("Expected bundled reserve fallback models");
+		const otherModel = getBundledModel("anthropic", "claude-haiku-4-5");
+		if (!primaryModel || !fallbackModel || !otherModel) {
+			throw new Error("Expected bundled reserve fallback models");
+		}
 		const mock = createMockModel({ handler: { content: ["stayed on primary"] } });
 		const agent = new Agent({
 			getApiKey: model => `${model.provider}-test-key`,
@@ -1155,7 +1150,12 @@ describe("AgentSession retry fallback", () => {
 			"compaction.enabled": false,
 			"retry.usageAwareFallback": true,
 			"retry.usageReservePolicy": "confirm",
-			"retry.fallbackChains": { default: [`${fallbackModel.provider}/${fallbackModel.id}`] },
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+				// A model switched to explicitly owns no role chain; its fallback
+				// comes from the model selector that names it.
+				[`${otherModel.provider}/${otherModel.id}`]: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
 		});
 		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
 		let health: "reserve" | "unknown" | "healthy" = "reserve";
@@ -1228,8 +1228,6 @@ describe("AgentSession retry fallback", () => {
 		await session.prompt("Keep the decision after resetting the provider connection");
 		await session.waitForIdle();
 		expect(confirmFallback).toHaveBeenCalledTimes(2);
-		const otherModel = getBundledModel("anthropic", "claude-haiku-4-5");
-		if (!otherModel) throw new Error("Expected another bundled reserve model");
 		await session.setModel(otherModel);
 		await session.prompt("Ask before spending another model's reserve");
 		await session.waitForIdle();
@@ -4630,7 +4628,7 @@ describe("AgentSession retry fallback", () => {
 		]);
 	});
 
-	it("uses the active initial model as the default fallback primary when other role fallback chains are configured", async () => {
+	it("does not lend the default chain when the default role is unconfigured", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
 		const otherRoleFallbackModel = getBundledModel("openai", "gpt-4o");
@@ -4640,16 +4638,23 @@ describe("AgentSession retry fallback", () => {
 
 		const requestedModels: string[] = [];
 		const fallbackAppliedEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
-		const agent = createFallbackAgent(primaryModel, requestedModels);
+		const agent = createFallbackAgent(primaryModel, requestedModels, {
+			// Past `retry.maxDelayMs`: the turn must end instead of switching.
+			firstError: "429 rate_limit_error retry-after-ms=11180001",
+		});
 
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.maxRetries": 1,
+			"retry.maxDelayMs": 100,
 			"retry.fallbackChains": {
 				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
 				smol: [`${otherRoleFallbackModel.provider}/${otherRoleFallbackModel.id}`],
 			},
 		});
+		// No modelRoles.default: the initial model is an unconfigured bootstrap
+		// pick, not the default role's model, so no configured chain owns it.
+		const retryEndEvents: Array<Extract<AgentSessionEvent, { type: "auto_retry_end" }>> = [];
 
 		session = new AgentSession({
 			agent,
@@ -4662,26 +4667,22 @@ describe("AgentSession retry fallback", () => {
 			if (event.type === "retry_fallback_applied") {
 				fallbackAppliedEvents.push(event);
 			}
+			if (event.type === "auto_retry_end") retryEndEvents.push(event);
 		});
 
-		await session.prompt("Recover using implicit default primary");
+		await session.prompt("Fail visibly without an owned default chain");
 		await session.waitForIdle();
 
-		expect(requestedModels).toEqual([
-			`${primaryModel.provider}/${primaryModel.id}`,
-			`${fallbackModel.provider}/${fallbackModel.id}`,
-		]);
-		expect(session.model?.provider).toBe(fallbackModel.provider);
-		expect(session.model?.id).toBe(fallbackModel.id);
-		expect(fallbackAppliedEvents).toEqual([
-			{
-				type: "retry_fallback_applied",
-				from: `${primaryModel.provider}/${primaryModel.id}`,
-				to: `${fallbackModel.provider}/${fallbackModel.id}`,
-				role: "default",
-				reason: expect.any(String),
-			},
-		]);
+		expect(fallbackAppliedEvents).toEqual([]);
+		expect(requestedModels).toEqual([`${primaryModel.provider}/${primaryModel.id}`]);
+		expect(session.model?.provider).toBe(primaryModel.provider);
+		expect(session.model?.id).toBe(primaryModel.id);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({
+			success: false,
+			finalError: expect.stringContaining("exceeds retry.maxDelayMs"),
+		});
+		expect(getLastAssistantMessage(session).stopReason).toBe("error");
 	});
 
 	it("falls back on structured classifier refusals and pins the fallback", async () => {

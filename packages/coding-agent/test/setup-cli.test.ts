@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { Model } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { checkPythonSetup } from "../src/cli/setup-cli";
+import { checkPythonSetup, configuredLocalModelId } from "../src/cli/setup-cli";
+import type { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import { DEFAULT_STT_MODEL_KEY } from "../src/stt/models";
 import { restoreEnvValue } from "./helpers/settings-test-state";
 
 const cliEntry = path.join(import.meta.dir, "..", "src", "cli.ts");
@@ -149,6 +153,40 @@ describe("omp setup python", () => {
 			if (previousSkipCheck === undefined) delete process.env.PI_PYTHON_SKIP_CHECK;
 			else process.env.PI_PYTHON_SKIP_CHECK = previousSkipCheck;
 		}
+	});
+});
+
+describe("omp setup speech local model resolution", () => {
+	const localSpeech = getBundledModel("local", "kokoro");
+	const cloudSpeech = getBundledModel("xai", "grok-tts");
+	if (!localSpeech || !cloudSpeech) throw new Error("Missing bundled speech test models");
+	const models: Model[] = [localSpeech, cloudSpeech];
+	const registry = { getAvailable: () => models } as unknown as ModelRegistry;
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	// Regression: a `speech` role pinned to a cloud model used to throw here,
+	// aborting `omp setup speech` before its local-model picker could render.
+	it("reports no local model for a cloud-configured role instead of throwing", () => {
+		const settings = Settings.isolated({ modelRoles: { speech: "xai/grok-tts" } });
+
+		expect(configuredLocalModelId("speech", settings, registry)).toBeUndefined();
+	});
+
+	it("keeps an explicitly selected local speech model", () => {
+		const settings = Settings.isolated({ modelRoles: { speech: "local/kokoro" } });
+
+		expect(configuredLocalModelId("speech", settings, registry)).toBe("kokoro");
+	});
+
+	it("uses the local catalog default while the role is unconfigured", () => {
+		expect(configuredLocalModelId("speech", Settings.isolated(), registry)).toBe("kokoro");
+	});
+
+	it("bootstraps the bundled dictation model while its role is unconfigured", () => {
+		expect(configuredLocalModelId("dictation", Settings.isolated(), registry)).toBe(DEFAULT_STT_MODEL_KEY);
 	});
 });
 

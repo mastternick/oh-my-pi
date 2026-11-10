@@ -16,6 +16,7 @@ import { type } from "@oh-my-pi/omptype";
 import { instrumentedCompleteSimple, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import { type Api, type AssistantMessage, Effort, type Model, type Tool } from "@oh-my-pi/pi-ai";
 import { clampThinkingLevelForModel, getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
+import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { Snowflake } from "@oh-my-pi/pi-utils";
 import { extractTextContent, extractToolCall, parseJsonPayload } from "../commit/utils";
 
@@ -49,6 +50,7 @@ import {
 import type { JsStatusEvent } from "./js/shared/types";
 
 import { cfgDisabledProviders } from "../config/model-settings";
+import { EXPLICIT_MODEL_CHANGE_ROLE } from "../session/session-entries";
 import { cfgRetry } from "../session/settings";
 
 /** Synthetic bridge name reserved for the `completion()` helper across both runtimes. */
@@ -244,6 +246,29 @@ function appendFallbackCandidates(
 }
 
 /**
+ * Role identity that owns the `default` tier's primary model.
+ *
+ * Mirrors `TurnRecovery#liveRetryRoleHint` (session/turn-recovery.ts): the
+ * identity recorded when the model was selected decides which chain applies.
+ * A session that never recorded a model change started role-less on `default`
+ * and owns the configured `default` chain; another role's chain applies only
+ * while its own assignment still resolves to the active model. An explicit
+ * selector, a temporary switch, or an unconfigured role owns no role chain, so
+ * routing falls through to the literal model key and provider wildcard.
+ * Without an active model the tier fell back to `@default`, which is `default`.
+ */
+function resolveDefaultTierRoleHint(session: ToolSession, activeModel: Model<Api> | undefined): string | undefined {
+	if (!activeModel) return "default";
+	const recorded = session.sessionManager?.getLastModelChangeRole?.({ skipEphemeral: true }) ?? "default";
+	if (recorded === "default") return "default";
+	if (recorded === EXPLICIT_MODEL_CHANGE_ROLE) return undefined;
+	const configured = session.settings.getModelRole(recorded);
+	if (!configured || !session.modelRegistry) return undefined;
+	const resolved = resolveModelOverride([configured], session.modelRegistry, session.settings);
+	return resolved.model && modelsAreEqual(resolved.model, activeModel) ? recorded : undefined;
+}
+
+/**
  * Resolve a tier to its primary model and configured retry-fallback candidates.
  * `default` prefers the session's active model before the `@default` role.
  */
@@ -278,11 +303,16 @@ function resolveTierCandidates(tier: CompletionTier, session: ToolSession): Comp
 				: undefined;
 		return { model, selector, configuredEffort };
 	};
-	const primary =
-		tier === "default"
-			? (resolve(session.getActiveModelString?.() ?? session.getModelString?.()) ?? resolve(TIER_TO_PATTERN.default))
-			: resolve(TIER_TO_PATTERN[tier]);
+	// The `default` tier runs on the session's active model when one is known.
+	// Its fallback chain belongs to the identity that owns that model, recorded
+	// when the model was selected — not inferred from model equality, since one
+	// model can be assigned to several roles.
+	const activeSelector =
+		tier === "default" ? (session.getActiveModelString?.() ?? session.getModelString?.()) : undefined;
+	const activePrimary = activeSelector ? resolve(activeSelector) : undefined;
+	const primary = activePrimary ?? resolve(TIER_TO_PATTERN[tier]);
 	if (!primary) return [];
+	const roleHint = tier === "default" ? resolveDefaultTierRoleHint(session, activePrimary?.model) : tier;
 
 	const candidates: CompletionCandidate[] = [
 		{
@@ -311,7 +341,7 @@ function resolveTierCandidates(tier: CompletionTier, session: ToolSession): Comp
 		primary.selector,
 		primary.model,
 		inheritPrimary ? candidates[0] : undefined,
-		tier,
+		roleHint,
 		new Set([candidateIdentity(primary.model, candidates[0])]),
 		new Set(),
 		candidates,

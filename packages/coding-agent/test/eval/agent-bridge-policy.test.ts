@@ -331,7 +331,6 @@ describe("runEvalAgent", () => {
 		expect(firstOptions.taskDepth).toBe(2);
 		expect(firstOptions.signal).not.toBe(abortController.signal);
 		expect(firstOptions.signal?.aborted).toBe(false);
-		expect(firstOptions.parentActiveModelPattern).toBe("p/current");
 		expect(firstOptions.outputSchema).toBe(schema);
 		expect(firstOptions.outputSchemaOverridesAgent).toBe(true);
 		// task.structured is off (default); eval agents keep yield + schemas regardless.

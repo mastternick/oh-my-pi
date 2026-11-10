@@ -2,7 +2,6 @@ import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { formatModelStringWithRouting, resolveModelOverride, resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import {
-	expandDefaultRetryFallbackChains,
 	findRetryFallbackCandidates,
 	type RetryFallbackChains,
 	type RetryFallbackResolutionContext,
@@ -109,9 +108,11 @@ function expandFallbackCandidates(
  *
  * Order: each requested role's primary, then canonical retry fallback chains
  * traversed transitively (so a hop onto B also consults B's own chain).
- * Disabling model fallback restricts attempts to the first resolvable primary,
- * unless `tryAllRoles` asks for the explicit role chain without configured
- * retry-chain expansion.
+ * A configured role that resolves no model is authoritative: collection stops
+ * there instead of substituting a later role's model, and that holds whether or
+ * not model fallback is enabled. Disabling model fallback otherwise restricts
+ * attempts to the first resolvable primary, unless `tryAllRoles` asks for the
+ * explicit role chain without configured retry-chain expansion.
  */
 export function collectOnlineTinyCandidates(
 	roles: readonly string[],
@@ -134,7 +135,12 @@ export function collectOnlineTinyCandidates(
 	const primaries: OnlineTinyCandidate[] = [];
 	for (const role of roles) {
 		const resolved = resolveRoleSelection([role], settings, availableModels);
-		if (!resolved?.model) continue;
+		if (!resolved?.model) {
+			// A configured role that cannot resolve is authoritative: collecting a
+			// later role's model for it would be a cross-role substitution.
+			if (settings.getModelRole(role) !== undefined) break;
+			continue;
+		}
 		addPrimary(resolved.role, resolved.model);
 		if (!fallbackEnabled && !options?.tryAllRoles) return out;
 		if (fallbackEnabled) primaries.push({ role: resolved.role, model: resolved.model });
@@ -144,11 +150,8 @@ export function collectOnlineTinyCandidates(
 	const configuredChains = cfgRetryFallbackChains.get(settings);
 	if (!configuredChains || typeof configuredChains !== "object") return out;
 
-	const context = createFallbackContext(
-		expandDefaultRetryFallbackChains(configuredChains, roles),
-		settings,
-		availableModels,
-	);
+	// Each role walks only its own configured chain; no default lending.
+	const context = createFallbackContext(configuredChains, settings, availableModels);
 	expandFallbackCandidates(
 		primaries.map(({ role, model }) => ({
 			role,
@@ -168,11 +171,10 @@ export function collectOnlineTinyCandidates(
 /**
  * Expand one model's own `retry.fallbackChains` transitively.
  *
- * Does not merge role/`default` chains into the seed via
- * `expandDefaultRetryFallbackChains` — title generation appends the active
- * session model separately from tiny/commit/smol role collection, so its
- * recovery path must consult only the configured model-keyed / wildcard /
- * matching-role keys that `resolveRetryFallbackChainKey` already selects.
+ * Merges no role/`default` chain into the seed — title generation appends the
+ * active session model separately from tiny/commit/smol role collection, so its
+ * recovery path consults only the configured model-keyed / wildcard keys that
+ * `resolveRetryFallbackChainKey` selects.
  */
 export function expandOnlineTinyModelFallbacks(
 	model: Model<Api>,

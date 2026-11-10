@@ -81,7 +81,7 @@ afterEach(() => {
 });
 
 describe("seance source resolution", () => {
-	it("resolves paths and stored IDs to read-only source metadata with the active model and default fallback", async () => {
+	it("resolves paths and stored IDs to read-only source metadata with only the active model", async () => {
 		using tempDir = TempDir.createSync("@omp-seance-source-");
 		const cwd = path.join(tempDir.path(), "project");
 		const sessionDir = path.join(tempDir.path(), "sessions");
@@ -96,12 +96,12 @@ describe("seance source resolution", () => {
 		await expect(resolveSeanceSource(file, options)).resolves.toEqual({
 			file,
 			id: "saved-source-id",
-			modelSelectors: ["anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-5"],
+			modelSelectors: ["anthropic/claude-sonnet-4-6"],
 		});
 		await expect(resolveSeanceSource("saved-source-id", options)).resolves.toEqual({
 			file,
 			id: "saved-source-id",
-			modelSelectors: ["anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-5"],
+			modelSelectors: ["anthropic/claude-sonnet-4-6"],
 		});
 		expect(await fs.readFile(file)).toEqual(original);
 	});
@@ -120,7 +120,7 @@ describe("seance source resolution", () => {
 		await writeSession(file, "active-model-source", cwd, entries);
 		await expect(resolveSeanceSource(file, { cwd, sessionDirHint: sessionDir })).resolves.toMatchObject({
 			id: "active-model-source",
-			modelSelectors: ["anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-5"],
+			modelSelectors: ["anthropic/claude-sonnet-4-6"],
 		});
 
 		const clearedFile = path.join(sessionDir, "cleared-usage.jsonl");

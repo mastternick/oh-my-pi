@@ -719,21 +719,21 @@ describe("runSubprocess per-agent service-tier overrides", () => {
 		expect(childTiers(spy.mock.calls[0]?.[0])).toEqual({});
 	});
 
-	it("resolves the override against the auth-fallback model rather than the requested one", async () => {
+	it("keeps an explicit unauthenticated model instead of a sibling provider", async () => {
 		const requested = getBundledModel("anthropic", "claude-sonnet-4-5");
-		const parentModel = getBundledModel("openai-codex", "gpt-5.6-sol");
-		if (!requested || !parentModel) throw new Error("Expected bundled service-tier models to exist");
+		const sibling = getBundledModel("openai-codex", "gpt-5.6-sol");
+		if (!requested || !sibling) throw new Error("Expected bundled service-tier models to exist");
 		const session = yieldEmittingSession();
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
-		// The requested Anthropic model has no working credentials; the parent's OpenAI model does.
-		const modelRegistry = createModelRegistry([requested, parentModel], async model =>
-			model.provider === parentModel.provider ? "test-key" : undefined,
+		// Only the sibling provider has credentials; the explicit request keeps its
+		// own provider instead of borrowing another one's auth.
+		const modelRegistry = createModelRegistry([requested, sibling], async model =>
+			model.provider === sibling.provider ? "test-key" : undefined,
 		);
 
 		const result = await runSubprocess({
 			...baseOptions,
 			agent: { ...baseAgent, name: "scout", model: [`${requested.provider}/${requested.id}`] },
-			parentActiveModelPattern: `${parentModel.provider}/${parentModel.id}`,
 			serviceTierOverride: "scale",
 			id: "subagent-agent-service-tier-auth-fallback",
 			settings: Settings.isolated({ "tier.subagent": "priority" }),
@@ -741,9 +741,9 @@ describe("runSubprocess per-agent service-tier overrides", () => {
 		});
 
 		expect(result.exitCode).toBe(0);
-		expect(spy.mock.calls[0]?.[0]?.model?.provider).toBe(parentModel.provider);
-		// `scale` is an OpenAI-only tier: it lands on the fallback family and never on Anthropic.
-		expect(childTiers(spy.mock.calls[0]?.[0])).toEqual({ openai: "scale" });
+		expect(spy.mock.calls[0]?.[0]?.model?.provider).toBe(requested.provider);
+		// `scale` is an OpenAI-only tier: it cannot land on the requested family.
+		expect(childTiers(spy.mock.calls[0]?.[0])).toEqual({});
 	});
 
 	it("scopes a concrete override to the model the session resolves instead of broadcasting it", async () => {

@@ -28,6 +28,7 @@ import { CostGate } from "../../src/session/cost-gate";
 import { rejectionOf } from "../helpers/rejection";
 
 import { cfgRetryFallbackChains, cfgRetryMaxRetries } from "@oh-my-pi/pi-coding-agent/session/settings";
+import { EXPLICIT_MODEL_CHANGE_ROLE } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 
 async function runEvalCompletionAndWait(
 	args: unknown,
@@ -98,8 +99,15 @@ interface SessionOptions {
 	available?: Model<Api>[];
 	cwd?: string;
 	apiKey?: string | null;
-	activeModel?: string;
+	/** `null` means the session has no active model yet. */
+	activeModel?: string | null;
 	roles?: Partial<Record<"smol" | "default" | "slow", string>>;
+	/**
+	 * Role recorded on the session's newest model change: a role name, `null`
+	 * for a manager whose log records no role yet, or omitted for a session
+	 * without a session manager (completion has no recorded identity).
+	 */
+	lastModelChangeRole?: string | null;
 }
 
 function makeSession(opts: SessionOptions = {}): ToolSession {
@@ -116,11 +124,16 @@ function makeSession(opts: SessionOptions = {}): ToolSession {
 		getApiKey: async () => (opts.apiKey === undefined ? "test-key" : opts.apiKey),
 		resolver: () => async () => (opts.apiKey === undefined ? "test-key" : opts.apiKey),
 	} as unknown as ModelRegistry;
+	const sessionManager =
+		opts.lastModelChangeRole === undefined
+			? undefined
+			: { getLastModelChangeRole: () => opts.lastModelChangeRole ?? undefined };
 	return {
 		cwd: opts.cwd ?? process.cwd(),
 		settings,
 		modelRegistry,
-		getActiveModelString: () => opts.activeModel ?? "p/default",
+		getActiveModelString: () => (opts.activeModel === null ? undefined : (opts.activeModel ?? "p/default")),
+		...(sessionManager ? { sessionManager } : {}),
 	} as unknown as ToolSession;
 }
 
@@ -159,7 +172,11 @@ async function runPythonCompletionsInSubprocess(tempDir: TempDir): Promise<Pytho
 	const repoRoot = path.resolve(import.meta.dir, "../../..");
 	const scriptPath = path.join(tempDir.path(), "run-python-completion.ts");
 	const resultPath = path.join(tempDir.path(), "python-completion-result.json");
-	const aiPath = path.resolve(import.meta.dir, "../../../ai/src/index.ts");
+	// Resolve through the same package specifier the runtime uses. A hard-coded
+	// `packages/ai/src/index.ts` path names a different module instance whenever
+	// `node_modules/@oh-my-pi/pi-ai` is linked to another checkout, so the spy
+	// below would miss the `completeSimple` the bridge actually calls.
+	const aiPath = Bun.resolveSync("@oh-my-pi/pi-ai", import.meta.dir);
 	const executorPath = path.resolve(import.meta.dir, "../../src/eval/py/executor.ts");
 	const settingsPath = path.resolve(import.meta.dir, "../../src/config/settings.ts");
 	const code = [
@@ -284,6 +301,175 @@ describe("runEvalCompletion", () => {
 		expect(`${model.provider}/${model.id}`).toBe("p/slow");
 	});
 
+	it("applies the configured default chain to the default role's active model", async () => {
+		const fallback = makeModel("p", "fallback");
+		const session = makeSession({
+			available: [DEFAULT, fallback],
+			roles: { default: "p/default" },
+			lastModelChangeRole: "default",
+		});
+		cfgRetryFallbackChains.set(session.settings, { default: ["p/fallback"] });
+		const spy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "quota exhausted" }))
+			.mockResolvedValueOnce(assistant({ text: "fallback answer" }));
+
+		const result = await runEvalCompletionAndWait({ prompt: "q", model: "default" }, { session });
+
+		expect(spy.mock.calls.map(call => (call[0] as Model<Api>).id)).toEqual(["default", "fallback"]);
+		expect(result.text).toBe("fallback answer");
+	});
+
+	it("treats a session that recorded no role as the default identity", async () => {
+		const fallback = makeModel("p", "fallback");
+		const session = makeSession({
+			available: [DEFAULT, fallback],
+			roles: { default: "p/default" },
+			lastModelChangeRole: null,
+		});
+		cfgRetryFallbackChains.set(session.settings, { default: ["p/fallback"] });
+		const spy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "quota exhausted" }))
+			.mockResolvedValueOnce(assistant({ text: "fallback answer" }));
+
+		await runEvalCompletionAndWait({ prompt: "q", model: "default" }, { session });
+
+		expect(spy.mock.calls.map(call => (call[0] as Model<Api>).id)).toEqual(["default", "fallback"]);
+	});
+
+	it("uses the recorded role's own chain when another role shares its model", async () => {
+		const fallback = makeModel("p", "fallback");
+		const smolFallback = makeModel("p", "smol-fallback");
+		const session = makeSession({
+			available: [DEFAULT, fallback, smolFallback],
+			roles: { default: "p/default", smol: "p/default" },
+			lastModelChangeRole: "smol",
+		});
+		cfgRetryFallbackChains.set(session.settings, {
+			default: ["p/fallback"],
+			smol: ["p/smol-fallback"],
+		});
+		const spy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "quota exhausted" }))
+			.mockResolvedValueOnce(assistant({ text: "smol fallback answer" }));
+
+		const result = await runEvalCompletionAndWait({ prompt: "q", model: "default" }, { session });
+
+		expect(spy.mock.calls.map(call => (call[0] as Model<Api>).id)).toEqual(["default", "smol-fallback"]);
+		expect(result.text).toBe("smol fallback answer");
+	});
+
+	it("does not lend the default chain to a role whose assignment no longer matches", async () => {
+		const fallback = makeModel("p", "fallback");
+		const session = makeSession({
+			available: [SMOL, DEFAULT, fallback],
+			roles: { default: "p/default", smol: "p/smol" },
+			lastModelChangeRole: "smol",
+		});
+		cfgRetryFallbackChains.set(session.settings, { default: ["p/fallback"] });
+		const spy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValue(assistant({ stopReason: "error", errorMessage: "quota exhausted" }));
+
+		await expect(runEvalCompletionAndWait({ prompt: "q", model: "default" }, { session })).rejects.toThrow(
+			"quota exhausted",
+		);
+		expect(spy.mock.calls.map(call => (call[0] as Model<Api>).id)).toEqual(["default"]);
+	});
+
+	it("owns no role chain for an explicit-selector identity", async () => {
+		const fallback = makeModel("p", "fallback");
+		const session = makeSession({
+			available: [DEFAULT, fallback],
+			roles: { default: "p/default" },
+			lastModelChangeRole: EXPLICIT_MODEL_CHANGE_ROLE,
+		});
+		cfgRetryFallbackChains.set(session.settings, { default: ["p/fallback"] });
+		const spy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValue(assistant({ stopReason: "error", errorMessage: "quota exhausted" }));
+
+		await expect(runEvalCompletionAndWait({ prompt: "q", model: "default" }, { session })).rejects.toThrow(
+			"quota exhausted",
+		);
+		expect(spy.mock.calls.map(call => (call[0] as Model<Api>).id)).toEqual(["default"]);
+	});
+
+	it("still walks the literal model-selector chain for an explicit selector", async () => {
+		const fallback = makeModel("p", "fallback");
+		const session = makeSession({
+			available: [DEFAULT, fallback],
+			lastModelChangeRole: EXPLICIT_MODEL_CHANGE_ROLE,
+		});
+		cfgRetryFallbackChains.set(session.settings, { "p/default": ["p/fallback"] });
+		const spy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "quota exhausted" }))
+			.mockResolvedValueOnce(assistant({ text: "fallback answer" }));
+
+		const result = await runEvalCompletionAndWait({ prompt: "q", model: "default" }, { session });
+
+		expect(spy.mock.calls.map(call => (call[0] as Model<Api>).id)).toEqual(["default", "fallback"]);
+		expect(result.text).toBe("fallback answer");
+	});
+
+	it("still walks a provider wildcard chain for an explicit selector", async () => {
+		const fallback = makeModel("p", "fallback");
+		const session = makeSession({
+			available: [DEFAULT, fallback],
+			lastModelChangeRole: EXPLICIT_MODEL_CHANGE_ROLE,
+		});
+		cfgRetryFallbackChains.set(session.settings, { "p/*": ["p/fallback"] });
+		const spy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "quota exhausted" }))
+			.mockResolvedValueOnce(assistant({ text: "wildcard answer" }));
+
+		const result = await runEvalCompletionAndWait({ prompt: "q", model: "default" }, { session });
+
+		expect(spy.mock.calls.map(call => (call[0] as Model<Api>).id)).toEqual(["default", "fallback"]);
+		expect(result.text).toBe("wildcard answer");
+	});
+
+	it("owns no role chain for a temporary switch", async () => {
+		const fallback = makeModel("p", "fallback");
+		const session = makeSession({
+			available: [DEFAULT, fallback],
+			roles: { default: "p/default" },
+			lastModelChangeRole: "temporary",
+		});
+		cfgRetryFallbackChains.set(session.settings, { default: ["p/fallback"] });
+		const spy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValue(assistant({ stopReason: "error", errorMessage: "quota exhausted" }));
+
+		await expect(runEvalCompletionAndWait({ prompt: "q", model: "default" }, { session })).rejects.toThrow(
+			"quota exhausted",
+		);
+		expect(spy.mock.calls.map(call => (call[0] as Model<Api>).id)).toEqual(["default"]);
+	});
+
+	it("applies the default chain when the tier falls back to the @default role", async () => {
+		const fallback = makeModel("p", "fallback");
+		const session = makeSession({
+			available: [SMOL, DEFAULT, fallback],
+			activeModel: null,
+			roles: { default: "p/default", smol: "p/smol" },
+			lastModelChangeRole: "smol",
+		});
+		cfgRetryFallbackChains.set(session.settings, { default: ["p/fallback"] });
+		const spy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "quota exhausted" }))
+			.mockResolvedValueOnce(assistant({ text: "fallback answer" }));
+
+		await runEvalCompletionAndWait({ prompt: "q", model: "default" }, { session });
+
+		expect(spy.mock.calls.map(call => (call[0] as Model<Api>).id)).toEqual(["default", "fallback"]);
+	});
+
 	it("uses the tier fallback chain after the primary model fails", async () => {
 		const fallback = makeModel("p", "fallback");
 		const session = makeSession({ available: [SMOL, fallback] });
@@ -365,7 +551,7 @@ describe("runEvalCompletion", () => {
 		expect(spy.mock.calls.map(call => (call[0] as Model<Api>).id)).toEqual(["smol", "b"]);
 	});
 
-	it("resolves nested fallbacks without the root tier hint", async () => {
+	it("does not walk another role's chain for a nested model that role owns", async () => {
 		const [b, c, d, e] = ["b", "c", "d", "e"].map(id => makeModel("p", id));
 		const session = makeSession({ available: [SMOL, b, c, d, e] });
 		session.settings.setModelRole("vision", "p/b");
@@ -374,13 +560,12 @@ describe("runEvalCompletion", () => {
 			.spyOn(ai, "completeSimple")
 			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "smol down" }))
 			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "b down" }))
-			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "d down" }))
-			.mockResolvedValueOnce(assistant({ text: "e answer" }));
+			.mockResolvedValueOnce(assistant({ stopReason: "error", errorMessage: "c down" }));
 
-		const result = await runEvalCompletionAndWait({ prompt: "q", model: "smol" }, { session });
-
-		expect(spy.mock.calls.map(call => (call[0] as Model<Api>).id)).toEqual(["smol", "b", "d", "e"]);
-		expect(result.text).toBe("e answer");
+		await expect(runEvalCompletionAndWait({ prompt: "q", model: "smol" }, { session })).rejects.toThrow("c down");
+		// `vision` happens to be assigned the nested hop `p/b`, but its chain is its
+		// own identity's, not the `smol` walk's: only the literal `smol` chain runs.
+		expect(spy.mock.calls.map(call => (call[0] as Model<Api>).id)).toEqual(["smol", "b", "c"]);
 	});
 
 	it("inherits the failed candidate's effort for bare nested entries", async () => {
@@ -1154,6 +1339,11 @@ describe("completion() through eval runtimes", () => {
 		const tempDir = TempDir.createSync("@omp-eval-completion-py-");
 		try {
 			const result = await runPythonCompletionsInSubprocess(tempDir);
+			// A Python cell failure exits 1 with its traceback in `output`; surface
+			// it before asserting so the cause is never discarded.
+			if (result.exitCode !== 0) {
+				throw new Error(`Python completion cell failed with exit code ${result.exitCode}:\n${result.output}`);
+			}
 			expect(result.exitCode).toBe(0);
 			expect(JSON.parse(result.output.trim())).toEqual({
 				plain: "hello from python",

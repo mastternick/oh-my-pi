@@ -23,6 +23,7 @@ import {
 	type CompactionEntry,
 	type CustomMessageEntry,
 	EPHEMERAL_MODEL_CHANGE_ROLE,
+	EXPLICIT_MODEL_CHANGE_ROLE,
 	resolveSessionLeafId,
 	type SessionEntry,
 	type SessionMessageEntry,
@@ -130,7 +131,16 @@ export interface SessionContext {
 	cacheMissExplainedAt?: boolean[];
 }
 
-/** Lists session model strings to try when restoring, in fallback order. */
+/**
+ * Lists session model strings to try when restoring.
+ *
+ * Only the last active role's own model is a candidate: when it is no longer
+ * available, resume reports that failure instead of adopting the `default`
+ * role's model (another role's selection). The `default` model is used only
+ * when the `default` role (or no role at all) was active, or when the recorded
+ * role never stored a model of its own. An explicit-selector identity restores
+ * the model it recorded and never falls through to another role's selection.
+ */
 export function getRestorableSessionModels(
 	models: Readonly<Record<string, string>>,
 	lastModelChangeRole: string | undefined,
@@ -143,11 +153,13 @@ export function getRestorableSessionModels(
 	) {
 		return defaultModel ? [defaultModel] : [];
 	}
+	if (lastModelChangeRole === EXPLICIT_MODEL_CHANGE_ROLE) {
+		const explicitModel = models[EXPLICIT_MODEL_CHANGE_ROLE];
+		return explicitModel ? [explicitModel] : [];
+	}
 
 	const roleModel = models[lastModelChangeRole];
-	if (!roleModel) return defaultModel ? [defaultModel] : [];
-	if (!defaultModel || roleModel === defaultModel) return [roleModel];
-	return [roleModel, defaultModel];
+	return roleModel ? [roleModel] : defaultModel ? [defaultModel] : [];
 }
 
 export function getLatestCompactionEntry(entries: readonly SessionEntry[]): CompactionEntry | null {

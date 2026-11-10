@@ -596,12 +596,16 @@ export function rankXAIProviders<T>(items: readonly T[], modelOf: (item: T) => M
  * chain's xAI-grounded candidates plus the provider default swapped to its
  * cheaper `webSearchModel`, ranked by {@link rankXAIProviders}. Empty without
  * xAI credentials.
+ *
+ * The provider-default addition is bootstrap only. A configured `web` role is
+ * authoritative, so an unrelated xAI model is never appended for it.
  */
 export function xaiModelChain(modelRegistry: ModelRegistry, settings: Settings): Model<Api>[] {
 	const pool = roleCandidatePool("web", settings, modelRegistry);
 	const chain = resolveRoleChain("web", settings, pool)
 		.map(candidate => candidate.model)
 		.filter(model => model.webSearch === "xai");
+	if (settings.getModelRole("web") !== undefined) return rankXAIProviders(chain, model => model, settings);
 	const grounded = pool.filter(model => model.webSearch === "xai");
 	const fallback = pickDefaultAvailableModel(grounded);
 	const runner = fallback && (resolveConfiguredModelTarget(fallback.webSearchModel, fallback, grounded) ?? fallback);

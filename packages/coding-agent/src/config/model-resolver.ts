@@ -17,9 +17,9 @@ import {
  *   grammar on top: trailing `:level` thinking suffixes (`splitThinkingSuffix`)
  *   and `@upstream` provider routing (`splitUpstreamRouting`).
  * - Everything else (`resolveModelFromString`, `resolveModelOverride*`,
- *   `resolveRoleSelection`, `resolveModelScope`, `resolveCliModel`,
- *   `findSmolModel`/`findSlowModel`) adapts inputs — roles, settings patterns,
- *   CLI flags, scope globs — onto that pipeline.
+ *   `resolveRoleSelection`, `resolveModelScope`, `resolveCliModel`) adapts
+ *   inputs — roles, settings patterns, CLI flags, scope globs — onto that
+ *   pipeline.
  */
 
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
@@ -52,7 +52,6 @@ import {
 	DEFAULT_MODEL_ROLE_ALIAS,
 	formatModelRoleAlias,
 	LEGACY_MODEL_ROLE_ALIAS_PREFIX,
-	CHAT_MODEL_ROLE_IDS,
 	MODEL_ROLE_ALIAS_PREFIX,
 	MODEL_ROLE_IDS,
 	type ModelRole,
@@ -572,7 +571,6 @@ export interface ModelMatchPreferences {
 export type ModelLookupRegistry = Pick<ModelRegistry, "getAvailable">;
 type CliModelRegistry = Pick<ModelRegistry, "getAll" | "getAvailable"> & Partial<Pick<ModelRegistry, "hasProvider">>;
 type InitialModelRegistry = Pick<ModelRegistry, "getAvailable" | "find" | "hasConcreteAuth">;
-type RestorableModelRegistry = Pick<ModelRegistry, "getAvailable" | "find" | "getApiKey" | "hasConcreteAuth">;
 
 const kModelOrderIndex = Symbol("model-resolver.modelOrderIndex");
 type ModelsWithOrderIndex = readonly Model<Api>[] & {
@@ -1165,39 +1163,24 @@ function isSessionInheritedAgentPattern(value: string): boolean {
 	);
 }
 
-function shouldInheritDefaultBeforePriority(role: ModelRole): boolean {
-	return role === "smol" || role === "slow";
-}
-
 /**
- * Roles that have no catalog default chain (`roleDefaultModels()`) reuse another role's
- * list. The advisor — a second-opinion reviewer — uses a configured `slow`
- * role before that list, but never inherits the primary's model when `slow`
- * is unset, so it stays a distinct strong model out of the box. The `tiny`
- * role — the override for online title/classifier tasks — resolves through
- * `smol` so it picks the same configured, inherited, or built-in fast model.
- * The `memory` role first reuses a configured/effective `tiny` role, then the
- * same `smol` priority list. The `widget` role — the author of background-job
- * widget specs — resolves exactly like `smol` until configured on its own.
+ * Roles that have no catalog default chain (`roleDefaultModels()`) reuse another
+ * role's built-in list. The advisor — a second-opinion reviewer — uses the
+ * built-in `slow` priority list, never the session's primary model, so it stays
+ * a distinct strong model out of the box. The `tiny` role — the override for
+ * online title/classifier tasks — resolves through `smol`'s built-in fast-model
+ * list. The `memory` role uses the same `smol` priority list, and the `widget`
+ * role — the author of background-job widget specs — also resolves like `smol`.
+ *
+ * Aliasing applies to catalog defaults only. Another role's *configured*
+ * selector is never adopted: an unconfigured role bootstraps from the catalog,
+ * and a configured role is authoritative for itself.
  */
 const ROLE_PRIORITY_ALIAS: Partial<Record<ModelRole, string>> = {
 	advisor: "slow",
 	memory: "smol",
 	tiny: "smol",
 	widget: "smol",
-};
-
-interface ConfiguredRoleFallback {
-	role: ModelRole;
-	/** Skip the target role's default inheritance when it has no explicit configuration. */
-	configuredOnly: boolean;
-}
-
-const ROLE_CONFIGURED_FALLBACK: Partial<Record<ModelRole, ConfiguredRoleFallback>> = {
-	advisor: { role: "slow", configuredOnly: true },
-	memory: { role: "tiny", configuredOnly: false },
-	tiny: { role: "smol", configuredOnly: false },
-	widget: { role: "smol", configuredOnly: false },
 };
 
 function hasOwnKey<T extends object>(value: T, key: PropertyKey): key is keyof T {
@@ -1246,17 +1229,6 @@ function resolveNestedRolePatterns(
 	return resolved;
 }
 
-function resolveDefaultInheritedPatterns(
-	role: ModelRole,
-	configuredDefault: string | undefined,
-	roleDefaults: string[],
-	settings: ModelRoleLookup | undefined,
-	visited: Set<string>,
-): string[] {
-	if (!shouldInheritDefaultBeforePriority(role) || !configuredDefault) return [];
-	return resolveNestedRolePatterns(configuredDefault, roleDefaults, settings, visited);
-}
-
 function resolveConfiguredRolePattern(
 	value: string,
 	settings?: ModelRoleLookup,
@@ -1276,26 +1248,16 @@ function resolveConfiguredRolePattern(
 	visited.add(role);
 
 	const configured = settings?.getModelRole(role)?.trim();
-	const configuredDefault = settings?.getModelRole(DEFAULT_MODEL_ROLE)?.trim();
 	// Built-in defaults chain to other roles (judge: `@tiny`, `@smol`, `@default`). Left unexpanded, the
 	// matcher reads them as literal ids and `@default` fuzzy-matches Vertex ids like `claude-opus-4-8@default`.
 	const roleDefaults = isModelRole(role)
 		? resolveNestedRolePatterns(rolePriorityDefaults(role), [], settings, visited)
 		: [];
-	const configuredFallback = isModelRole(role) ? ROLE_CONFIGURED_FALLBACK[role] : undefined;
-	const fallbackPatterns =
-		configured ||
-		!configuredFallback ||
-		(configuredFallback.configuredOnly && !settings?.getModelRole(configuredFallback.role)?.trim())
-			? undefined
-			: resolveConfiguredRolePattern(formatModelRoleAlias(configuredFallback.role), settings, new Set(visited));
-	const resolved = configured
-		? resolveNestedRolePatterns(configured, roleDefaults, settings, visited)
-		: fallbackPatterns
-			? fallbackPatterns
-			: isModelRole(role)
-				? resolveDefaultInheritedPatterns(role, configuredDefault, roleDefaults, settings, visited)
-				: roleDefaults;
+	// A configured role is authoritative: only its own value (and aliases the
+	// user wrote inside it) applies. An unconfigured role bootstraps from the
+	// catalog; it never adopts another role's configured selector, which would
+	// make the absence of configuration silently pick a specific model.
+	const resolved = configured ? resolveNestedRolePatterns(configured, roleDefaults, settings, visited) : roleDefaults;
 	if (resolved.length === 0) {
 		resolved.push(...roleDefaults);
 	}
@@ -1608,31 +1570,6 @@ export function resolveModelFromString(
 	return parseModelPattern(value, available, matchPreferences).model;
 }
 
-/**
- * Resolve a model from configured roles, honoring order and overrides.
- */
-export function resolveModelFromSettings(options: {
-	settings: Settings;
-	availableModels: Model<Api>[];
-	matchPreferences?: ModelMatchPreferences;
-	roleOrder?: readonly ModelRole[];
-}): Model<Api> | undefined {
-	const { settings, availableModels, matchPreferences, roleOrder } = options;
-	const roles = roleOrder ?? CHAT_MODEL_ROLE_IDS;
-	let sawConfiguredProviderQualifiedRole = false;
-	for (const role of roles) {
-		const configured = settings.getModelRole(role);
-		if (!configured) continue;
-		const expanded = expandRoleAlias(configured, settings).trim();
-		if (expanded.includes("/")) {
-			sawConfiguredProviderQualifiedRole = true;
-		}
-		const resolved = resolveModelFromString(expanded, availableModels, matchPreferences);
-		if (resolved) return resolved;
-	}
-	return sawConfiguredProviderQualifiedRole ? undefined : availableModels[0];
-}
-
 /** A resolved role-chain attempt and whether configuration explicitly admitted it. */
 export interface RoleChainCandidate {
 	model: Model<Api>;
@@ -1642,16 +1579,29 @@ export interface RoleChainCandidate {
 	replaces?: string;
 }
 
-/** Resolve a role's primary and retry candidates in effective attempt order. */
+/**
+ * Resolve a role's primary and retry candidates in effective attempt order.
+ *
+ * An explicitly configured role is authoritative: its candidates are exactly
+ * its configured primary plus its own `retry.fallbackChains[role]` entries.
+ * Falling back to the catalog priority list would silently swap a configured
+ * model for another one, so that list is used only for an unconfigured role
+ * (fresh-install bootstrap).
+ */
 export function resolveRoleChain(role: string, settings: Settings, pool: Model<Api>[]): RoleChainCandidate[] {
 	const configuredRoles = settings.getModelRoles();
 	const configured = settings.getModelRole(role)?.trim();
+	const hasConfiguredRole = Object.hasOwn(configuredRoles, role);
 	const primarySelector = configured || formatModelRoleAlias(role);
 	const configuredFallbacks = cfgRetryFallbackChains.get(settings)[role];
 	const hasConfiguredFallbackChain = Array.isArray(configuredFallbacks);
-	const fallbackSelectors = hasConfiguredFallbackChain ? configuredFallbacks : rolePriorityDefaults(role);
+	const fallbackSelectors = hasConfiguredFallbackChain
+		? configuredFallbacks
+		: hasConfiguredRole
+			? []
+			: rolePriorityDefaults(role);
 	const selectors = [
-		{ selector: primarySelector, explicit: Object.hasOwn(configuredRoles, role) },
+		{ selector: primarySelector, explicit: hasConfiguredRole },
 		...fallbackSelectors.map(selector => ({ selector, explicit: hasConfiguredFallbackChain })),
 	];
 	const candidates: RoleChainCandidate[] = [];
@@ -1810,18 +1760,18 @@ export function sessionModelDiscoveryProviders(
 }
 
 /**
- * Resolve a list of override patterns to the first matching model, with an
- * auth-aware fallback to the parent session's active model.
+ * Resolve a list of override patterns to the first model that can actually
+ * authenticate, walking only the caller's own ordered selector list.
  *
  * Providers disabled through settings are removed before matching so ordered
  * overrides skip them and an all-disabled list resolves to no model.
  *
- * If the resolved subagent model has no working credentials (provider has no
- * usable auth), and the parent's active model resolves with working auth,
- * use the parent's model instead. This prevents subagent dispatch from
- * silently routing to a provider the user can't actually call (e.g.
- * `modelRoles.task` pointing at an unqualified id whose only available
- * provider variant has no configured credentials — see #985).
+ * The ordered override list is the caller's own fallback chain: when the first
+ * resolved entry has no usable credential, a later configured entry that does
+ * authenticate is selected. When none of them can authenticate the primary
+ * resolution is returned unchanged, so the existing error path surfaces the
+ * failure instead of substituting an unrelated model (the parent session's
+ * primary included).
  *
  * `sessionId` is forwarded to `getApiKey` so that session-sticky OAuth
  * credentials resolve correctly during the pre-flight auth check. Without it,
@@ -1830,17 +1780,10 @@ export function sessionModelDiscoveryProviders(
  *
  * Keyless-by-design providers (llama.cpp, ollama, lm-studio) advertise the
  * `kNoAuth` sentinel from `getApiKey` to signal that they do not require
- * credentials. Those are treated as authenticated here so an explicitly
- * configured local model is never silently rerouted to the parent's remote
- * provider (see #1008).
- *
- * If neither the subagent nor the parent has working auth, returns the
- * primary resolution unchanged so the existing error path still surfaces
- * a meaningful failure downstream.
+ * credentials, so an explicitly configured local model is never rerouted.
  */
 export async function resolveModelOverrideWithAuthFallback(
 	modelPatterns: string[],
-	parentActiveModelPattern: string | undefined,
 	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey">,
 	settings?: Settings,
 	sessionId?: string,
@@ -1849,7 +1792,6 @@ export async function resolveModelOverrideWithAuthFallback(
 	model?: Model<Api>;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	explicitThinkingLevel: boolean;
-	authFallbackUsed: boolean;
 	warning?: string;
 }> {
 	const disabledProviders = disabledProviderIds(settings);
@@ -1859,42 +1801,34 @@ export async function resolveModelOverrideWithAuthFallback(
 		lookupRegistry = { getAvailable: () => enabledModels };
 	}
 	const primary = resolveModelOverride(modelPatterns, lookupRegistry, settings, options);
-	if (!primary.model || !parentActiveModelPattern) {
-		return { ...primary, authFallbackUsed: false };
+	if (!primary.model) {
+		return primary;
 	}
 
 	const primaryKey = await modelRegistry.getApiKey(primary.model, sessionId);
 	if (primaryKey === kNoAuth || isAuthenticated(primaryKey)) {
-		return { ...primary, authFallbackUsed: false };
+		return primary;
 	}
 	// The ordered override list is the caller's own fallback chain: an
-	// authenticated later entry beats the parent's model.
+	// authenticated later entry beats the unauthenticated primary.
 	for (const pattern of resolveConfiguredModelPatterns(modelPatterns, settings)) {
 		const candidate = resolveModelOverride([pattern], lookupRegistry, settings);
 		if (!candidate.model || modelsAreEqual(candidate.model, primary.model)) continue;
 		const candidateKey = await modelRegistry.getApiKey(candidate.model, sessionId);
 		if (candidateKey === kNoAuth || isAuthenticated(candidateKey)) {
-			return { ...candidate, authFallbackUsed: false };
+			return primary.warning ? { ...candidate, warning: primary.warning } : candidate;
 		}
 	}
-
-	const fallback = resolveModelOverride([parentActiveModelPattern], lookupRegistry, settings);
-	if (!fallback.model) {
-		return { ...primary, authFallbackUsed: false };
-	}
-	if (modelsAreEqual(fallback.model, primary.model)) {
-		return { ...primary, authFallbackUsed: false };
-	}
-	const fallbackKey = await modelRegistry.getApiKey(fallback.model, sessionId);
-	if (!isAuthenticated(fallbackKey)) {
-		return { ...primary, authFallbackUsed: false };
-	}
-
-	return { ...fallback, authFallbackUsed: true, warning: primary.warning ?? fallback.warning };
+	return primary;
 }
 
 /**
  * Resolve a list of role patterns to the first matching model.
+ *
+ * The walk stops at the first role that is explicitly configured: when that
+ * role's own selector cannot resolve, the caller sees no model (and reports the
+ * failure) instead of silently adopting the next role's model. Roles are only
+ * skipped while they are unconfigured.
  */
 export function resolveRoleSelection(
 	roles: readonly string[],
@@ -1903,13 +1837,17 @@ export function resolveRoleSelection(
 ): { role: string; model: Model<Api>; thinkingLevel?: ConfiguredThinkingLevel } | undefined {
 	const matchPreferences = getModelMatchPreferences(settings);
 	for (const role of roles) {
-		const resolved = resolveModelRoleValue(settings.getModelRole(role), availableModels, {
+		const configured = settings.getModelRole(role)?.trim();
+		const resolved = resolveModelRoleValue(configured, availableModels, {
 			settings,
 			matchPreferences,
 		});
 		if (resolved.model) {
 			return { role, model: resolved.model, thinkingLevel: resolved.thinkingLevel };
 		}
+		// A configured role with no usable model is a failure, not a reason to
+		// borrow the next role's selection.
+		if (configured) return undefined;
 	}
 	return undefined;
 }
@@ -1917,10 +1855,9 @@ export function resolveRoleSelection(
 /**
  * Resolve the model for the `advisor` role. A configured `modelRoles.advisor`
  * wins outright (a bad override surfaces as no model rather than silently
- * running something else); when unset it uses a configured `slow` role before
- * the built-in slow priority chain. It never inherits the primary model through
- * an unconfigured `slow` role. Returns undefined only when no candidate in the
- * resolved chain is available.
+ * running something else); when unset it uses the built-in slow priority chain.
+ * It never adopts a configured `slow` role's selector, nor the primary model.
+ * Returns undefined only when no candidate in the resolved chain is available.
  */
 export function resolveAdvisorRoleSelection(
 	settings: Settings,
@@ -2543,141 +2480,4 @@ export async function findInitialModel(options: {
 
 	// 5. No model found
 	return { model: undefined, thinkingLevel: undefined, fallbackMessage: undefined };
-}
-
-/**
- * Restore model from session, with fallback to available models
- */
-export async function restoreModelFromSession(
-	savedProvider: string,
-	savedModelId: string,
-	currentModel: Model<Api> | undefined,
-	shouldPrintMessages: boolean,
-	modelRegistry: RestorableModelRegistry,
-): Promise<{ model: Model<Api> | undefined; fallbackMessage: string | undefined }> {
-	const restoredModel = modelRegistry.find(savedProvider, savedModelId);
-
-	// Check if restored model exists and has a valid API key
-	const hasApiKey = restoredModel ? !!(await modelRegistry.getApiKey(restoredModel)) : false;
-
-	if (restoredModel && hasApiKey) {
-		if (shouldPrintMessages) {
-			console.log(chalk.dim(`Restored model: ${savedProvider}/${savedModelId}`));
-		}
-		return { model: restoredModel, fallbackMessage: undefined };
-	}
-
-	// Model not found or no API key - fall back
-	const reason = !restoredModel ? "model no longer exists" : "no API key available";
-
-	if (shouldPrintMessages) {
-		console.error(chalk.yellow(`Warning: Could not restore model ${savedProvider}/${savedModelId} (${reason}).`));
-	}
-
-	// If we already have a model, use it as fallback
-	if (currentModel) {
-		if (shouldPrintMessages) {
-			console.log(chalk.dim(`Falling back to: ${currentModel.provider}/${currentModel.id}`));
-		}
-		return {
-			model: currentModel,
-			fallbackMessage: `Could not restore model ${savedProvider}/${savedModelId} (${reason}). Using ${currentModel.provider}/${currentModel.id}.`,
-		};
-	}
-
-	// Try to find any available model
-	const availableModels = modelRegistry.getAvailable();
-
-	const fallbackModel = pickDefaultAvailableModel(availableModels, provider =>
-		modelRegistry.hasConcreteAuth(provider),
-	);
-	if (fallbackModel) {
-		if (shouldPrintMessages) {
-			console.log(chalk.dim(`Falling back to: ${fallbackModel.provider}/${fallbackModel.id}`));
-		}
-
-		return {
-			model: fallbackModel,
-			fallbackMessage: `Could not restore model ${savedProvider}/${savedModelId} (${reason}). Using ${fallbackModel.provider}/${fallbackModel.id}.`,
-		};
-	}
-
-	// No models available
-	return { model: undefined, fallbackMessage: undefined };
-}
-
-/**
- * Find a smol/fast model using the priority chain.
- * Tries exact matches first, then fuzzy matches.
- *
- * @param modelRegistry The model registry to search
- * @param savedModel Optional saved model string from settings (provider/modelId)
- * @returns The best available smol model, or undefined if none found
- */
-export async function findSmolModel(
-	modelRegistry: ModelLookupRegistry,
-	savedModel?: string,
-): Promise<Model<Api> | undefined> {
-	const availableModels = modelRegistry.getAvailable();
-	if (availableModels.length === 0) return undefined;
-
-	// 1. Try saved model from settings
-	if (savedModel) {
-		const match = resolveModelFromString(savedModel, availableModels, undefined);
-		if (match) return match;
-	}
-
-	// 2. Try priority chain
-	for (const pattern of roleDefaultModels().smol) {
-		// Try exact match with provider prefix
-		const providerMatch = availableModels.find(m => `${m.provider}/${m.id}`.toLowerCase() === pattern);
-		if (providerMatch) return providerMatch;
-
-		// Try exact match first
-		const exactMatch = parseModelPattern(pattern, availableModels, undefined).model;
-		if (exactMatch) return exactMatch;
-
-		// Try fuzzy match (substring)
-		const fuzzyMatch = availableModels.find(m => m.id.toLowerCase().includes(pattern));
-		if (fuzzyMatch) return fuzzyMatch;
-	}
-
-	// 3. Fallback to first available (same as default)
-	return availableModels[0];
-}
-
-/**
- * Find a slow/comprehensive model using the priority chain.
- * Prioritizes reasoning and codex models for thorough analysis.
- *
- * @param modelRegistry The model registry to search
- * @param savedModel Optional saved model string from settings (provider/modelId)
- * @returns The best available slow model, or undefined if none found
- */
-export async function findSlowModel(
-	modelRegistry: ModelLookupRegistry,
-	savedModel?: string,
-): Promise<Model<Api> | undefined> {
-	const availableModels = modelRegistry.getAvailable();
-	if (availableModels.length === 0) return undefined;
-
-	// 1. Try saved model from settings
-	if (savedModel) {
-		const match = resolveModelFromString(savedModel, availableModels, undefined);
-		if (match) return match;
-	}
-
-	// 2. Try priority chain
-	for (const pattern of roleDefaultModels().slow) {
-		// Try exact match first
-		const exactMatch = parseModelPattern(pattern, availableModels, undefined).model;
-		if (exactMatch) return exactMatch;
-
-		// Try fuzzy match (substring)
-		const fuzzyMatch = availableModels.find(m => m.id.toLowerCase().includes(pattern.toLowerCase()));
-		if (fuzzyMatch) return fuzzyMatch;
-	}
-
-	// 3. Fallback to first available (same as default)
-	return availableModels[0];
 }

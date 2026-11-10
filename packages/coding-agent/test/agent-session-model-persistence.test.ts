@@ -6,7 +6,11 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream"
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { type CreateAgentSessionResult, createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
+import {
+	type CreateAgentSessionResult,
+	createAgentSession,
+	SessionModelRestoreError,
+} from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { getRestorableSessionModels } from "@oh-my-pi/pi-coding-agent/session/session-context";
@@ -323,7 +327,7 @@ describe("AgentSession model persistence", () => {
 		expect(result.session.model?.id).toBe(smolModel.id);
 	});
 
-	it("falls back to the saved default model when switch-session role restore is unavailable", async () => {
+	it("rejects a switch-session restore whose role model is unavailable instead of borrowing default", async () => {
 		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
 		const previousModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
 		const defaultRoleValue = modelValue(defaultModel);
@@ -335,8 +339,11 @@ describe("AgentSession model persistence", () => {
 			persist: true,
 		});
 
-		await expect(created.session.switchSession(targetSessionFile)).resolves.toBe(true);
-		expect(created.session.model?.id).toBe(defaultModel.id);
+		// The saved default role is another identity's selection: the restore
+		// fails visibly rather than silently running its model.
+		await expect(created.session.switchSession(targetSessionFile)).rejects.toThrow(
+			"Could not restore model anthropic/not-loaded-anymore",
+		);
 	});
 
 	it("restores the saved default model when switch-session last role is fallback", async () => {
@@ -359,7 +366,7 @@ describe("AgentSession model persistence", () => {
 		expect(created.session.model?.id).toBe(defaultModel.id);
 	});
 
-	it("falls back to the saved default model when startup role restore is unavailable", async () => {
+	it("rejects a startup restore whose role model is unavailable instead of borrowing default", async () => {
 		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
 		const settingsFallbackModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
 		const defaultRoleValue = modelValue(defaultModel);
@@ -367,9 +374,10 @@ describe("AgentSession model persistence", () => {
 		const settings = Settings.isolated();
 		settings.setModelRole("default", modelValue(settingsFallbackModel));
 
-		const result = await createStartupResumeSession(targetSessionFile, settings);
-
-		expect(result.session.model?.id).toBe(defaultModel.id);
+		// A configured default role cannot stand in for the last active role.
+		await expect(createStartupResumeSession(targetSessionFile, settings)).rejects.toBeInstanceOf(
+			SessionModelRestoreError,
+		);
 	});
 
 	it("restores the saved default model when startup last role is fallback", async () => {
@@ -842,7 +850,7 @@ describe("AgentSession model persistence", () => {
 		});
 	});
 
-	it("lists restorable temporary model before the default fallback", () => {
+	it("lists only the last active role's own model, never the default role's", () => {
 		expect(
 			getRestorableSessionModels(
 				{
@@ -851,7 +859,7 @@ describe("AgentSession model persistence", () => {
 				},
 				"temporary",
 			),
-		).toEqual(["anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-5"]);
+		).toEqual(["anthropic/claude-sonnet-4-6"]);
 	});
 
 	it("lists only the default model for ephemeral fallback restores", () => {

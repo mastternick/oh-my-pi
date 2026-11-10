@@ -350,7 +350,9 @@ export function createPersistedSubagentReviverFactory(
 					modelRegistry: ctx.modelRegistry,
 					...(perCallModel ? { model: perCallModel, thinkingLevel: init.perCallThinkingLevel ?? undefined } : {}),
 					...(persistedModelPattern ? { modelPattern: persistedModelPattern } : {}),
-					modelPatternAuthFallback: restoredSeance || init.perCallModel ? undefined : init.resolvedModel,
+					// A revived subagent owns the same `subagent:<id>` role the spawn
+					// recorded, so its persisted chain still routes at a changed effort.
+					...(init.retryFallback ? { modelPatternFallbackRole: subagentRetryFallbackRole(ref.id) } : {}),
 					settings: subagentSettings,
 					sessionManager: reopened,
 					agentId: ref.id,

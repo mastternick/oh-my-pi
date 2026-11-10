@@ -1903,9 +1903,10 @@ export class TurnRecovery {
 	/**
 	 * Map the failing model selector to the chain key that owns it, by
 	 * specificity: an exact model-selector key, then a `provider/*` wildcard,
-	 * then a model role whose current assignment matches, then `default`.
-	 * Model-oriented keys win over roles so a chain follows the model across
-	 * role reassignments.
+	 * then the hinted role's own key while that role still owns the live model.
+	 * Model-oriented keys outrank roles so a chain follows its model; a role is
+	 * never inferred from model equality, and no role (including `default`)
+	 * lends its chain to another identity.
 	 */
 	resolveRetryFallbackRole(
 		currentSelector: string,
@@ -1952,14 +1953,29 @@ export class TurnRecovery {
 	 * Live session role for chain lookup, provided its assignment still matches the active model.
 	 * Temporary switches record the `fallback` role; skipping them keeps the assigned role (e.g. a
 	 * subagent's own, possibly empty, chain) once the session is back on that role's model.
+	 *
+	 * A session with no recorded model-change role started on the `default`
+	 * role (startup appends the initial model without a role), so `default` is
+	 * the identity to try next: without it the explicitly configured `default`
+	 * chain would never apply to the session that owns it. No other role is
+	 * inferred from model equality — that inference is what let a shared
+	 * assignment capture another role's chain. A role that does not own the
+	 * active model, an explicit model switch (`temporary`), and the
+	 * explicit-selector identity all resolve to no hint: they route by model
+	 * selector and provider wildcard only.
 	 */
 	#liveRetryRoleHint(currentModel: Model | null | undefined): string | undefined {
-		const role = this.#host.sessionManager?.getLastModelChangeRole?.({ skipEphemeral: true });
-		if (!role || !currentModel) return undefined;
-		const configured = this.#host.settings.getModelRole(role);
-		if (!configured) return undefined;
-		const resolved = resolveModelOverride([configured], this.#host.modelRegistry, this.#host.settings);
-		return resolved.model && modelsAreEqual(resolved.model, currentModel) ? role : undefined;
+		if (!currentModel) return undefined;
+		// `getLastModelChangeRole` reports a role-less startup entry as `default`,
+		// which is this session's own identity.
+		const recorded = this.#host.sessionManager?.getLastModelChangeRole?.({ skipEphemeral: true }) ?? "default";
+		if (recorded === "default") return "default";
+		const configured = this.#host.settings.getModelRole(recorded);
+		if (configured) {
+			const resolved = resolveModelOverride([configured], this.#host.modelRegistry, this.#host.settings);
+			if (resolved.model && modelsAreEqual(resolved.model, currentModel)) return recorded;
+		}
+		return undefined;
 	}
 
 	/** Finds fallback candidates that follow the active selector. */

@@ -79,6 +79,7 @@ import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import type { CostGate } from "../session/cost-gate";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
+import { EXPLICIT_MODEL_CHANGE_ROLE } from "../session/session-entries";
 import { hasConversationalHistory, SessionManager } from "../session/session-manager";
 import { truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import {
@@ -307,11 +308,12 @@ function resolveSubagentRetryFallbackCandidates(
  * fallbacks of their own. The child is pinned to a `subagent:<id>` role whose
  * chain shadows every configured role chain (see
  * {@link installSubagentRetryFallbackChain}), so a role-alias request (`@smol`,
- * the bundled `task` agent's `@task`) MUST inherit that role's chain —
- * otherwise the pin silently re-routes the child onto the `default` role's
- * chain. Explicit model selectors keep inheriting `default`: they carry no role
- * identity, and a role that happens to be assigned the same model must not
- * capture the child's fallback routing.
+ * the bundled `task` agent's `@task`) inherits that role's own chain.
+ *
+ * An explicit model selector carries no role identity, so it inherits nothing:
+ * the `default` role's chain belongs to the default role, and lending it to a
+ * child pinned elsewhere would route the child onto models the user never
+ * selected for it.
  *
  * Spawn paths preserve the pre-expansion alias as `modelRole` because their
  * model patterns are already expanded. Direct callers may still supply an
@@ -324,9 +326,9 @@ function resolveSubagentInheritedRetryFallbackChain(
 	role: string | undefined,
 ): string[] | undefined {
 	const configuredChains = cfgRetryFallbackChains.get(settings);
-	// An explicitly emptied role chain means "no fallbacks", not "inherit
-	// default" — mirrors expandDefaultRetryFallbackChains.
-	const fallbackChain = (role !== undefined ? configuredChains?.[role] : undefined) ?? configuredChains?.default;
+	// Only the role's own chain applies; an explicitly emptied chain means
+	// "no fallbacks", not "inherit default".
+	const fallbackChain = role !== undefined ? configuredChains?.[role] : undefined;
 	if (!Array.isArray(fallbackChain) || !fallbackChain.every(entry => typeof entry === "string")) {
 		return undefined;
 	}
@@ -343,17 +345,16 @@ function installSubagentRetryFallbackChain(args: {
 	candidates: SubagentRetryFallbackCandidate[];
 	inheritedFallbackChain: string[] | undefined;
 	model: Model<Api> | undefined;
-	authFallbackUsed: boolean;
 }): string | undefined {
-	const { settings, id, candidates, inheritedFallbackChain, model, authFallbackUsed } = args;
-	if (!model || authFallbackUsed || candidates.length === 0) return undefined;
+	const { settings, id, candidates, inheritedFallbackChain, model } = args;
+	if (!model || candidates.length === 0) return undefined;
 
 	const selectedIndex = candidates.findIndex(
 		candidate => candidate.model.provider === model.provider && candidate.model.id === model.id,
 	);
 	if (selectedIndex < 0) return undefined;
 	const fallbackSelectors = candidates.slice(selectedIndex + 1).map(candidate => candidate.selector);
-	// A single configured model may reuse its role's (or the default) configured chain, but never an implicit parent fallback.
+	// A single configured model may reuse its own role's configured chain.
 	const fallbackChain = fallbackSelectors.length > 0 ? fallbackSelectors : inheritedFallbackChain;
 	if (!Array.isArray(fallbackChain) || !fallbackChain.every(entry => typeof entry === "string")) {
 		return undefined;
@@ -461,11 +462,6 @@ export interface ExecutorOptions {
 	modelRole?: string;
 	/** Extension routing note for the chosen model; surfaced as `resolvedModelRoute`. */
 	modelRoute?: string;
-	/**
-	 * Active model selector of the parent session, used as an auth-aware fallback
-	 * if the resolved subagent model has no working credentials. See #985.
-	 */
-	parentActiveModelPattern?: string;
 	/** Set for a per-call `model`; every model the child sends to must stay approved by these grants. */
 	perCallModelGrants?: PerCallModelGrants;
 	thinkingLevel?: ConfiguredThinkingLevel;
@@ -4738,12 +4734,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				model,
 				thinkingLevel: resolvedThinkingLevel,
 				explicitThinkingLevel,
-				authFallbackUsed,
 				warning: modelResolutionWarning,
 			} = await awaitAbortable(
 				resolveModelOverrideWithAuthFallback(
 					modelPatterns,
-					options.parentActiveModelPattern,
 					modelRegistry,
 					settings,
 					id,
@@ -4759,14 +4753,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				logger.warn("Subagent model resolution warning", {
 					warning: modelResolutionWarning,
 					requested: modelPatterns,
-				});
-			}
-			if (authFallbackUsed && model) {
-				logger.warn("Subagent model has no working credentials; falling back to parent session model", {
-					requested: modelPatterns,
-					parentModel: options.parentActiveModelPattern,
-					resolvedProvider: model.provider,
-					resolvedModel: model.id,
 				});
 			}
 			// Preflight skips these checks while the registry is cold, so hold the model
@@ -4795,7 +4781,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				candidates: resolveSubagentRetryFallbackCandidates(modelPatterns, modelRegistry, subagentSettings),
 				inheritedFallbackChain: inheritedRetryFallbackChain,
 				model,
-				authFallbackUsed,
 			});
 			if (retryFallbackRole) {
 				logger.debug("Configured subagent runtime model fallback chain", {
@@ -4958,8 +4943,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					inheritedSessionAgents: options.inheritedSessionAgents,
 					model,
 					modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
-					modelPatternAuthFallback:
-						model || modelOverride === undefined ? undefined : options.parentActiveModelPattern,
 					modelPatternFallbackRole:
 						model || modelOverride === undefined ? undefined : subagentRetryFallbackRole(id),
 					modelPatternDefaultFallbackChain:
@@ -5105,16 +5088,22 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 			mcpFollower?.bind(session);
 			// The SDK records a new session's initial model as the default role.
-			// Pin the child's own chain so a parent default sharing that model
-			// cannot steal its fallback routing. Resumed history keeps its role.
+			// Record the child's own identity instead — its pinned retry role, else
+			// the role it was spawned for, else explicit-selector identity — so the
+			// parent's `default` chain cannot capture a child that never had a chain
+			// of its own. Resumed history keeps its role.
 			if (
 				!hasExistingModelRole &&
-				retryFallbackRole &&
 				model &&
 				session.model &&
 				formatModelStringWithRouting(session.model) === formatModelStringWithRouting(model)
 			) {
-				sessionManager.appendModelChange(formatModelStringWithRouting(model), retryFallbackRole);
+				const spawnIdentity =
+					retryFallbackRole ??
+					modelRole ??
+					resolveExplicitModelRole(modelPatterns, subagentSettings) ??
+					EXPLICIT_MODEL_CHANGE_ROLE;
+				sessionManager.appendModelChange(formatModelStringWithRouting(model), spawnIdentity);
 			}
 			sessionCreatedAt = performance.now();
 

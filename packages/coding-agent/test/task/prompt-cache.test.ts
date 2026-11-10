@@ -749,64 +749,59 @@ describe("task sibling prompt-cache routing", () => {
 		}
 	});
 
-	it.each([
-		["muse-code/muse-spark-1.3-contributor", "openai-codex", "gpt-6-luna", undefined],
-		["openai-codex/gpt-6-luna", "muse-code", "muse-spark-1.3-contributor", "parent:task"],
-	] as const)(
-		"gates the authenticated fallback after deferred %s selection",
-		async (requested, provider, modelId, expected) => {
-			using directory = TempDir.createSync("@omp-task-cache-fallback-");
-			vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Network is disabled in this test"));
-			const requests: Array<{ model: Model; cacheKey: string | undefined }> = [];
-			const mock = createMockModel({ handler: { content: [{ type: "text", text: "Done." }] } });
-			const realSettingsStream = settingsStream.createSettingsAwareStreamFn;
-			vi.spyOn(settingsStream, "createSettingsAwareStreamFn").mockImplementation((settings, _base, slowMode) =>
-				realSettingsStream(
-					settings,
-					(model, context, options) => {
-						requests.push({ model, cacheKey: options?.promptCacheKey });
-						return mock.stream(model, context, options);
-					},
-					slowMode,
-				),
-			);
-			const authStorage = await AuthStorage.create(directory.join("auth.db"));
-			authStorage.keys.setRuntime(provider, "test-key");
-			try {
-				const { session } = await sdk.createAgentSession({
-					cwd: directory.path(),
-					agentDir: directory.path(),
-					authStorage,
-					modelPattern: requested,
-					modelPatternAuthFallback: `${provider}/${modelId}`,
-					taskPromptCacheKey: "parent:task",
-					sessionManager: SessionManager.inMemory(directory.path()),
-					settings: Settings.isolated({
-						"async.enabled": false,
-						"marketplace.autoUpdate": "off",
-						"compaction.enabled": false,
-					}),
-					toolNames: [],
-					disableExtensionDiscovery: true,
-					skills: [],
-					contextFiles: [],
-					promptTemplates: [],
-					rules: [],
-					enableMCP: false,
-					enableLsp: false,
-				});
-				sessions.push(session);
-				await session.agent.prompt("Review the change.");
-				expect(requests).toHaveLength(1);
-				expect(requests[0]?.model.provider).toBe(provider);
-				expect(requests[0]?.model.id).toBe(modelId);
-				expect(requests[0]?.cacheKey).toBe(expected);
-			} finally {
-				await Promise.all(sessions.splice(0).map(session => session.dispose()));
-				authStorage.close();
-			}
-		},
-	);
+	it("keeps an explicitly requested deferred model instead of an authenticated sibling", async () => {
+		using directory = TempDir.createSync("@omp-task-cache-fallback-");
+		vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Network is disabled in this test"));
+		const requests: Array<{ model: Model; cacheKey: string | undefined }> = [];
+		const mock = createMockModel({ handler: { content: [{ type: "text", text: "Done." }] } });
+		const realSettingsStream = settingsStream.createSettingsAwareStreamFn;
+		vi.spyOn(settingsStream, "createSettingsAwareStreamFn").mockImplementation((settings, _base, slowMode) =>
+			realSettingsStream(
+				settings,
+				(model, context, options) => {
+					requests.push({ model, cacheKey: options?.promptCacheKey });
+					return mock.stream(model, context, options);
+				},
+				slowMode,
+			),
+		);
+		const authStorage = await AuthStorage.create(directory.join("auth.db"));
+		// Only the unrelated provider holds credentials: the explicit selection
+		// still wins, and the task's prompt-cache key rides its own family.
+		authStorage.keys.setRuntime("openai-codex", "test-key");
+		try {
+			const { session } = await sdk.createAgentSession({
+				cwd: directory.path(),
+				agentDir: directory.path(),
+				authStorage,
+				modelPattern: "muse-code/muse-spark-1.3-contributor",
+				taskPromptCacheKey: "parent:task",
+				sessionManager: SessionManager.inMemory(directory.path()),
+				settings: Settings.isolated({
+					"async.enabled": false,
+					"marketplace.autoUpdate": "off",
+					"compaction.enabled": false,
+				}),
+				toolNames: [],
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				rules: [],
+				enableMCP: false,
+				enableLsp: false,
+			});
+			sessions.push(session);
+			await session.agent.prompt("Review the change.");
+			expect(requests).toHaveLength(1);
+			expect(requests[0]?.model.provider).toBe("muse-code");
+			expect(requests[0]?.model.id).toBe("muse-spark-1.3-contributor");
+			expect(requests[0]?.cacheKey).toBe("parent:task");
+		} finally {
+			await Promise.all(sessions.splice(0).map(session => session.dispose()));
+			authStorage.close();
+		}
+	});
 
 	const cacheModels = ["muse-spark-1.3-contributor", "muse-wonder-full-1.0-contributor"];
 	it.each(cacheModels)("rechecks %s while explicit session and request keys win", async modelId => {

@@ -18,7 +18,7 @@ import { isEnoent, logger, parseImageMetadata, prompt, ptree, Snowflake, untilAb
 import { type RoleChainCandidate, resolveModelRoleValue, resolveRoleChain } from "../config/model-resolver";
 import { roleCandidatePool } from "../config/model-roles";
 import { isAuthenticated, type ModelRegistry } from "../config/model-registry";
-import { settings } from "../config/settings";
+import { settings, type Settings } from "../config/settings";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import imageGenDescription from "../prompts/tools/image-gen.md" with { type: "text" };
 import { resolveConfiguredModelTarget } from "../session/role-models";
@@ -166,6 +166,10 @@ function resolveHostedImageCarrier(
  * Default image candidates: explicit role entries first, then the session's
  * own provider (its `imageModel` swap, then the session model itself when it
  * carries the hosted image tool), then the remaining built-in chain.
+ *
+ * The session-derived candidates are passed as `undefined` when the `image`
+ * role is explicitly configured: a configured image model is authoritative and
+ * must not be replaced by the session's provider when it cannot serve.
  */
 function defaultImageCandidates(chain: RoleChainCandidate[], sessionModel: Model | undefined, pool: Model[]): Model[] {
 	const sessionCandidates = sessionModel
@@ -187,6 +191,31 @@ function defaultImageCandidates(chain: RoleChainCandidate[], sessionModel: Model
 		seen.add(key);
 		return true;
 	});
+}
+
+/**
+ * Image candidates for one request.
+ *
+ * A requested selector wins outright. Otherwise the `image` role chain applies,
+ * with the session's own provider appended only while the role is
+ * unconfigured: a configured image model is authoritative and must not be
+ * replaced by the session's provider when it cannot serve.
+ */
+export function resolveImageCandidates(
+	settingsInstance: Settings,
+	models: Model[],
+	sessionModel: Model | undefined,
+	requestedModel?: string,
+): Model[] {
+	if (requestedModel) {
+		const selected = resolveModelRoleValue(requestedModel, models, { settings: settingsInstance }).model;
+		if (!selected) {
+			throw new Error(`Image model selector did not match an available image model: ${requestedModel}`);
+		}
+		return [selected];
+	}
+	const sessionFallback = settingsInstance.getModelRole("image") === undefined ? sessionModel : undefined;
+	return defaultImageCandidates(resolveRoleChain("image", settingsInstance, models), sessionFallback, models);
 }
 
 async function buildToolResult(
@@ -246,15 +275,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 			const requestSignal = ptree.combineSignals(signal, IMAGE_TIMEOUT);
 			const effectiveSettings = ctx.settings ?? settings;
 			const pool = roleCandidatePool("image", effectiveSettings, ctx.modelRegistry);
-			let candidates: Model[];
-			if (params.model) {
-				const selected = resolveModelRoleValue(params.model, pool, { settings: effectiveSettings }).model;
-				if (!selected)
-					throw new Error(`Image model selector did not match an available image model: ${params.model}`);
-				candidates = [selected];
-			} else {
-				candidates = defaultImageCandidates(resolveRoleChain("image", effectiveSettings, pool), ctx.model, pool);
-			}
+			const candidates = resolveImageCandidates(effectiveSettings, pool, ctx.model, params.model);
 
 			const failures: ProviderHttpError[] = [];
 			const skipped: string[] = [];

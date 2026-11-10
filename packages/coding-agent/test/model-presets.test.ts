@@ -21,7 +21,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { cfgDefaultThinkingLevel } from "@oh-my-pi/pi-coding-agent/session/settings";
+import { cfgDefaultThinkingLevel, cfgRetryFallbackChains } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const SONNET = "anthropic/claude-sonnet-4-5";
@@ -117,6 +117,38 @@ describe("model presets", () => {
 		// setModel alone keeps the previous `high`; the preset's `low` must win.
 		expect(session.thinkingLevel).toBe(Effort.Low);
 		expect(cfgDefaultThinkingLevel.get(settings)).toBe(Effort.Low);
+	});
+
+	it("round-trips retry fallback chains per role, and a chainless preset applies an empty record", async () => {
+		const settings = Settings.isolated();
+		settings.setModelRole("default", OPUS);
+		settings.setModelRole("slow", SONNET);
+		cfgRetryFallbackChains.override(settings, {
+			default: ["anthropic/claude-haiku-4-5"],
+			slow: ["anthropic/claude-sonnet-4-6"],
+		});
+		saveModelPreset(settings, "chained");
+		cfgModelPresets.setEntry(settings, "bare", { modelRoles: { default: OPUS } });
+
+		// Live chains drift after the save; applying restores exactly the snapshot.
+		settings.setModelRole("slow", undefined);
+		cfgRetryFallbackChains.override(settings, { slow: ["anthropic/claude-opus-4-5"] });
+		const session = createSession(settings, SONNET, Effort.High);
+
+		const applied = await applyModelPreset(session, "chained", { scope: "project" });
+		expect(applied.kind).toBe("switched");
+		// The applied preset owns the session's chains whole, ahead of the runtime
+		// override that still decides the project-level record.
+		expect(cfgRetryFallbackChains.get(session.settings)).toEqual({
+			default: ["anthropic/claude-haiku-4-5"],
+			slow: ["anthropic/claude-sonnet-4-6"],
+		});
+
+		// A preset without chains is explicit-only: every role resolves no key,
+		// never a chain inherited from the live configuration.
+		const bare = await applyModelPreset(session, "bare", { scope: "project" });
+		expect(bare.kind).toBe("switched");
+		expect(cfgRetryFallbackChains.get(session.settings)).toEqual({});
 	});
 
 	it("an explicit selector level on the preset's default beats its defaultThinkingLevel", async () => {

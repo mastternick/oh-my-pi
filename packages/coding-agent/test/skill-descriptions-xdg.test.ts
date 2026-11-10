@@ -7,7 +7,6 @@ import * as agentCore from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { __resetProfileSnapshotForTests, getAgentDir, Snowflake, setAgentDir } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../src/config/model-registry";
-import { resolveRoleChain, resolveRoleSelection } from "../src/config/model-resolver";
 import { cfgDisabledProviders } from "../src/config/model-settings";
 import { Settings } from "../src/config/settings";
 import {
@@ -377,18 +376,6 @@ describe("skill description compressor model selection", () => {
 		return { registry, settings, authStorage, compressor: createSkillDescriptionCompressor(registry, settings) };
 	}
 
-	it("does not materialize unrelated catalogs for the first exact role selection", () => {
-		const { registry, compressor } = fixture({ default: "anthropic/claude-opus-4-5" });
-		const all = spyOn(registry, "getAvailable").mockImplementation(() => {
-			throw new Error("Unrelated catalogs must stay lazy");
-		});
-		const scoped = spyOn(registry, "getAvailableForProviders");
-		expect(compressor.modelKey()).toBe("anthropic/claude-opus-4-5");
-		expect(compressor.modelKey()).toBe("anthropic/claude-opus-4-5");
-		expect(scoped).toHaveBeenCalledWith(new Set(["anthropic"]));
-		expect(all).not.toHaveBeenCalled();
-	});
-
 	it("keeps complete selector and fallback precedence when a scoped exact match misses", () => {
 		const { registry, settings, compressor } = fixture({});
 		registry.registerProvider("skill-custom", {
@@ -407,22 +394,19 @@ describe("skill description compressor model selection", () => {
 				},
 			],
 		});
-		for (const selector of [
-			"anthropic/claude-opus-4-5:high",
-			"missing-provider/missing,anthropic/claude-haiku-4-5",
-			"claude-haiku-4-5",
-			"skill-custom/anthropic/claude-opus-4-5:high",
-			"missing-provider/missing",
-		]) {
+		const cases: Array<[selector: string, expected: string | undefined]> = [
+			// The custom provider's literal id outranks the provider-qualified spelling.
+			["anthropic/claude-opus-4-5:high", "skill-custom/anthropic/claude-opus-4-5:high"],
+			["missing-provider/missing,anthropic/claude-haiku-4-5", "anthropic/claude-haiku-4-5"],
+			["claude-haiku-4-5", "anthropic/claude-haiku-4-5"],
+			["skill-custom/anthropic/claude-opus-4-5:high", "skill-custom/anthropic/claude-opus-4-5:high"],
+			// A configured but unresolvable smol role is authoritative: no tiny stand-in.
+			["missing-provider/missing", undefined],
+		];
+		for (const [selector, expected] of cases) {
 			settings.setModelRole("smol", selector);
-			const available = registry.getAvailable();
-			const expected =
-				resolveRoleChain("smol", settings, available)[0]?.model ??
-				resolveRoleSelection(["tiny"], settings, available)?.model;
-			expect(compressor.modelKey()).toBe(expected ? `${expected.provider}/${expected.id}` : undefined);
+			expect(compressor.modelKey()).toBe(expected);
 		}
-		settings.setModelRole("smol", "anthropic/claude-opus-4-5:high");
-		expect(compressor.modelKey()).toBe("skill-custom/anthropic/claude-opus-4-5:high");
 	});
 
 	it("observes live role, disabled-provider and runtime catalog changes after a scoped lookup", () => {
@@ -431,11 +415,8 @@ describe("skill description compressor model selection", () => {
 		settings.setModelRole("smol", "anthropic/claude-opus-4-5");
 		expect(compressor.modelKey()).toBe("anthropic/claude-opus-4-5");
 		cfgDisabledProviders.set(settings, ["anthropic"]);
-		const available = registry.getAvailable();
-		const expected =
-			resolveRoleChain("smol", settings, available)[0]?.model ??
-			resolveRoleSelection(["tiny"], settings, available)?.model;
-		expect(compressor.modelKey()).toBe(expected ? `${expected.provider}/${expected.id}` : undefined);
+		// Configured smol is unavailable and another role's model is never substituted.
+		expect(compressor.modelKey()).toBeUndefined();
 		cfgDisabledProviders.set(settings, []);
 		expect(compressor.modelKey()).toBe("anthropic/claude-opus-4-5");
 
@@ -464,8 +445,13 @@ describe("skill description compressor model selection", () => {
 		expect(compressor.modelKey()).toBe("skill-runtime/second");
 	});
 
-	it("uses the configured default for an unset smol role instead of the built-in smol chain", () => {
-		expect(fixture({ default: "anthropic/claude-opus-4-5" }).compressor.modelKey()).toBe("anthropic/claude-opus-4-5");
+	it("does not adopt the configured default for an unset smol role", () => {
+		const { registry, settings, compressor } = fixture({ default: "anthropic/claude-opus-4-5" });
+		expect(settings.getModelRole("smol")).toBeUndefined();
+		const modelKey = compressor.modelKey();
+		// Bootstrap selects a real catalog model and never borrows the `default` role's selector.
+		expect(registry.getAvailable().map(model => `${model.provider}/${model.id}`)).toContain(modelKey);
+		expect(modelKey).not.toBe("anthropic/claude-opus-4-5");
 	});
 
 	it("prefers a configured smol role over the configured default", () => {

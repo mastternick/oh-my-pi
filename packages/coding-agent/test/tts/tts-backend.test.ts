@@ -67,14 +67,14 @@ describe("speech role candidate ordering", () => {
 		expect(resolveSpeechCandidates(settings, registry, true).map(candidate => candidate.model)).toEqual([xai, local]);
 	});
 
-	test("keeps an explicitly configured local candidate ahead of paid MP3 candidates", async () => {
+	test("keeps an explicitly configured local candidate as the only speech candidate", async () => {
 		await authStorage.credentials.set("xai", [{ type: "api_key", key: "xai-test-key" }]);
 		const settings = Settings.isolated({ modelRoles: { speech: "local/kokoro" } });
 		const registry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"), { settings });
 
 		const candidates = resolveSpeechCandidates(settings, registry, true);
-		expect(candidates.map(candidate => candidate.model)).toEqual([local, xai]);
-		expect(candidates.map(candidate => candidate.explicit)).toEqual([true, false]);
+		expect(candidates.map(candidate => candidate.model)).toEqual([local]);
+		expect(candidates.map(candidate => candidate.explicit)).toEqual([true]);
 	});
 });
 

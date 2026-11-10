@@ -358,18 +358,16 @@ describe("subagent runtime model resolution", () => {
 		expect(result.resolvedModelIsFallback).toBeFalsy();
 	});
 
-	it("inherits an explicitly configured default fallback chain for a single subagent model", async () => {
+	it("does not install a fallback role for an explicit single subagent model", async () => {
 		const primary = model("lm-studio", "local-reviewer");
 		const fallback = model("openai-codex", "gpt-5.6-sol");
 		let childFallbackChains: Record<string, string[]> | undefined;
-		let childFallbackChainKeys: string[] = [];
 		let childModelRole: string | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			if (!options) throw new Error("Expected createAgentSession options");
 			childFallbackChains = (options.settings ? cfgRetryFallbackChains.get(options.settings) : undefined) as
 				| Record<string, string[]>
 				| undefined;
-			childFallbackChainKeys = Object.keys(childFallbackChains ?? {});
 			childModelRole = options.settings?.getModelRoles()["subagent:single-model-configured-fallback"];
 			return { session: createYieldingSession(), extensionsResult: {}, setToolUIContext: () => {} } as never;
 		});
@@ -397,11 +395,10 @@ describe("subagent runtime model resolution", () => {
 			enableLsp: false,
 		});
 
-		expect(childModelRole).toBe("lm-studio/local-reviewer");
-		expect(childFallbackChainKeys[0]).toBe("subagent:single-model-configured-fallback");
-		expect(childFallbackChains?.["subagent:single-model-configured-fallback"]).toEqual(["openai-codex/gpt-5.6-sol"]);
-		expect(childFallbackChains?.default).toEqual(["openai-codex/gpt-5.6-sol"]);
-		expect(childFallbackChains?.["existing-local-role"]).toEqual(["other-provider/other-model"]);
+		// An explicit selector carries no role identity, so it inherits nothing:
+		// another role's chain (including `default`) must not route the child.
+		expect(childModelRole).toBeUndefined();
+		expect(childFallbackChains?.["subagent:single-model-configured-fallback"]).toBeUndefined();
 	});
 
 	it("inherits the aliased role's chain, not the default chain, for a role-alias subagent model", async () => {
@@ -501,7 +498,7 @@ describe("subagent runtime model resolution", () => {
 		expect(childFallbackChains?.["subagent:pre-expanded-role"]).toEqual(["task-provider/sonnet"]);
 	});
 
-	it("inherits the default chain for a role alias whose role configures no chain", async () => {
+	it("does not lend the default chain to a role alias that configures none", async () => {
 		const fast = model("fast", "hy3");
 		const slow = model("slow", "opus");
 		let childFallbackChains: Record<string, string[]> | undefined;
@@ -538,7 +535,9 @@ describe("subagent runtime model resolution", () => {
 			enableLsp: false,
 		});
 
-		expect(childFallbackChains?.["subagent:role-alias-default-chain"]).toEqual(["slow/opus-backup"]);
+		// Only the role's own chain applies; it configures none, so the child gets
+		// no `subagent:` chain rather than the `default` role's chain.
+		expect(childFallbackChains?.["subagent:role-alias-default-chain"]).toBeUndefined();
 	});
 
 	it("does not inherit the default chain when multiple requested models collapse to one candidate", async () => {
@@ -600,7 +599,6 @@ describe("subagent runtime model resolution", () => {
 			index: 0,
 			id: "single-model-no-fallback",
 			modelOverride: "lm-studio/local-reviewer",
-			parentActiveModelPattern: "openai-codex/gpt-5.6-sol",
 			settings: Settings.isolated(),
 			modelRegistry: {
 				refresh: async () => {},
@@ -676,18 +674,16 @@ describe("subagent runtime model resolution", () => {
 		expect(childFallbackChains?.["subagent:issue-2750-routed"]).toEqual(["openrouter/z-ai/glm-4.7@fireworks"]);
 	});
 
-	it("defers unresolved explicit subagent model selectors instead of picking an available default", async () => {
+	it("defers unresolved explicit subagent model selectors without the default chain", async () => {
 		const defaultModel = model("zai", "glm-5.2");
 		let childModel: Model | undefined;
 		let childModelPattern: unknown;
-		let childModelPatternAuthFallback: unknown;
 		let childModelPatternFallbackRole: unknown;
 		let childModelPatternDefaultFallbackChain: unknown;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			if (!options) throw new Error("Expected createAgentSession options");
 			childModel = options.model;
 			childModelPattern = options.modelPattern;
-			childModelPatternAuthFallback = options.modelPatternAuthFallback;
 			childModelPatternFallbackRole = options.modelPatternFallbackRole;
 			childModelPatternDefaultFallbackChain = options.modelPatternDefaultFallbackChain;
 			return { session: createYieldingSession(), extensionsResult: {}, setToolUIContext: () => {} } as never;
@@ -701,7 +697,6 @@ describe("subagent runtime model resolution", () => {
 			index: 0,
 			id: "issue-4421",
 			modelOverride: ["openai-codex/gpt-5.5:auto"],
-			parentActiveModelPattern: "openai-codex/gpt-5.5",
 			settings: Settings.isolated({
 				"retry.fallbackChains": {
 					default: ["openai-codex/gpt-5.6-sol"],
@@ -717,9 +712,10 @@ describe("subagent runtime model resolution", () => {
 
 		expect(childModel).toBeUndefined();
 		expect(childModelPattern).toEqual(["openai-codex/gpt-5.5:auto"]);
-		expect(childModelPatternAuthFallback).toBe("openai-codex/gpt-5.5");
 		expect(childModelPatternFallbackRole).toBe("subagent:issue-4421");
-		expect(childModelPatternDefaultFallbackChain).toEqual(["openai-codex/gpt-5.6-sol"]);
+		// The `default` role's chain belongs to `default`; an explicit selector
+		// defers on its own route instead of inheriting it.
+		expect(childModelPatternDefaultFallbackChain).toBeUndefined();
 	});
 });
 
@@ -770,7 +766,8 @@ describe("subagent runtime fallback on a real provider error", () => {
 
 	/**
 	 * Spawns a real `pinned-worker` child whose role shares the `default` model. The primary
-	 * fails every request with a retryable error; `default`'s chain names a fallback that yields.
+	 * fails every request with a retryable error; only the role's own chain may name a fallback
+	 * that yields — the `default` chain is never lent to the role.
 	 */
 	async function runPinnedWorker(id: string, roleChain: string[] | undefined) {
 		const authStorage = createInMemoryAuthStorage();
@@ -855,11 +852,11 @@ describe("subagent runtime fallback on a real provider error", () => {
 		expect(result.error).toContain(OVERLOADED);
 	});
 
-	it("recovers on the inherited default fallback when the role has no chain", async () => {
+	it("surfaces the error instead of inheriting the default chain when the role has no chain", async () => {
 		const { result, fallbackRequests } = await runPinnedWorker("UnsetRoleChain", undefined);
-		expect(fallbackRequests).toBeGreaterThan(0);
-		expect(result.exitCode).toBe(0);
-		expect(result.resolvedModel).toBe("fallback/working-model");
-		expect(result.resolvedModelIsFallback).toBe(true);
+		expect(fallbackRequests).toBe(0);
+		expect(result.exitCode).not.toBe(0);
+		expect(result.resolvedModelIsFallback).toBeFalsy();
+		expect(result.error).toContain(OVERLOADED);
 	});
 });

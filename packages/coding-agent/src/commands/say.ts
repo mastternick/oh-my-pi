@@ -54,6 +54,14 @@ export default class Say extends Command {
 
 		const settings = await Settings.init({ cwd: getProjectDir() });
 		const model = flags.model ?? (await this.#resolveDefaultModel(settings));
+		if (!model) {
+			process.stderr.write(
+				chalk.red(
+					"error: modelRoles.speech resolves no local TTS model. Configure a local speech model or clear modelRoles.speech.\n",
+				),
+			);
+			process.exit(1);
+		}
 		const voice = flags.voice ?? cfgTtsLocalVoice.get(settings);
 		const speed = flags.speed === undefined ? cfgTtsLocalSpeed.get(settings) : Number(flags.speed);
 		if (!Number.isFinite(speed) || speed <= 0) {
@@ -147,7 +155,7 @@ export default class Say extends Command {
 		if (exitCode !== 0) process.exit(exitCode);
 	}
 
-	async #resolveDefaultModel(settings: Settings): Promise<string> {
+	async #resolveDefaultModel(settings: Settings): Promise<string | undefined> {
 		const authStorage = await discoverAuthStorage(undefined, { settings });
 		try {
 			const registry = new ModelRegistry(authStorage, undefined, { settings });

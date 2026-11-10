@@ -66,7 +66,7 @@ import { type OAuthAccountPools, SessionAccountPoolScope } from "./config/accoun
 import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode";
 import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mode";
 import { attachSessionPreset, recordSessionPreset } from "./config/model-presets";
-import { isAuthenticated, kNoAuth, ModelRegistry } from "./config/model-registry";
+import { ModelRegistry } from "./config/model-registry";
 import {
 	disabledProviderIds,
 	formatModelString,
@@ -221,7 +221,6 @@ import {
 	dropUnreadableContextImages,
 } from "./session/provider-image-budget";
 import {
-	expandDefaultRetryFallbackChains,
 	findRetryFallbackCandidates,
 	installRetryFallbackRole,
 	type RetryFallbackResolutionContext,
@@ -620,8 +619,6 @@ export interface CreateAgentSessionOptions {
 	/** Raw model pattern(s) (e.g. from --model CLI flag) to resolve after extensions load.
 	 * Used when model lookup is deferred because extension-provided models aren't registered yet. */
 	modelPattern?: string | string[];
-	/** Authenticated fallback selector for deferred subagent model patterns. */
-	modelPatternAuthFallback?: string;
 	/** Role name used to install retry fallbacks after deferred subagent patterns resolve. */
 	modelPatternFallbackRole?: string;
 	/** Validated inherited retry chain for a deferred singleton pattern; empty explicitly disables fallbacks. */
@@ -3244,10 +3241,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							return primaryPatterns;
 						}
 						const fallbackContext: RetryFallbackResolutionContext = {
-							chains: expandDefaultRetryFallbackChains(cfgRetryFallbackChains.get(settings), [
-								...Object.keys(settings.getModelRoles()),
-								resolved.configuredRole,
-							]),
+							// Configured chains as written: this role walks only its own.
+							chains: cfgRetryFallbackChains.get(settings) ?? {},
 							getModelRole: role => settings.getModelRole(role),
 							modelLookup: modelRegistry,
 						};
@@ -3385,7 +3380,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						}
 					}
 				}
-				let selectedModel = primary.model;
+				const selectedModel = primary.model;
 				let selectedThinkingLevel = primary.thinkingLevel;
 				let selectedExplicitThinkingLevel = primary.explicitThinkingLevel;
 				// A chain entry without its own `:level` suffix inherits the
@@ -3395,27 +3390,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					selectedThinkingLevel = retryFallback.originalThinkingLevel;
 					selectedExplicitThinkingLevel = true;
 				}
-				let authFallbackUsed = false;
-				if (options.modelPatternAuthFallback) {
-					const primaryKey = await modelRegistry.getApiKey(primary.model);
-					if (primaryKey !== kNoAuth && !isAuthenticated(primaryKey)) {
-						const fallback = parseModelPattern(
-							options.modelPatternAuthFallback,
-							resolutionModels,
-							matchPreferences,
-						);
-						if (fallback.model) {
-							const fallbackKey = await modelRegistry.getApiKey(fallback.model);
-							if (isAuthenticated(fallbackKey)) {
-								selectedModel = fallback.model;
-								selectedThinkingLevel = fallback.thinkingLevel;
-								selectedExplicitThinkingLevel = fallback.explicitThinkingLevel;
-								authFallbackUsed = true;
-							}
-						}
-					}
-				}
-				if (!authFallbackUsed && options.modelPatternFallbackRole) {
+				if (options.modelPatternFallbackRole) {
 					const primarySelector = formatModelSelectorValue(
 						formatModelStringWithRouting(primary.model),
 						primary.thinkingLevel,
@@ -3523,10 +3498,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const tryResolveDefaultRoleFallback = (fallbackCandidates: Model[]): boolean => {
 				const originalSelector = settings.getModelRole("default");
 				if (hasExplicitModel || !originalSelector || !cfgRetryModelFallback.get(settings)) return false;
-				const chains = expandDefaultRetryFallbackChains(cfgRetryFallbackChains.get(settings), [
-					...Object.keys(settings.getModelRoles()),
-					"default",
-				]);
+				// The `default` role walks only its own configured chain.
+				const chains = cfgRetryFallbackChains.get(settings) ?? {};
 				// Candidates come only from configured chain entries. Without one,
 				// bail before any catalog lookup so the first-paint path never
 				// composes the full catalog.
@@ -3627,15 +3600,18 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					}
 				}
 
-				if (!model && !tryResolveDefaultRoleFallback(fallbackCandidates) && pick) {
-					model = pick;
-					adoptThinkingForModel(pick);
-					// A configured default that no longer resolves (a renamed or retired
-					// id) must not be replaced silently; the suffix below names `pick`.
-					// The checks above ran against usable models only, so tell a model
-					// the catalog lacks apart from one without credentials or scope.
-					const configuredDefault = settings.getModelRole("default");
+				if (!model && !tryResolveDefaultRoleFallback(fallbackCandidates)) {
+					// A configured default role is authoritative. When its primary and
+					// its own configured chain cannot serve the turn, startup reports the
+					// failure instead of picking an unrelated provider default: silently
+					// starting on a model the user never selected is exactly the
+					// substitution this routing contract forbids. Only an unconfigured
+					// default role (fresh install) bootstraps from the first available
+					// provider default.
+					const configuredDefault = settings.getModelRole("default")?.trim();
 					if (configuredDefault && !hasExplicitModel) {
+						// The checks above ran against usable models only, so tell a model
+						// the catalog lacks apart from one without credentials or scope.
 						const inCatalog = resolveModelRoleValue(configuredDefault, modelRegistry.getAll(), {
 							settings,
 							matchPreferences: modelMatchPreferences,
@@ -3647,6 +3623,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						modelFallbackMessage = modelFallbackMessage
 							? `${modelFallbackMessage}. ${defaultReason}`
 							: defaultReason;
+					} else if (pick) {
+						model = pick;
+						adoptThinkingForModel(pick);
 					}
 				}
 			}
@@ -3654,7 +3633,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				if (modelFallbackMessage) {
 					modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
 				}
-			} else {
+			} else if (!modelFallbackMessage) {
 				const patterns = cfgEnabledModels.get(settings);
 				modelFallbackMessage =
 					patterns && patterns.length > 0

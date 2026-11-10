@@ -24,7 +24,7 @@ import type { AgentDefinition, SeanceTaskSchemaFields } from "./types";
 export interface ResolvedSeanceSource {
 	file: string;
 	id: string;
-	/** Active saved model-role selector, then the saved default fallback. */
+	/** Only the active saved model-role selector; no fallback to another role's model. */
 	modelSelectors: string[];
 }
 
@@ -266,7 +266,6 @@ export async function prepareSeance(context: {
 		}
 		const resolved = await resolveModelOverrideWithAuthFallback(
 			[selector],
-			undefined,
 			modelRegistry,
 			context.session.settings,
 			context.session.getSessionId?.() ?? undefined,

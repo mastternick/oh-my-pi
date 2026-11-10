@@ -224,12 +224,21 @@ export class STTController {
 				`Dictation model ${first.replaces} not found; using ${first.model.provider}/${first.model.id}`,
 			);
 		} else if (!first && this.#registry) {
-			// Empty chain: nothing replaced the configured selector, so the built-in local model runs.
+			// Empty chain with a configured dictation role: the configured model is
+			// authoritative, so dictation stops with a visible message instead of
+			// transcribing with the built-in local model. Only an unconfigured role
+			// bootstraps onto the bundled local model.
 			const role = this.#settings.getModelRole("dictation")?.trim();
-			const qualified = role
-				? (resolveConfiguredModelPatterns(role, this.#settings) ?? [role]).find(pattern => pattern.includes("/"))
-				: undefined;
-			if (qualified) options.showWarning(`Dictation model ${qualified} not found; using the built-in local model`);
+			if (role) {
+				const qualified =
+					(resolveConfiguredModelPatterns(role, this.#settings) ?? [role]).find(pattern =>
+						pattern.includes("/"),
+					) ?? role;
+				options.showWarning(
+					`Dictation model ${qualified} is unavailable; dictation stays off until it resolves or modelRoles.dictation is cleared`,
+				);
+				return;
+			}
 		}
 		let model = first?.model;
 		if (model?.api === "openai-transcriptions") {

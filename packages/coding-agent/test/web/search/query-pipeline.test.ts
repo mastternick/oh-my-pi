@@ -80,7 +80,7 @@ describe("web search directive pipeline", () => {
 	});
 
 	it.each<[string, string, SearchProviderId]>([
-		["routes an X-only query to xAI ahead of the role's engine", "tern site:x.com", "xai"],
+		["keeps the configured role's engine for an X-only query", "tern site:x.com", "brave"],
 		["keeps the role's engine for queries that are not X-only", "tern site:x.com site:github.com", "brave"],
 	])("%s", async (_caseName, query, expectedProvider) => {
 		const context = await stubRoleProvider("brave", async () => ({ provider: "brave", sources: SOURCES }));

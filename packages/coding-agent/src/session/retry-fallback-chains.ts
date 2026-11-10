@@ -42,8 +42,9 @@ export interface RetryFallbackModelLookup {
 
 /**
  * Inputs shared by startup (sdk) and runtime (turn-recovery) fallback-chain
- * resolution. `chains` is pre-expanded so callers can apply the default chain
- * to roles beyond the configured model roles (e.g. a subagent fallback role).
+ * resolution. `chains` is the configured record as written: a chain entry is
+ * reachable only through the key that literally names it (the role, model
+ * selector, or provider wildcard), never through another role.
  */
 export interface RetryFallbackResolutionContext {
 	chains: RetryFallbackChains;
@@ -156,25 +157,15 @@ export function isKnownProvider(
 	return modelRegistry.hasProvider(provider);
 }
 
-/** Apply the configured default chain to roles without their own chain. */
-export function expandDefaultRetryFallbackChains(
-	configuredChains: RetryFallbackChains,
-	roleNames: readonly string[],
-): RetryFallbackChains {
-	const chains: RetryFallbackChains = { ...configuredChains };
-	const defaultChain = chains.default;
-	if (!Array.isArray(defaultChain)) return chains;
-	for (const role of roleNames) {
-		if (role !== "default" && !isKindRole(role) && chains[role] === undefined) chains[role] = defaultChain;
-	}
-	return chains;
-}
-
-/** Resolves configured fallback chains, applying the default chain to named roles. */
+/**
+ * Resolves the configured fallback chains exactly as written. A chain applies
+ * only to the role, model selector, or provider wildcard it names: assigning
+ * the `default` role a chain never lends it to any other role.
+ */
 export function getRetryFallbackChains(settings: Settings): RetryFallbackChains {
 	const configuredChains = cfgRetryFallbackChains.get(settings);
 	if (!configuredChains || typeof configuredChains !== "object") return {};
-	return expandDefaultRetryFallbackChains(configuredChains, Object.keys(settings.getModelRoles()));
+	return configuredChains;
 }
 
 /**
@@ -391,9 +382,8 @@ type SelectorMatchKind = "exact" | "normalized" | "base" | "effort" | "none";
  * - `base` — a suffixless key naming the same provider/model, so it applies
  *   to that model at any effort.
  * - `effort` — same provider/model at an explicit effort that stays distinct
- *   after model normalization. Model-selector keys treat this as no match;
- *   role keys accept it as their weakest tier, since a role's chain follows
- *   its assigned model across runtime effort changes.
+ *   after model normalization. Model-selector keys treat this as no match: a
+ *   different explicit effort is a different configuration.
  * - `none` — a different model, or no primary.
  */
 function selectorMatchKind(
@@ -427,9 +417,14 @@ function selectorMatchKind(
 }
 
 /**
- * Resolve the chain key for a concrete selector by specificity: exact model,
- * longest matching wildcard, hinted role, then matching role keys with
- * `default` preferred over other shared assignments, then default.
+ * Resolve the chain key that owns a concrete selector by specificity: an exact
+ * model-selector key, then the longest matching provider wildcard, then the
+ * hinted role's own key.
+ *
+ * Only keys that literally name the active route are eligible. A role key is
+ * never selected because another role happens to be assigned the same model,
+ * and the `default` chain is unreachable unless the live identity is `default`:
+ * a configured role must not borrow another role's chain or its model.
  */
 export function resolveRetryFallbackChainKey(
 	context: RetryFallbackResolutionContext,
@@ -493,41 +488,26 @@ export function resolveRetryFallbackChainKey(
 	}
 	if (wildcardMatch) return wildcardMatch;
 
-	// 3. The hinted role, then role keys matched by their assigned model.
-	// A shared assignment (default and vision both the same model) must not
-	// let yaml insertion order steal the live role's chain. Prefer the hint,
-	// then `default` when it also matches. A role assigned the live model at a
-	// different explicit effort (spawn `effort`, `/thinking`) still owns it,
-	// but only after every role whose effort matches.
-	if (roleHint && Array.isArray(context.chains[roleHint])) return roleHint;
-	let matchedRole: string | undefined;
-	let effortRole: string | undefined;
-	for (const key in context.chains) {
-		if (isRetryFallbackModelKey(key)) continue;
-		const kind = selectorMatchKind(
-			getRetryFallbackPrimarySelector(context, key),
-			parsedCurrent,
-			parsedPlainCurrent,
-			currentModel,
-		);
-		if (kind === "none") continue;
-		if (kind === "effort") {
-			if (key === "default" || effortRole === undefined) effortRole = key;
-			continue;
+	// 3. The hinted role's own chain, provided the role still exists and its
+	//    configured primary names the live model (any effort of it: a candidate
+	//    change does not relinquish the role). None of that infers a role from
+	//    model equality — a role assigned the live model (or `default`, or an
+	//    effort-matched sibling) never lends its chain, because that chain
+	//    begins with *its* primary model and would silently re-route the live
+	//    role onto another model. A role whose assignment was removed owns
+	//    nothing. An alias primary (`@other`) is unparseable here; the caller
+	//    resolved that alias to this live model, so its hint stands.
+	if (roleHint && Array.isArray(context.chains[roleHint])) {
+		const configured = context.getModelRole(roleHint)?.trim();
+		if (configured) {
+			const rolePrimary = parseRetryFallbackSelector(configured, context.modelLookup);
+			if (
+				!rolePrimary ||
+				selectorMatchKind(rolePrimary, parsedCurrent, parsedPlainCurrent, currentModel) !== "none"
+			) {
+				return roleHint;
+			}
 		}
-		if (key === "default") return "default";
-		matchedRole ??= key;
-	}
-	if (matchedRole) return matchedRole;
-	if (effortRole) return effortRole;
-
-	// 4. The default chain. Use it even when `default` has an explicit role
-	//    primary that is a *different* model than the live one (#12421): a
-	//    /model switch or a mid-chain hop onto Fable/Astra must still reach
-	//    glm/grok/… instead of resolving no key and aborting on wait > maxDelayMs.
-	const defaultChain = context.chains.default;
-	if (Array.isArray(defaultChain) && defaultChain.length > 0) {
-		return "default";
 	}
 	return undefined;
 }

@@ -30,10 +30,10 @@ describe("parseXUrl", () => {
 describe("handleTwitter", () => {
 	const authStorages: AuthStorage[] = [];
 
-	async function xaiRegistry(webRole?: string): Promise<ModelRegistry> {
+	async function xaiRegistry(webRole?: string, webChain: string[] = []): Promise<ModelRegistry> {
 		const settings = await Settings.init({ inMemory: true });
 		if (webRole) settings.setModelRole("web", webRole);
-		cfgRetryFallbackChains.set(settings, { web: [] });
+		cfgRetryFallbackChains.set(settings, { web: webChain });
 		const authStorage = createInMemoryAuthStorage();
 		authStorages.push(authStorage);
 		authStorage.keys.setRuntime("xai", "test-xai-key");
@@ -53,6 +53,18 @@ describe("handleTwitter", () => {
 
 		expect(result?.method).toBe("x-unavailable");
 		expect(result?.content).toContain("xai-oauth");
+		expect(fetchSpy).not.toHaveBeenCalled();
+	});
+
+	it("blames the configured web role, not missing xAI credentials, when it cannot read X", async () => {
+		const fetchSpy = vi.spyOn(globalThis, "fetch");
+		const modelRegistry = await xaiRegistry("web/no-xai-model");
+
+		const result = await handleTwitter("https://x.com/jack/status/20", 10, undefined, null, modelRegistry);
+
+		expect(result?.method).toBe("x-unavailable");
+		expect(result?.content).toContain("web/no-xai-model");
+		expect(result?.content).not.toContain("XAI_API_KEY");
 		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 
@@ -79,7 +91,9 @@ describe("handleTwitter", () => {
 	});
 
 	it("falls back along the xAI model chain when a model is refused", async () => {
-		const modelRegistry = await xaiRegistry("xai/grok-4.7");
+		// A configured `web` role is authoritative: its own chain supplies the
+		// fallback, never an appended provider default.
+		const modelRegistry = await xaiRegistry("xai/grok-4.7", ["xai/grok-4.5"]);
 		const attempted: string[] = [];
 		vi.spyOn(globalThis, "fetch").mockImplementation(
 			asGlobalFetch(async (_input, init) => {

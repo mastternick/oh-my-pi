@@ -74,7 +74,7 @@ describe("resolveRoleAssignments", () => {
 		expect(roles.image?.model).toBe(image);
 	});
 
-	test("shows configured smol for an unconfigured tiny role", () => {
+	test("auto-selects the priority head for an unconfigured tiny role", () => {
 		const smol = makeModel("demo", "custom-smol");
 		const priorityHead = makeModel("demo", "gemini-3.8-flash");
 		const settings = Settings.isolated({
@@ -91,11 +91,11 @@ describe("resolveRoleAssignments", () => {
 		);
 
 		expect(roles.smol?.model).toBe(smol);
-		expect(roles.tiny?.model).toBe(smol);
+		expect(roles.tiny?.model).toBe(priorityHead);
 		expect(roles.tiny?.autoSelected).toBe(true);
 	});
 
-	test("shows configured slow for an unconfigured advisor role", () => {
+	test("auto-selects the priority head for an unconfigured advisor role", () => {
 		const slow = makeModel("demo", "custom-slow");
 		const priorityHead = makeModel("demo", "gpt-5.6-sol");
 		const settings = Settings.isolated({
@@ -112,7 +112,7 @@ describe("resolveRoleAssignments", () => {
 		);
 
 		expect(roles.slow?.model).toBe(slow);
-		expect(roles.advisor?.model).toBe(slow);
+		expect(roles.advisor?.model).toBe(priorityHead);
 		expect(roles.advisor?.autoSelected).toBe(true);
 	});
 });

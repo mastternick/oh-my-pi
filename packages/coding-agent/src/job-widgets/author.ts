@@ -173,9 +173,11 @@ export interface ModelJobWidgetAuthorOptions {
 }
 
 /**
- * The `widget` role's model with a usable credential: the role (configured,
- * or resolved like `smol`), then the built-in `smol` defaults. Job captions
- * use it too.
+ * Resolve the `widget` role model.
+ *
+ * A configured `widget` role is authoritative: when its model cannot serve, the
+ * author is unavailable instead of running the built-in fast chain, which is
+ * bootstrap for an unconfigured role only.
  */
 export async function resolveWidgetModel(
 	settings: Settings,
@@ -188,9 +190,11 @@ export async function resolveWidgetModel(
 	const candidates: Model<Api>[] = [];
 	const role = resolveModelRoleValue(formatModelRoleAlias("widget"), available, { settings, matchPreferences }).model;
 	if (role) candidates.push(role);
-	for (const pattern of roleDefaultModels().smol ?? []) {
-		const model = parseModelPattern(pattern, available, matchPreferences).model;
-		if (model) candidates.push(model);
+	if (settings.getModelRole("widget") === undefined) {
+		for (const pattern of roleDefaultModels().smol ?? []) {
+			const model = parseModelPattern(pattern, available, matchPreferences).model;
+			if (model) candidates.push(model);
+		}
 	}
 	for (const model of candidates) {
 		if (await registry.getApiKey(model, sessionId, { signal })) return model;

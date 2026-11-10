@@ -217,7 +217,7 @@ describe("structured subagent primitive", () => {
 		expect(inherited.schema).toMatchObject({ source: "session", mode: "strict", outputSchemaOverridesAgent: false });
 	});
 
-	it("uses saved seance models in active-role/default order and honors an explicit available override", async () => {
+	it("uses the saved active-role seance model and honors an explicit available override", async () => {
 		const seanceAgent = getBundledAgent("seance");
 		if (!seanceAgent) throw new Error("Expected the bundled seance agent");
 		mockDiscovery(seanceAgent);
@@ -259,7 +259,9 @@ describe("structured subagent primitive", () => {
 			);
 			expect(saved.preparedSession?.fork.sourceFile).toBe(sourceFile);
 
-			expect(saved.modelOverride).toEqual(["anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-5"]);
+			// Only the active role's own saved model is restored; the saved
+			// `default` model is another role's selection and never a second choice.
+			expect(saved.modelOverride).toEqual(["anthropic/claude-sonnet-4-6"]);
 			expect(saved.enableLsp).toBe(false);
 			expect(saved.enableIrc).toBe(false);
 
@@ -1487,8 +1489,6 @@ describe("per-call model preflight", () => {
 			}),
 		);
 		expect(policy.modelOverride).toEqual(["mock/target:high"]);
-		// A requested model never falls back to the parent's.
-		expect(policy.parentActiveModelPattern).toBeUndefined();
 	});
 
 	it.each(["SDK overlay", "nested subagent"])("reloads removed on-disk role grants through an %s", async kind => {
@@ -1573,7 +1573,6 @@ describe("per-call model preflight", () => {
 		);
 		expect(policy.modelOverride).toEqual(["mock/agent-own"]);
 		expect(policy.perCallModelGrants).toBeUndefined();
-		expect(policy.parentActiveModelPattern).toBe("mock/parent");
 	});
 
 	describe("an agent shadowing the seance name", () => {

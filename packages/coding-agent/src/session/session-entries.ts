@@ -39,6 +39,14 @@ export const EPHEMERAL_MODEL_CHANGE_ROLE = "fallback";
 /** A prewalk or plan-yolo handoff: restored on resume, passed over when looking up the assigned role. */
 export const PREWALK_MODEL_CHANGE_ROLE = "prewalk";
 
+/**
+ * A model selected by explicit provider/model selector, not by a configured
+ * role. It records an identity so startup does not fall back to the role-less
+ * `default` entry, but it owns no `retry.fallbackChains` key: explicit
+ * selections route by model selector and provider wildcard only.
+ */
+export const EXPLICIT_MODEL_CHANGE_ROLE = "explicit";
+
 export interface SessionHeader {
 	type: "session";
 	version?: number; // v1 sessions don't have this

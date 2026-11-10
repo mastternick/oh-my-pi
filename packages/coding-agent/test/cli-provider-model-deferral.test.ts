@@ -117,7 +117,7 @@ describe("print-mode suggestions for a provider-qualified miss", () => {
 });
 
 describe("print mode with a stale configured default", () => {
-	test("warns on stderr naming the stale default and the model that runs instead", async () => {
+	test("reports the stale default without switching to another model", async () => {
 		const home = path.join(os.tmpdir(), `pi-cli-stale-default-${Snowflake.next()}`);
 		const agentDir = path.join(home, ".omp", "agent");
 		fs.mkdirSync(agentDir, { recursive: true });
@@ -147,7 +147,6 @@ describe("print mode with a stale configured default", () => {
 						TMPDIR: process.env.TMPDIR,
 						NO_COLOR: "1",
 						ANTHROPIC_API_KEY: "test-key",
-						// The fallback model's request never reaches Anthropic; the test stops the run once the warning is out.
 						ANTHROPIC_BASE_URL: "http://127.0.0.1:9",
 					},
 					stdin: "ignore",
@@ -155,30 +154,12 @@ describe("print mode with a stale configured default", () => {
 					stderr: "pipe",
 				},
 			);
-			const warning = "Default model anthropic/claude-sonnet-9-9 not found. Using anthropic/";
-			const stderr = await readUntil(proc.stderr, warning);
-			proc.kill();
-			await proc.exited;
-			expect(stderr).toContain(warning);
+			const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+			expect(stderr).toContain("Default model anthropic/claude-sonnet-9-9 not found");
+			expect(stderr).not.toContain("Using anthropic/");
+			expect(exitCode).not.toBe(0);
 		} finally {
 			removeSyncWithRetries(home);
 		}
 	}, 60_000);
 });
-
-/** Stderr read until it contains `needle`, or all of it once the stream ends without it. */
-async function readUntil(stream: ReadableStream<Uint8Array>, needle: string): Promise<string> {
-	const reader = stream.getReader();
-	const decoder = new TextDecoder();
-	let text = "";
-	try {
-		while (!text.includes(needle)) {
-			const { value, done } = await reader.read();
-			if (done) break;
-			text += decoder.decode(value, { stream: true });
-		}
-	} finally {
-		reader.releaseLock();
-	}
-	return text;
-}

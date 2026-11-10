@@ -177,10 +177,19 @@ function expandHostedCandidate(
  * Move the chain's xAI-grounded candidates to the front, keeping their order,
  * or prepend {@link xaiModelChain} when the chain has none. Unchanged without
  * xAI credentials.
+ *
+ * The catalog prepend is bootstrap only: a configured `web` role that names no
+ * xAI-grounded model is authoritative, so unrelated xAI models are not added
+ * ahead of it.
  */
-function preferXAI(chain: RoleChainCandidate[], modelRegistry: ModelRegistry): RoleChainCandidate[] {
+function preferXAI(
+	chain: RoleChainCandidate[],
+	modelRegistry: ModelRegistry,
+	allowCatalogFallback: boolean,
+): RoleChainCandidate[] {
 	const xai = chain.filter(candidate => candidate.model.webSearch === "xai");
 	if (xai.length > 0) return [...xai, ...chain.filter(candidate => candidate.model.webSearch !== "xai")];
+	if (!allowCatalogFallback) return chain;
 	return [...xaiModelChain(modelRegistry, settings).map(model => ({ model, explicit: false })), ...chain];
 }
 
@@ -202,13 +211,18 @@ async function executeSearch(
 			})()
 		: resolveRoleChain("web", settings, pool);
 	const parsedQuery = parseSearchQuery(params.query);
+	// A configured `web` role is authoritative: no catalog substitution for it.
+	// An unconfigured role keeps the bootstrap behaviour. The `web/hosted`
+	// placeholder always expands onto the session provider — naming it is the
+	// user's own choice of that provider.
+	const roleConfigured = settings.getModelRole("web") !== undefined;
 	let expanded = rankXAIProviders(
 		candidates.flatMap(candidate => expandHostedCandidate(candidate, options.sessionModel, pool)),
 		candidate => candidate.model,
 		settings,
 	);
 	// Only xAI reaches X posts; X-only queries try it first even when the role prefers another engine.
-	if (!params.model && targetsX(parsedQuery)) expanded = preferXAI(expanded, modelRegistry);
+	if (!params.model && targetsX(parsedQuery)) expanded = preferXAI(expanded, modelRegistry, !roleConfigured);
 
 	// Invariant across candidates; resolve once before walking the role chain.
 	let antigravityEndpointMode: "auto" | "production" | "sandbox" | undefined;

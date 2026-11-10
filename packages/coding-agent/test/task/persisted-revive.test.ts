@@ -1373,7 +1373,6 @@ describe("persisted subagent revival", () => {
 		await reviver(ref);
 
 		expect(capturedOptions?.modelPattern).toEqual(["@review-fast", "anthropic/claude-sonnet-4-5"]);
-		expect(capturedOptions?.modelPatternAuthFallback).toBe("anthropic/claude-sonnet-4-5");
 	});
 
 	it("restores compaction threshold behavior after parent settings change", async () => {
@@ -1421,7 +1420,6 @@ describe("persisted subagent revival", () => {
 		await reviver(ref);
 
 		expect(capturedOptions?.modelPattern).toBe("anthropic/claude-sonnet-4-5");
-		expect(capturedOptions?.modelPatternAuthFallback).toBe("anthropic/claude-sonnet-4-5");
 	});
 
 	it("reinstalls the spawn's subagent fallback chain so it still routes at a changed effort (#13789)", async () => {
@@ -1452,7 +1450,11 @@ describe("persisted subagent revival", () => {
 			},
 		};
 		const live = "xai-oauth/grok-4.7:xhigh";
-		const chainKey = resolveRetryFallbackChainKey(context, live, grok);
+		// The revived session owns its persisted role: the recorded identity, not
+		// model-equality inference, decides which chain applies at a changed effort.
+		const revivedRole = capturedOptions?.modelPatternFallbackRole;
+		expect(revivedRole).toBe("subagent:persisted-restricted");
+		const chainKey = resolveRetryFallbackChainKey(context, live, grok, revivedRole);
 		expect(chainKey).toBe("subagent:persisted-restricted");
 		if (!chainKey) throw new Error("Expected the revived subagent chain");
 		expect(findRetryFallbackCandidates(context, chainKey, live, grok).map(candidate => candidate.raw)).toEqual([

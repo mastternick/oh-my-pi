@@ -219,8 +219,6 @@ export interface EffectiveSubagentPolicy {
 	compactionThresholdOverride?: CompactionThresholdPair;
 	/** Exact-name `task.agentAccountPools` entry: the only OAuth accounts the child may use, per listed provider. */
 	oauthAccountPools?: OAuthAccountPools;
-	/** Absent for a per-call `model`: a requested model that cannot run fails instead of falling back to the parent's. */
-	parentActiveModelPattern?: string;
 	/** Whether the child gets the `yield` tool; see {@link StructuredSubagentRequest.structured}. */
 	structured: boolean;
 	/** Present for a per-call `model`: every model the child sends to must stay approved by these grants. */
@@ -582,14 +580,14 @@ export async function resolveEffectiveSubagentPolicy(
 						? parentModelGrantPattern(parentActiveModel)
 						: request.session.getActiveModelString?.(),
 				);
-	const parentActiveModelPattern =
+	const activeModelPattern =
 		hasPreparedSeance || perCallModelGrants ? undefined : request.session.getActiveModelString?.();
 	const modelResolution = {
 		requestModel: preparedSeance?.modelPatterns ?? request.model,
 		settingsOverride: hasPreparedSeance ? undefined : agentModelOverrides[agentName],
 		agentModel: hasPreparedSeance ? undefined : effectiveAgent.model,
 		settings: request.session.settings,
-		activeModelPattern: parentActiveModelPattern,
+		activeModelPattern,
 		fallbackModelPattern: hasPreparedSeance ? undefined : request.session.getModelString?.(),
 	};
 	// Role identity and patterns come from one call so they cannot be derived
@@ -633,7 +631,6 @@ export async function resolveEffectiveSubagentPolicy(
 		serviceTierOverride,
 		compactionThresholdOverride,
 		oauthAccountPools,
-		parentActiveModelPattern,
 		perCallModelGrants,
 		structured,
 		schema,
@@ -791,7 +788,6 @@ function buildExecutorOptions(
 		serviceTierOverride: policy.serviceTierOverride,
 		compactionThresholdOverride: policy.compactionThresholdOverride,
 		oauthAccountPools: policy.oauthAccountPools,
-		parentActiveModelPattern: policy.parentActiveModelPattern,
 		perCallModelGrants: policy.perCallModelGrants,
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
 		effort: request.effort,

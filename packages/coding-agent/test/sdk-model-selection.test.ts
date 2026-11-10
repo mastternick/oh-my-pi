@@ -686,7 +686,6 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		const { session, modelFallbackMessage } = await createAgentSession({
 			...buildSessionOptions("runtime-provider/runtime-model"),
 			settings,
-			modelPatternAuthFallback: "runtime-provider/runtime-fallback-model",
 		});
 
 		try {
@@ -765,20 +764,10 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
-	test("uses auth fallback when deferred subagent modelPattern resolves without working credentials", async () => {
-		const parentModel = getBundledModel("anthropic", "claude-sonnet-4-5");
-		if (!parentModel) {
-			throw new Error("Expected bundled anthropic parent model");
-		}
+	test("keeps a deferred subagent modelPattern on its own selector without credentials", async () => {
 		const authStorage = createInMemoryAuthStorage();
 		authStoragesToClose.push(authStorage);
-		authStorage.keys.setRuntime(parentModel.provider, "test-key");
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "fallback-models.yml"));
-		const getApiKeySpy = vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async requested => {
-			if (requested.provider === "runtime-provider") return undefined;
-			if (requested.provider === parentModel.provider) return "test-key";
-			return undefined;
-		});
 		const { session, modelFallbackMessage } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
@@ -798,16 +787,16 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			preloadedCustomToolPaths: [],
 			toolNames: ["read"],
 			modelPattern: "runtime-provider/runtime-model",
-			modelPatternAuthFallback: `${parentModel.provider}/${parentModel.id}`,
 		});
 
 		try {
-			expect(session.model?.provider).toBe(parentModel.provider);
-			expect(session.model?.id).toBe(parentModel.id);
+			// The parent session's model is never substituted for the child's own
+			// selector; a missing credential fails at dispatch, visibly.
+			expect(session.model?.provider).toBe("runtime-provider");
+			expect(session.model?.id).toBe("runtime-model");
 			expect(modelFallbackMessage).toBeUndefined();
 		} finally {
 			await session.dispose();
-			getApiKeySpy.mockRestore();
 		}
 	});
 
@@ -1604,9 +1593,8 @@ describe("createAgentSession deferred model pattern resolution", () => {
 				});
 
 				try {
-					expect(session.model).toBeDefined();
+					expect(session.model).toBeUndefined();
 					expect(modelFallbackMessage).toContain(`Default model ${configured} ${reason}`);
-					expect(modelFallbackMessage).toContain(`${session.model?.provider}/${session.model?.id}`);
 				} finally {
 					await session.dispose();
 				}
@@ -1831,7 +1819,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			settings: Settings.isolated({ modelRoles: { default: "anthropic/claude-sonnet-9-9" } }),
 		});
 		try {
-			expect(session.model).toBeDefined();
+			expect(session.model).toBeUndefined();
 			expect(modelFallbackMessage).toContain("Could not restore model missing-provider/missing-model");
 			expect(modelFallbackMessage).toContain("Default model anthropic/claude-sonnet-9-9 not found");
 		} finally {

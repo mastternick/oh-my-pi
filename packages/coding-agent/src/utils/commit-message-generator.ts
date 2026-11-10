@@ -62,6 +62,11 @@ function getSmolModelCandidates(
 	});
 	addCandidate(configuredSmol.model, concreteThinkingLevel(configuredSmol.thinkingLevel));
 
+	// A configured `smol` role is authoritative: the built-in chain and the
+	// arbitrary available models below are bootstrap for an unconfigured role
+	// only, never a stand-in for an unavailable configured model.
+	if (settings.getModelRole("smol") !== undefined) return candidates;
+
 	for (const pattern of roleDefaultModels().smol) {
 		const needle = pattern.toLowerCase();
 		addCandidate(availableModels.find(m => m.id.toLowerCase() === needle));

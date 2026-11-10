@@ -450,7 +450,7 @@ describe("skill description compressor model selection", () => {
 		expect(settings.getModelRole("smol")).toBeUndefined();
 		const modelKey = compressor.modelKey();
 		// Bootstrap selects a real catalog model and never borrows the `default` role's selector.
-		expect(registry.getAvailable().map(model => `${model.provider}/${model.id}`)).toContain(modelKey);
+		expect(registry.getAvailable().some(model => `${model.provider}/${model.id}` === modelKey)).toBe(true);
 		expect(modelKey).not.toBe("anthropic/claude-opus-4-5");
 	});
 

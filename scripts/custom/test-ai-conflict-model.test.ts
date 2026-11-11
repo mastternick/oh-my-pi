@@ -172,8 +172,7 @@ function fakeSdk(options: FakeSdkOptions): { sdk: SdkModule; state: FakeSdkState
 		closeCalls: 0,
 	};
 	const manager: { file?: string; name?: string } = {};
-	const assistantText =
-		options.assistantText ?? ANSWER;
+	const assistantText = options.assistantText ?? ANSWER;
 
 	const sdk: SdkModule = {
 		Settings: {
@@ -399,7 +398,13 @@ describe("resolve boundary", () => {
 	});
 
 	test("rejects malformed or prose-wrapped JSON", async () => {
-		for (const text of ["", "not json", '```json\n{"resolutions":[]}\n````', 'Here you go: {"resolutions":[]}', "[]"]) {
+		for (const text of [
+			"",
+			"not json",
+			'```json\n{"resolutions":[]}\n````',
+			'Here you go: {"resolutions":[]}',
+			"[]",
+		]) {
 			const response = await resolveConflicts(resolveRequest(), { runner: runnerReturning(text) });
 			expectFailure(response, "MALFORMED_MODEL_OUTPUT");
 		}
@@ -407,16 +412,22 @@ describe("resolve boundary", () => {
 
 	test("accepts a single fenced JSON object", async () => {
 		const response = await resolveConflicts(resolveRequest(), {
-			runner: runnerReturning(
-				"```json\n" + ANSWER + "\n```",
-			),
+			runner: runnerReturning("```json\n" + ANSWER + "\n```"),
 		});
 		expectResolveSuccess(response);
 	});
 });
 
 function diff3(tag: string, base: boolean, eol = "\n"): string {
-	const lines = [`<<<<<<< HEAD`, `ours-${tag}`, `||||||| 9058ab9`, `base-${tag}`, `=======`, `theirs-${tag}`, ">>>>>>> upstream"];
+	const lines = [
+		`<<<<<<< HEAD`,
+		`ours-${tag}`,
+		`||||||| 9058ab9`,
+		`base-${tag}`,
+		`=======`,
+		`theirs-${tag}`,
+		">>>>>>> upstream",
+	];
 	if (!base) lines.splice(2, 2);
 	return lines.map(line => line + eol).join("");
 }
@@ -511,7 +522,9 @@ describe("conflict region parsing", () => {
 
 	test("refuses a file that ends inside a region", () => {
 		for (const merged of ["<<<<<<< HEAD\nours\n", "<<<<<<< HEAD\nours\n=======\ntheirs\n"]) {
-			expect(() => parseMergedFile(conflictAt("i.txt", merged))).toThrow(/ends inside the block that starts at line 1/);
+			expect(() => parseMergedFile(conflictAt("i.txt", merged))).toThrow(
+				/ends inside the block that starts at line 1/,
+			);
 		}
 	});
 
@@ -551,9 +564,17 @@ describe("conflict region parsing", () => {
 	});
 
 	test("refuses two base sections before the separator", () => {
-		const merged = ["<<<<<<< HEAD", "ours", "||||||| a", "base", "||||||| b", "=======", "theirs", ">>>>>>> upstream", ""].join(
-			"\n",
-		);
+		const merged = [
+			"<<<<<<< HEAD",
+			"ours",
+			"||||||| a",
+			"base",
+			"||||||| b",
+			"=======",
+			"theirs",
+			">>>>>>> upstream",
+			"",
+		].join("\n");
 		expect(() => parseMergedFile(conflictAt("m.txt", merged))).toThrow(/has two "\|\|\|\|\|\|\|" sections/);
 	});
 
@@ -570,9 +591,7 @@ describe("conflict region parsing", () => {
 			merged: "kept\n",
 		});
 		expect(plan.wholeFile).toBe(true);
-		expect(plan.regions).toEqual([
-			{ index: 0, ours: "kept\n", base: "kept\n", theirs: null, before: "", after: "" },
-		]);
+		expect(plan.regions).toEqual([{ index: 0, ours: "kept\n", base: "kept\n", theirs: null, before: "", after: "" }]);
 	});
 });
 
@@ -587,7 +606,9 @@ describe("region payload", () => {
 		});
 		expectResolveSuccess(response);
 		expect(prompt).toContain("<conflict-regions>");
-		const payload = JSON.parse(prompt.slice(prompt.indexOf("<conflict-regions>") + 18, prompt.indexOf("</conflict-regions>")));
+		const payload = JSON.parse(
+			prompt.slice(prompt.indexOf("<conflict-regions>") + 18, prompt.indexOf("</conflict-regions>")),
+		);
 		expect(payload).toEqual([
 			{
 				path: CONFLICT.path,
@@ -837,26 +858,14 @@ describe("input validation", () => {
 			priorAnswers: [{ region: 0, content: "ours\n" }],
 		};
 		const responses = [
-			await runAdapter(
-				{ ...resolveRequest(), reviewFeedback: [{ ...note, path: "other.txt" }] },
-				{ runner },
-			),
-			await runAdapter(
-				{ ...resolveRequest(), reviewFeedback: [{ ...note, priorAnswers: [] }] },
-				{ runner },
-			),
+			await runAdapter({ ...resolveRequest(), reviewFeedback: [{ ...note, path: "other.txt" }] }, { runner }),
+			await runAdapter({ ...resolveRequest(), reviewFeedback: [{ ...note, priorAnswers: [] }] }, { runner }),
 			await runAdapter(
 				{ ...resolveRequest(), reviewFeedback: [{ ...note, priorAnswers: [{ region: 3, content: "x" }] }] },
 				{ runner },
 			),
-			await runAdapter(
-				{ ...resolveRequest(), reviewFeedback: [{ ...note, regions: [0, 1] }] },
-				{ runner },
-			),
-			await runAdapter(
-				{ ...resolveRequest(), reviewFeedback: [{ ...note, findings: [] }] },
-				{ runner },
-			),
+			await runAdapter({ ...resolveRequest(), reviewFeedback: [{ ...note, regions: [0, 1] }] }, { runner }),
+			await runAdapter({ ...resolveRequest(), reviewFeedback: [{ ...note, findings: [] }] }, { runner }),
 			await runAdapter(
 				{ ...resolveRequest(), reviewFeedback: [{ ...note, priorAnswers: [{ region: 0, content: null }] }] },
 				{ runner },
@@ -901,9 +910,12 @@ describe("input validation", () => {
 				{ runner },
 			),
 			await runAdapter({ ...resolveRequest(), refusals: [] }, { runner }),
-			await runAdapter({ ...reviewRequest(), refusals: [{ path: CONFLICT.path, side: "ours", regions: [0], reason: "x" }] }, {
-				runner,
-			}),
+			await runAdapter(
+				{ ...reviewRequest(), refusals: [{ path: CONFLICT.path, side: "ours", regions: [0], reason: "x" }] },
+				{
+					runner,
+				},
+			),
 		];
 		expect(called).toBe(0);
 		for (const response of responses) expectFailure(response, "INVALID_INPUT");
@@ -1405,7 +1417,8 @@ describe("retry prompt", () => {
 						path: CONFLICT.path,
 						side: "theirs",
 						regions: [0],
-						reason: "resolved content matches the upstream side; copying a side is not a merge, refusing (SIDE_COPY)",
+						reason:
+							"resolved content matches the upstream side; copying a side is not a merge, refusing (SIDE_COPY)",
 					},
 				],
 			}),
@@ -1475,7 +1488,8 @@ describe("retry prompt", () => {
 	test("keeps the request a region plan: only the path's planned regions are sent", async () => {
 		const multiRegion: ConflictInput = {
 			...CONFLICT,
-			merged: "alpha\n<<<<<<< HEAD\nours\n||||||| base\n=======\ntheirs\n>>>>>>> upstream\nmid\n<<<<<<< HEAD\nours2\n||||||| base\n=======\ntheirs2\n>>>>>>> upstream\n",
+			merged:
+				"alpha\n<<<<<<< HEAD\nours\n||||||| base\n=======\ntheirs\n>>>>>>> upstream\nmid\n<<<<<<< HEAD\nours2\n||||||| base\n=======\ntheirs2\n>>>>>>> upstream\n",
 		};
 		let prompt = "";
 		const response = await resolveConflicts(

@@ -621,10 +621,7 @@ function normalizeConflicts(raw: unknown): ConflictInput[] {
  * Validate the proposed region answers a review turn is asked to judge. Coverage against the
  * actual region plan is checked in `execute`, where the plans exist.
  */
-function normalizeResolutions(
-	raw: unknown,
-	conflictPaths: readonly string[],
-): ProposedRegionResolution[] {
+function normalizeResolutions(raw: unknown, conflictPaths: readonly string[]): ProposedRegionResolution[] {
 	if (!Array.isArray(raw) || raw.length === 0) invalid("resolutions must be a non-empty array for review");
 	const allowed = new Set(conflictPaths);
 	const seen = new Set<string>();
@@ -696,7 +693,11 @@ function normalizeRefusals(raw: unknown, conflictPaths: readonly string[], mode:
  * entry per conflicted path, the review's own findings, and one prior answer for every
  * region index so the retry can revise a complete file-wide proposal.
  */
-function normalizeReviewFeedback(raw: unknown, conflictPaths: readonly string[], mode: AdapterMode): ReviewFeedbackNote[] {
+function normalizeReviewFeedback(
+	raw: unknown,
+	conflictPaths: readonly string[],
+	mode: AdapterMode,
+): ReviewFeedbackNote[] {
 	if (mode !== "resolve") invalid("reviewFeedback is only valid for resolve");
 	if (!Array.isArray(raw) || raw.length === 0) invalid("reviewFeedback must be a non-empty array");
 	const allowed = new Set(conflictPaths);
@@ -1214,11 +1215,7 @@ function assertUsableTurn(outcome: TurnOutcome): void {
 	}
 	if (outcome.text.trim() !== "") return;
 	if (outcome.reasoningOnly) {
-		throw new AdapterError(
-			"MALFORMED_MODEL_OUTPUT",
-			"the model emitted only reasoning and no answer text",
-			proof,
-		);
+		throw new AdapterError("MALFORMED_MODEL_OUTPUT", "the model emitted only reasoning and no answer text", proof);
 	}
 }
 
@@ -1658,7 +1655,9 @@ function assertResolutionsCoverPlans(
 		const plan = planByPath.get(item.path);
 		if (!plan) invalid(`resolutions names "${item.path}", which is not a conflicted path`);
 		if (item.region >= plan.regions.length) {
-			invalid(`resolutions names region ${item.region} of "${item.path}", beyond its ${plan.regions.length} region(s)`);
+			invalid(
+				`resolutions names region ${item.region} of "${item.path}", beyond its ${plan.regions.length} region(s)`,
+			);
 		}
 	}
 	const answered = new Set(resolutions.map(item => `${item.path}\u0000${item.region}`));

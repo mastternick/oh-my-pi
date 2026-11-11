@@ -1285,7 +1285,7 @@ reason_len="$(jq -r 'select(.refusals) | .refusals[0].reason | length' "$d/fake/
 is "a maximal path keeps its refusal inside the adapter's 1000-character bound" yes \
   "$([[ "$reason_len" =~ ^[0-9]+$ ]] && (( reason_len <= 1000 )) && echo yes || echo no)"
 is "a maximal path is elided in its refusal, not left whole" yes \
-  "$((( reason_len < ${#longpath} )) && echo yes || echo no)"
+  "$( (( reason_len < ${#longpath} )) && echo yes || echo no )"
 is "the refusal still names the refused path and side" yes \
   "$(jq -r 'select(.refusals) | .refusals[0].reason' "$d/fake/requests.jsonl" \
     | grep -qF "file.txt' matches the upstream side" && echo yes || echo no)"

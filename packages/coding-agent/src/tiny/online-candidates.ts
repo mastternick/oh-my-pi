@@ -171,15 +171,21 @@ export function collectOnlineTinyCandidates(
 /**
  * Expand one model's own `retry.fallbackChains` transitively.
  *
- * Merges no role/`default` chain into the seed — title generation appends the
- * active session model separately from tiny/commit/smol role collection, so its
- * recovery path consults only the configured model-keyed / wildcard keys that
- * `resolveRetryFallbackChainKey` selects.
+ * With a role hint, only that role's own configured chain applies, and only
+ * while the role is configured: a chain belonging to another role (or to
+ * `default`) is never lent, so a retry cannot move to a model the user did not
+ * select. A role's built-in priority list never adds fallbacks either.
+ * Model-keyed and wildcard chains retain their precedence.
+ * Without a role hint, consult only the configured model-keyed / wildcard /
+ * matching-role keys that `resolveRetryFallbackChainKey` already selects. A
+ * role/`default` chain is not merged into the seed; title generation appends the
+ * active session model separately from tiny/commit/smol role collection.
  */
 export function expandOnlineTinyModelFallbacks(
 	model: Model<Api>,
 	settings: Settings,
 	availableModels: Model<Api>[],
+	role?: string,
 ): Model<Api>[] {
 	const seen = new Set<string>([candidateKey(model)]);
 	const out: OnlineTinyCandidate[] = [{ role: "current", model }];
@@ -188,13 +194,15 @@ export function expandOnlineTinyModelFallbacks(
 	const configuredChains = cfgRetryFallbackChains.get(settings);
 	if (!configuredChains || typeof configuredChains !== "object") return [model];
 
+	// A role hint walks only that role's own configured chain; no default lending.
 	const context = createFallbackContext(configuredChains, settings, availableModels);
 	expandFallbackCandidates(
 		[
 			{
 				role: "current",
 				model,
-				selector: formatModelStringWithRouting(model),
+				selector: (role && settings.getModelRole(role)) || formatModelStringWithRouting(model),
+				roleHint: role,
 			},
 		],
 		context,

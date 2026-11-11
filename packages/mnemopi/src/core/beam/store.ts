@@ -3,12 +3,19 @@ import { logger, withLoopPhase } from "@oh-my-pi/pi-utils";
 import { transaction } from "../../db";
 import { toUtcIso } from "../../util/datetime";
 import { generateId } from "../../util/ids";
-import { embeddingChain, embeddingsDisabled } from "../embeddings";
+import { embed, embeddingChain, embeddingsDisabled } from "../embeddings";
 import { EpisodicGraph } from "../episodic-graph";
 import { countExtractedFactCategories, extractFactCategoriesSafe } from "../extraction";
 import { getMnemopiRuntimeOptions, withMnemopiRuntimeOptions } from "../runtime-options";
 import { storeExtractedFactCategories } from "./consolidate";
-import { type EmbedItem, scheduleEmbedding, vecAvailable, vecInsert } from "./helpers";
+import {
+	type EmbedItem,
+	insertLiveEmbeddings,
+	type StagedEmbedding,
+	scheduleEmbedding,
+	vecAvailable,
+	vecInsert,
+} from "./helpers";
 import type {
 	BeamEvent,
 	BeamMemoryState,
@@ -361,12 +368,16 @@ const PRIMARY_MODEL_META_KEY = "embedding_primary_model";
  * - deletes rows whose model is no longer in the chain, since nothing can compare against them;
  * - when the PRIMARY model changed, clears the primary-only acceleration data (`episodic_memory.binary_vector`
  *   and the sqlite-vec `vec_episodes` index), which was built from the previous primary;
+ * - rebuilds the primary vectors only after a probe and the whole corpus embed under the new primary, in one
+ *   transaction that also records `PRIMARY_MODEL_META_KEY`, so a failed probe or batch keeps the stored
+ *   vectors and leaves the marker for the next open to retry;
  * - re-enqueues, per chain model, every live memory that lacks a vector for that model.
  *
- * Rows for models still in the chain are never wiped. Runs once per store open; an already-current store is
- * a no-op. Skipped entirely when embeddings are disabled or the primary model is unresolved, so a
- * stale-but-valid corpus is never destroyed without a replacement. MUST run inside the active runtime-options
- * scope so `embeddingChain()` / `embeddingsDisabled()` reflect the per-instance configuration.
+ * Rows for models still in the chain are never wiped, and the primary's own backfill is left to the staged
+ * migration so it never races it. Runs once per store open; an already-current store is a no-op apart from
+ * that per-model backfill. Skipped entirely when embeddings are disabled or the primary model is unresolved,
+ * so a stale-but-valid corpus is never destroyed without a replacement. MUST run inside the active
+ * runtime-options scope so `embeddingChain()` / `embeddingsDisabled()` reflect the per-instance configuration.
  */
 export function reconcileEmbeddingModel(beam: BeamMemoryState): void {
 	if (embeddingsDisabled()) return;
@@ -387,14 +398,19 @@ export function reconcileEmbeddingModel(beam: BeamMemoryState): void {
 			? Boolean(beam.db.query("SELECT 1 FROM memory_embeddings WHERE model IS NOT ? LIMIT 1").get(primary))
 			: storedPrimary !== primary;
 
+	// Only models outside the chain are stale: the primary and every fallback stay comparable, so a previous
+	// primary that is still part of the chain keeps its rows. Captured before the sweep so the migration can
+	// still name what it replaced.
 	const orphanModels = beam.db
 		.query(`SELECT DISTINCT model FROM memory_embeddings WHERE model NOT IN (${chainPlaceholders})`)
-		.all(...chain) as { model: string }[];
+		.all(...chain) as { model: string | null }[];
 	transaction(beam.db, () => {
 		if (orphanModels.length > 0) {
 			beam.db.query(`DELETE FROM memory_embeddings WHERE model NOT IN (${chainPlaceholders})`).run(...chain);
 		}
 		if (primaryChanged) {
+			// The acceleration data was built from the previous primary, so it is unusable now. Unlike the
+			// vectors it is derived data, so it is dropped as soon as the change is seen.
 			beam.db.run("UPDATE episodic_memory SET binary_vector = NULL");
 			if (vecAvailable(beam.db)) {
 				try {
@@ -404,40 +420,131 @@ export function reconcileEmbeddingModel(beam: BeamMemoryState): void {
 				}
 			}
 		}
-		beam.db
-			.query("INSERT OR REPLACE INTO mnemopi_meta (key, value) VALUES (?, ?)")
-			.run(PRIMARY_MODEL_META_KEY, primary);
 	});
-	if (primaryChanged) {
-		logger.info("mnemopi: embedding model changed, rebuilding", {
-			from: storedPrimary ?? "(unstamped)",
-			to: primary,
-		});
-	}
 	if (orphanModels.length > 0) {
 		logger.info("mnemopi: dropping embeddings for models outside the chain", {
-			models: orphanModels.map(row => row.model),
+			models: orphanModels.map(row => row.model ?? "(unstamped)"),
 		});
 	}
 
-	// Backfill per model in bounded batches so a corpus-wide rebuild never issues one giant embedding
-	// request; each batch is its own tracked background task.
-	for (const model of chain) {
-		const missing = beam.db
-			.query(`
-				SELECT id AS memoryId, COALESCE(embed_text, content) AS content FROM working_memory
-				WHERE superseded_by IS NULL AND id NOT IN (SELECT memory_id FROM memory_embeddings WHERE model = ?)
-				UNION ALL
-				SELECT id AS memoryId, content FROM episodic_memory
-				WHERE superseded_by IS NULL AND id NOT IN (SELECT memory_id FROM memory_embeddings WHERE model = ?)
-			`)
-			.all(model, model) as EmbedItem[];
-		if (missing.length === 0) continue;
-		logger.info("mnemopi: resuming embedding backfill", { model, count: missing.length });
-		for (let offset = 0; offset < missing.length; offset += EMBED_REBUILD_BATCH) {
-			scheduleEmbedding(beam, missing.slice(offset, offset + EMBED_REBUILD_BATCH), [model]);
+	// Enqueue, per model, every live memory that lacks a vector for that model. Bounded batches keep a
+	// corpus-wide backfill from issuing one giant embedding request; each batch is its own tracked task.
+	const backfill = (models: readonly string[]): void => {
+		for (const model of models) {
+			const missing = beam.db
+				.query(`
+					SELECT id AS memoryId, COALESCE(embed_text, content) AS content FROM working_memory
+					WHERE superseded_by IS NULL AND id NOT IN (SELECT memory_id FROM memory_embeddings WHERE model = ?)
+					UNION ALL
+					SELECT id AS memoryId, content FROM episodic_memory
+					WHERE superseded_by IS NULL AND id NOT IN (SELECT memory_id FROM memory_embeddings WHERE model = ?)
+				`)
+				.all(model, model) as EmbedItem[];
+			if (missing.length === 0) continue;
+			logger.info("mnemopi: resuming embedding backfill", { model, count: missing.length });
+			for (let offset = 0; offset < missing.length; offset += EMBED_REBUILD_BATCH) {
+				scheduleEmbedding(beam, missing.slice(offset, offset + EMBED_REBUILD_BATCH), [model]);
+			}
 		}
+	};
+
+	if (!primaryChanged) {
+		// Nothing is migrating here, so recording the primary is safe. Without the marker a store that
+		// predates the meta table re-derives `primaryChanged` from the stamps and would read the fallback
+		// vectors enqueued below as a primary change on the next open.
+		if (storedPrimary === undefined) {
+			beam.db
+				.query("INSERT OR REPLACE INTO mnemopi_meta (key, value) VALUES (?, ?)")
+				.run(PRIMARY_MODEL_META_KEY, primary);
+		}
+		backfill(chain);
+		return;
 	}
+
+	logger.info("mnemopi: embedding model changed, rebuilding", {
+		from: storedPrimary ?? "(unstamped)",
+		to: primary,
+	});
+
+	const migrate = async (): Promise<void> => {
+		try {
+			const probe = await embed(["mnemopi embedding probe"]);
+			if (probe === null || probe.length !== 1) {
+				logger.warn("mnemopi: embedding provider did not answer; keeping stored embeddings", { to: primary });
+				return;
+			}
+			const live = beam.db
+				.query(`
+					SELECT id AS memoryId, COALESCE(embed_text, content) AS content FROM working_memory WHERE superseded_by IS NULL
+					UNION ALL
+					SELECT id AS memoryId, content FROM episodic_memory WHERE superseded_by IS NULL
+				`)
+				.all() as EmbedItem[];
+
+			// Embed the whole corpus before touching anything stored. embed() handles the provider's
+			// per-request cap; a rejected chunk abandons the rebuild and leaves the stored vectors alone.
+			const toEmbed = live.filter(item => item.content.trim() !== "");
+			const staged: StagedEmbedding[] = [];
+			for (let offset = 0; offset < toEmbed.length; offset += EMBED_REBUILD_BATCH) {
+				const chunk = toEmbed.slice(offset, offset + EMBED_REBUILD_BATCH);
+				const vectors = await embed(chunk.map(item => item.content));
+				if (vectors === null || vectors.length !== chunk.length) {
+					logger.warn("mnemopi: embedding rebuild incomplete; keeping stored embeddings", {
+						to: primary,
+						embedded: staged.length,
+						total: toEmbed.length,
+					});
+					return;
+				}
+				chunk.forEach((item, index) => {
+					const vector = vectors[index];
+					if (vector !== undefined) {
+						staged.push({
+							memoryId: item.memoryId,
+							content: item.content,
+							json: JSON.stringify(Array.from(vector)),
+						});
+					}
+				});
+			}
+
+			transaction(beam.db, () => {
+				// Only rows outside the chain go. A row under the new primary that a concurrent remember()
+				// or update() stamped survives, and so does every fallback model's vector. Each staged
+				// insert also revalidates its source text.
+				beam.db.query(`DELETE FROM memory_embeddings WHERE model NOT IN (${chainPlaceholders})`).run(...chain);
+				insertLiveEmbeddings(beam.db, staged, primary);
+				// Record the new primary in the same transaction as its vectors: a failed probe or batch
+				// must leave the previous marker, or the next open would treat the cleared acceleration
+				// data as current and never rebuild it.
+				beam.db
+					.query("INSERT OR REPLACE INTO mnemopi_meta (key, value) VALUES (?, ?)")
+					.run(PRIMARY_MODEL_META_KEY, primary);
+			});
+			invalidateCaches(beam);
+
+			const replaced =
+				storedPrimary !== undefined ? [storedPrimary] : orphanModels.map(row => row.model ?? "(unstamped)");
+			logger.info("mnemopi: embedding model changed, rebuilt", {
+				from: replaced,
+				to: primary,
+				count: staged.length,
+			});
+		} catch (error) {
+			// A store closed during shutdown lands here; the next open resumes from the stamps.
+			logger.debug("mnemopi: embedding migration aborted", { error: String(error) });
+		}
+	};
+	const task = withMnemopiRuntimeOptions(getMnemopiRuntimeOptions(), migrate);
+	const pending = beam.pendingExtractions;
+	if (pending !== undefined) {
+		pending.add(task);
+		void task.finally(() => pending.delete(task));
+	}
+	// The primary's vectors are being staged by `migrate`, so its backfill must not run on this open: it
+	// would see every live memory as missing and enqueue duplicate tasks racing the atomic migration. The
+	// other chain models are untouched by the migration and still need their vectors here.
+	backfill(chain.slice(1));
 }
 
 export function remember(beam: BeamMemoryState, content: string, options: StoreRememberOptions = {}): string {
@@ -650,37 +757,39 @@ export function getContext(beam: BeamMemoryState, limit = 10): Row[] {
 
 export function invalidate(beam: BeamMemoryState, memoryId: string, replacementId: string | null = null): boolean {
 	const now = toUtcIso();
-	const working = beam.db.run(
-		`
-			UPDATE working_memory
-			SET valid_until = ?, superseded_by = ?
-			WHERE id = ? AND (session_id = ? OR scope = 'global')
-		`,
-		[now, replacementId, memoryId, beam.sessionId],
-	);
-	if (working.changes > 0) {
-		// Recall filters `valid_until`/`superseded_by` in SQL, but the enhanced path consults the
-		// query cache BEFORE it reaches SQL. Without this the row a caller just retired keeps being
-		// served to an identical query for the rest of the cache TTL -- the one thing an explicit
-		// invalidation is supposed to guarantee against. Every other mutator here already does this;
-		// this one was the omission. Gated on an actual row change, like `forgetWorking`, so a
-		// no-op invalidation never discards a valid cache.
-		invalidateCaches(beam);
-		return true;
-	}
-	const episodic = beam.db.run(
-		`
-			UPDATE episodic_memory
-			SET valid_until = ?, superseded_by = ?
-			WHERE id = ? AND (session_id = ? OR scope = 'global')
-		`,
-		[now, replacementId, memoryId, beam.sessionId],
-	);
-	if (episodic.changes > 0) {
-		invalidateCaches(beam);
-		return true;
-	}
-	return false;
+	const changed = transaction(beam.db, () => {
+		const working = beam.db.run(
+			`
+				UPDATE working_memory
+				SET valid_until = ?, superseded_by = ?
+				WHERE id = ? AND (session_id = ? OR scope = 'global')
+			`,
+			[now, replacementId, memoryId, beam.sessionId],
+		);
+		if (working.changes > 0) {
+			// Retire episodic summaries built from this source: they still carry its text. Siblings
+			// covered by the same summary stay recallable via their (consolidated, never TTL-trimmed)
+			// working rows.
+			beam.db.run(
+				`UPDATE episodic_memory SET valid_until = ?, superseded_by = ?
+				 WHERE (session_id = ? OR scope = 'global')
+				   AND instr(',' || summary_of || ',', ',' || ? || ',') > 0`,
+				[now, replacementId, beam.sessionId, memoryId],
+			);
+			return true;
+		}
+		const episodic = beam.db.run(
+			`
+				UPDATE episodic_memory
+				SET valid_until = ?, superseded_by = ?
+				WHERE id = ? AND (session_id = ? OR scope = 'global')
+			`,
+			[now, replacementId, memoryId, beam.sessionId],
+		);
+		return episodic.changes > 0;
+	});
+	if (changed) invalidateCaches(beam);
+	return changed;
 }
 
 export function getWorkingStats(

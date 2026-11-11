@@ -8,7 +8,8 @@ import {
 	type JudgeSourceInput,
 } from "@oh-my-pi/pi-tui/overlays/agent-hub-judge";
 import type { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
-import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { type AgentRegistryApi, MAIN_AGENT_ID } from "../registry/agent-registry";
+import type { AgentSessionManagerHandle } from "../session/agent-session-handle";
 import { sessionFileBelongsToRoot } from "../registry/persisted-agents";
 import type { SessionEntry } from "../session/session-entries";
 import { visitEntriesFromFileStream } from "../session/session-loader";
@@ -91,7 +92,13 @@ async function readFileSource(
 	return source;
 }
 
-function memorySource(key: string, actor: string, sessionManager: SessionManager): JudgeSourceInput {
+/**
+ * Root transcript reads. A registry ref narrows its session manager to the cross-thread
+ * {@link AgentSessionManagerHandle}, but reads its own transcript, so entry access is required.
+ */
+type JudgeSessionManager = AgentSessionManagerHandle & Pick<SessionManager, "getEntries">;
+
+function memorySource(key: string, actor: string, sessionManager: JudgeSessionManager): JudgeSourceInput {
 	const out: Collector = { entries: [] };
 	for (const entry of sessionManager.getEntries()) collectEntry(entry, out);
 	return { key, actor, entries: out.entries };
@@ -104,7 +111,7 @@ function memorySource(key: string, actor: string, sessionManager: SessionManager
  * is read once per (path, actor) and re-read only when its mtime or size changes.
  */
 export function createJudgeActivitySource(options: {
-	registry: AgentRegistry;
+	registry: AgentRegistryApi;
 	observers: SessionObserverRegistry;
 	sessionManager: SessionManager;
 }): JudgeActivitySource {
@@ -133,7 +140,9 @@ export function createJudgeActivitySource(options: {
 				const key = `memory:${ref.id}`;
 				if (seen.has(key)) continue;
 				seen.add(key);
-				sources.push(memorySource(key, ref.id, ref.session.sessionManager));
+				// In-process refs hold their AgentSession, whose manager is the concrete
+				// SessionManager; the handle type only narrows the cross-thread surface.
+				sources.push(memorySource(key, ref.id, ref.session.sessionManager as JudgeSessionManager));
 			}
 			return sources;
 		},

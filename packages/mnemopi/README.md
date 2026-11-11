@@ -90,6 +90,7 @@ Common environment fallbacks:
 - `MNEMOPI_EMBEDDING_MODEL`: defaults to `BAAI/bge-small-en-v1.5`.
 - `MNEMOPI_EMBEDDING_FALLBACK_MODELS`: comma-separated embedding models tried in order after `MNEMOPI_EMBEDDING_MODEL` when it fails (e.g. `nvidia/nemotron-3-embed-1b:free,perplexity/pplx-embed-v1-0.6b`). Each memory is stored once per chain model; query vectors are compared only against rows of the model that produced them. Models outside the chain are dropped on store open.
 - `MNEMOPI_EMBEDDING_API_URL` and `MNEMOPI_EMBEDDING_API_KEY`: OpenAI-compatible embedding endpoint.
+- `MNEMOPI_EMBEDDING_BATCH_SIZE`: texts per embedding API request, default `64`. Larger inputs are split into several requests. Set it lower for a provider with a smaller per-request limit, for example `10` for DashScope.
 - `MNEMOPI_LLM_ENABLED=1`, `MNEMOPI_LLM_BASE_URL`, `MNEMOPI_LLM_API_KEY`, `MNEMOPI_LLM_MODEL`: OpenAI-compatible LLM endpoint.
 
 Local embeddings use the `fastembed` npm package. Its default `BGESmallENV15` model is 384-dimensional and uses the package's CLS pooling plus vector normalization path. Local GGUF LLMs are not available in this package.

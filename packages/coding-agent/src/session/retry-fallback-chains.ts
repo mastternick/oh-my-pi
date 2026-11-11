@@ -496,7 +496,11 @@ export function resolveRetryFallbackChainKey(
 	//    begins with *its* primary model and would silently re-route the live
 	//    role onto another model. A role whose assignment was removed owns
 	//    nothing. An alias primary (`@other`) is unparseable here; the caller
-	//    resolved that alias to this live model, so its hint stands.
+	//    resolved that alias to this live model, so its hint stands. Model-kind
+	//    roles (`web`, `judge`, ...) likewise never match by model: a shared
+	//    model assignment does not mean the chat session owns the kind role
+	//    (kind chains may hold chat models too), so it must not adopt that
+	//    chain. They apply only through the explicit role hint above.
 	if (roleHint && Array.isArray(context.chains[roleHint])) {
 		const configured = context.getModelRole(roleHint)?.trim();
 		if (configured) {

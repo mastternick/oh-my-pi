@@ -12,6 +12,8 @@ import {
 	type ResolveRequest,
 	type ResolveResponse,
 	MAX_CALL_OUTPUT_TOKENS,
+	RESOLVER_MAX_OUTPUT_TOKENS,
+	RESOLVER_MODEL_COMPAT,
 	REVIEW_SESSION_PREFIX,
 	RESOLVER_SESSION_PREFIX,
 	assembleMergedFile,
@@ -154,6 +156,8 @@ interface FakeSdkOptions {
 	/** Registry limits the adapter's payload preflight reads; omitted means "not exposed". */
 	contextWindow?: number;
 	maxTokens?: number;
+	/** Compat flags the fake registry entry already carries. */
+	modelCompat?: Record<string, unknown>;
 }
 
 /** In-memory stand-in for the installed OMP SDK; no network, no real session storage. */
@@ -163,6 +167,7 @@ function fakeSdk(options: FakeSdkOptions): { sdk: SdkModule; state: FakeSdkState
 		id: AI_CONFLICT_MODEL.id,
 		contextWindow: options.contextWindow,
 		maxTokens: options.maxTokens,
+		compat: options.modelCompat,
 	};
 	const state: FakeSdkState = {
 		agentDir: options.agentDir,
@@ -1290,8 +1295,8 @@ describe("payload preflight", () => {
 
 	test("reserves one completion's route cap, not the registry's whole maxTokens", async () => {
 		const root = await tempDir();
-		// ~189000 chars of merged context: ~59063 input tokens, which fits beside the 48000
-		// resolve reserve but not beside the registry's full 384000.
+		// ~189000 chars of merged context: ~59063 input tokens, which fits beside the 120000
+		// resolve cap but not beside the registry's full 384000.
 		const { sdk, state } = fakeSdk({
 			agentDir: path.join(root, "agent"),
 			contextWindow: 300_000,
@@ -1324,14 +1329,38 @@ describe("payload preflight", () => {
 		);
 		expectFailure(response, "PAYLOAD_TOO_LARGE");
 		if (response.ok) return;
-		expect(response.error.message).toContain("completions capped at 48000 tokens");
+		expect(response.error.message).toContain("completions capped at 120000 tokens");
 		expect(response.error.message).toContain("300000-token context window");
 		expect(state.promptCalls).toBe(0);
+	});
+
+	test("refuses input plus the full call cap over the window", async () => {
+		const root = await tempDir();
+		// ~3.3M chars of merged context: ~1031250 input tokens, so the 120000-token call cap
+		// no longer fits the 1048576-token window.
+		const { sdk, state } = fakeSdk({
+			agentDir: path.join(root, "agent"),
+			contextWindow: 1_048_576,
+			maxTokens: 384_000,
+		});
+		const response = await resolveConflicts(
+			resolveRequest({
+				sessionDir: path.join(root, "sessions"),
+				conflicts: [{ ...CONFLICT, merged: `${"x".repeat(3_300_000)}\n${diff3("wide", true)}` }],
+			}),
+			{ sdk, stateRoot: path.join(root, "state") },
+		);
+		expectFailure(response, "PAYLOAD_TOO_LARGE");
+		if (response.ok) return;
+		expect(response.error.message).toContain("plus the 120000-token call cap");
+		expect(response.error.message).toContain("1048576-token context window");
+		expect(state.promptCalls).toBe(0);
+		expect(state.captured).toBeUndefined();
 	});
 });
 
 describe("model registry", () => {
-	test("reads the install's own models.yml and writes no override of its own", async () => {
+	test("writes its own owner-only models.yml and hands it to the registry", async () => {
 		const root = await tempDir();
 		const agentDir = path.join(root, "agent");
 		const stateRoot = path.join(root, "state");
@@ -1341,22 +1370,48 @@ describe("model registry", () => {
 			stateRoot,
 		});
 		expectResolveSuccess(response);
-		// A region plan needs ~15k output tokens, so the resolver carries no compat override and
-		// no models.yml of its own; it only lowers the session model's output cap.
-		expect(state.registryModelsFile).toBe(path.join(agentDir, "models.yml"));
-		await expect(fs.stat(path.join(stateRoot, "models.yml"))).rejects.toThrow();
-		const stray = await fs.readdir(stateRoot);
-		expect(stray).not.toContain("models.yml");
+		const modelsFile = path.join(stateRoot, "models.yml");
+		expect(state.registryModelsFile).toBe(modelsFile);
+		expect((await fs.stat(modelsFile)).mode & 0o777).toBe(0o600);
+		const text = await fs.readFile(modelsFile, "utf8");
+		expect(text).toContain("opencode-go:");
+		expect(text).toContain("deepseek-v4.1-flash:");
+		expect(text).toContain(`maxTokens: ${RESOLVER_MAX_OUTPUT_TOKENS}`);
+		expect(text).toContain("clampOutputToModelMax: true");
+		// The install's global models.yml is never touched.
+		await expect(fs.stat(path.join(agentDir, "models.yml"))).rejects.toThrow();
 	});
 });
 
 describe("enforced output cap", () => {
 	test("never exceeds the call cap and follows a smaller route cap", () => {
+		expect(MAX_CALL_OUTPUT_TOKENS).toBe(120_000);
+		expect(RESOLVER_MAX_OUTPUT_TOKENS).toBe(384_000);
 		expect(sessionOutputCap(384_000)).toBe(MAX_CALL_OUTPUT_TOKENS);
 		expect(sessionOutputCap(20_000)).toBe(20_000);
 		expect(sessionOutputCap(undefined)).toBe(MAX_CALL_OUTPUT_TOKENS);
 		expect(sessionOutputCap(0)).toBe(MAX_CALL_OUTPUT_TOKENS);
 		expect(sessionOutputCap(Number.NaN)).toBe(MAX_CALL_OUTPUT_TOKENS);
+	});
+
+	test("hands the session the call cap and the output-clamp compat flag", async () => {
+		const root = await tempDir();
+		const { sdk, state } = fakeSdk({
+			agentDir: path.join(root, "agent"),
+			contextWindow: 1_048_576,
+			maxTokens: 384_000,
+			modelCompat: { supportsStore: false },
+		});
+		const response = await resolveConflicts(resolveRequest({ sessionDir: path.join(root, "sessions") }), {
+			sdk,
+			stateRoot: path.join(root, "state"),
+		});
+		expectResolveSuccess(response);
+		const captured = state.captured as {
+			model?: { maxTokens?: number; compat?: Record<string, unknown> };
+		};
+		expect(captured.model?.maxTokens).toBe(MAX_CALL_OUTPUT_TOKENS);
+		expect(captured.model?.compat).toEqual({ supportsStore: false, ...RESOLVER_MODEL_COMPAT });
 	});
 
 	test("dispatches the session with that cap as its output limit", async () => {

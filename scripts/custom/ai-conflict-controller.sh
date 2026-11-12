@@ -60,12 +60,14 @@
 #   OMP_AI_CONFLICTS_INPUT_TOKEN_BUDGET    request budget per model call, tokens (default 660000;
 #                                 the regions and merged context of the whole 27-path plan
 #                                 estimate to ~55k, so this only stops a pathological input)
-#   OMP_AI_CONFLICTS_OUTPUT_TOKEN_BUDGET   answer budget per model call, tokens (default 240000;
-#                                 a whole plan's region slices estimate to ~15k, and every call
-#                                 is additionally capped at MODEL_OUTPUT_TOKENS = 48000, which
-#                                 the adapter enforces as the session model's output limit)
+#   OMP_AI_CONFLICTS_OUTPUT_TOKEN_BUDGET   answer budget per model call, tokens (default 90000 =
+#                                 the 120000-token call cap minus the 30000-token reasoning
+#                                 headroom measured on this route; every call is additionally
+#                                 capped at MODEL_OUTPUT_TOKENS = 120000, which the adapter
+#                                 enforces as the session model's output limit)
 #   OMP_AI_CONFLICTS_COMBINED_TOKEN_BUDGET input plus output ceiling for one call, tokens
-#                                 (default 900000)
+#                                 (default 900000; the request budget plus the 120000-token cap
+#                                 must stay under the 1048576-token context window)
 #                                 All of them convert bytes with the adapter's own chars/token
 #                                 divisor (ESTIMATE_CHARS_PER_TOKEN = 3.2 in
 #                                 ai-conflict-model.ts); a path that cannot fit alone stops
@@ -98,8 +100,14 @@ MODEL_TIMEOUT_MS="${OMP_AI_CONFLICTS_MODEL_TIMEOUT_MS:-1800000}"
 HARD_TIMEOUT="${OMP_AI_CONFLICTS_HARD_TIMEOUT:-2100}"
 MAX_TEXT="${OMP_AI_CONFLICTS_MAX_TEXT_BYTES:-7340032}"
 MAX_RESOLUTION="${OMP_AI_CONFLICTS_MAX_RESOLUTION_BYTES:-7340032}"
+# The pinned model's per-call output ceiling (MAX_CALL_OUTPUT_TOKENS in ai-conflict-model.ts),
+# its measured reasoning headroom, and the route's context window. Every budget below is
+# derived from these three, so the adapter's preflight and the batching agree.
+MODEL_OUTPUT_TOKENS=120000
+REASONING_HEADROOM_TOKENS=30000
+CONTEXT_WINDOW_TOKENS=1048576
 INPUT_TOKEN_BUDGET="${OMP_AI_CONFLICTS_INPUT_TOKEN_BUDGET:-660000}"
-OUTPUT_TOKEN_BUDGET="${OMP_AI_CONFLICTS_OUTPUT_TOKEN_BUDGET:-240000}"
+OUTPUT_TOKEN_BUDGET="${OMP_AI_CONFLICTS_OUTPUT_TOKEN_BUDGET:-$(( MODEL_OUTPUT_TOKENS - REASONING_HEADROOM_TOKENS ))}"
 COMBINED_TOKEN_BUDGET="${OMP_AI_CONFLICTS_COMBINED_TOKEN_BUDGET:-900000}"
 SYNC_WF="${OMP_AI_CONFLICTS_SYNC_WORKFLOW:-custom-sync.yml}"
 TIMEOUT="${OMP_AI_CONFLICTS_TIMEOUT:-7200}"
@@ -546,18 +554,21 @@ jobKey="sync-${tag}-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
 # reuses the partition because it carries the same regions plus the proposal.
 CHARS_PER_TOKEN_X10=32 # ESTIMATE_CHARS_PER_TOKEN (3.2) in ai-conflict-model.ts, scaled for integer math
 
-# One answer is a region plan, not a file set: the 55 regions of the real 27-path sync
-# estimate to ~15k output tokens, so a plain 48000-token ceiling per call is generous. The
-# adapter writes the same number into the session model's output limit, so this is the cap
-# the request really carries (a route advertising less lowers it, and a batch that cannot
-# finish then fails with OUTPUT_TRUNCATED instead of being silently truncated).
-MODEL_OUTPUT_TOKENS=48000
-BATCH_OUT=$(( OUTPUT_TOKEN_BUDGET < MODEL_OUTPUT_TOKENS ? OUTPUT_TOKEN_BUDGET : MODEL_OUTPUT_TOKENS ))
+# One answer is a region plan, not a file set. The call cap (120000 tokens) counts the
+# model's reasoning too, so the answer budget is capped at the cap minus the measured
+# 30000-token reasoning headroom; a plan that overruns both fails with OUTPUT_TRUNCATED
+# instead of being silently truncated. The adapter writes the same cap into the session
+# model's output limit, so this is the bound the request really carries (a route advertising
+# less lowers it).
+BATCH_OUT_LIMIT=$(( MODEL_OUTPUT_TOKENS - REASONING_HEADROOM_TOKENS ))
+BATCH_OUT=$(( OUTPUT_TOKEN_BUDGET < BATCH_OUT_LIMIT ? OUTPUT_TOKEN_BUDGET : BATCH_OUT_LIMIT ))
 BATCH_IN=$(( COMBINED_TOKEN_BUDGET - BATCH_OUT ))
 (( BATCH_IN > 0 )) \
   || fail "OMP_AI_CONFLICTS_COMBINED_TOKEN_BUDGET ($COMBINED_TOKEN_BUDGET) leaves no input room beside the $BATCH_OUT-token answer budget"
 (( INPUT_TOKEN_BUDGET < BATCH_IN )) && BATCH_IN=$INPUT_TOKEN_BUDGET
-log "one answer is capped at $MODEL_OUTPUT_TOKENS tokens (enforced as the session model's output limit); batching regions to ~$BATCH_IN input and ~$BATCH_OUT output tokens per call"
+(( BATCH_IN + MODEL_OUTPUT_TOKENS <= CONTEXT_WINDOW_TOKENS )) \
+  || fail "OMP_AI_CONFLICTS_INPUT_TOKEN_BUDGET ($BATCH_IN) plus the $MODEL_OUTPUT_TOKENS-token call cap exceeds the $CONTEXT_WINDOW_TOKENS-token context window"
+log "one answer is capped at $MODEL_OUTPUT_TOKENS tokens (the session model's output limit, reasoning included); batching regions to ~$BATCH_IN input and ~$BATCH_OUT output tokens per call"
 
 tokens_of() { # bytes -> overestimated tokens
   printf '%s' $(( ($1 * 10 + CHARS_PER_TOKEN_X10 - 1) / CHARS_PER_TOKEN_X10 ))

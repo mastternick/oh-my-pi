@@ -802,6 +802,10 @@ is "small conflict set uses one resolve turn" 1 "$(count_calls "$d" resolve)"
 is "small conflict set uses one review turn" 1 "$(count_calls "$d" review)"
 is "small conflict set logs a single batch" 1 \
   "$(grep -c 'batch 1/1: 6 path(s)' "$d/state/run.log" 2>/dev/null || true)"
+is "default batching states the call cap and per-request budgets" yes \
+  "$(grep -qF 'one answer is capped at 120000 tokens' "$d/state/run.log" \
+    && grep -qF 'batching regions to ~660000 input and ~90000 output tokens per call' "$d/state/run.log" \
+    && echo yes || echo no)"
 sbr="$(git -C "$d/origin.git" rev-parse --verify --quiet refs/heads/sync/upstream-v1.2.3)"
 is_not "small conflict set publishes the sync branch" "" "$sbr"
 is "small conflict set resolves every path" 6 \

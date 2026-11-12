@@ -360,13 +360,27 @@ class AdapterError extends Error {
 export const ESTIMATE_CHARS_PER_TOKEN = 3.2;
 
 /**
- * Ceiling on the answer of one resolver call. A region plan answers about 50 KB of conflict
- * text for the first real upstream (~15 k output tokens), so 48 k covers a plan several
- * times that size. It is not an assumption: `defaultTurnRunner` writes it into the session
- * model's `maxTokens`, which the SDK forwards as the request's output parameter, lowered to
- * the route's own advertised cap when the registry declares a smaller one.
+ * Ceiling on one resolver call's output, reasoning tokens included: the route counts the
+ * model's thinking against the same `max_completion_tokens` as the answer. A large resolve
+ * spent 47,679 of a 48,000-token cap thinking and had ~2k left for a ~23k-token plan, so
+ * the cap is raised to 120k: ~90k of answer beside the ~30k reasoning headroom measured on
+ * this route, while still fitting the window beside a realistic input. It is not an
+ * assumption: `defaultTurnRunner` writes it into the session model's `maxTokens`, which the
+ * SDK forwards as the request's output parameter, lowered to the route's own advertised cap
+ * when the registry declares a smaller one.
  */
-export const MAX_CALL_OUTPUT_TOKENS = 48_000;
+export const MAX_CALL_OUTPUT_TOKENS = 120_000;
+
+/**
+ * The pinned route's own output ceiling, declared in the resolver-owned models.yml. Without
+ * `compat.clampOutputToModelMax` the SDK clamps OpenAI-compatible requests to
+ * `OPENAI_MAX_OUTPUT_TOKENS` (64k) no matter what the model advertises; with it the clamp is
+ * the model's `maxTokens`. The gateway accepts this value (its own limit is 393,216).
+ */
+export const RESOLVER_MAX_OUTPUT_TOKENS = 384_000;
+
+/** The compat flag that hands the output clamp to {@link RESOLVER_MAX_OUTPUT_TOKENS}. */
+export const RESOLVER_MODEL_COMPAT = { clampOutputToModelMax: true } as const;
 
 /**
  * The output cap one turn is actually dispatched with: {@link MAX_CALL_OUTPUT_TOKENS}, or
@@ -411,7 +425,7 @@ export function assertPayloadFits(promptChars: number, limits: ContextLimits, mo
 	if (estimate + reserve <= limits.contextWindow) return;
 	throw new AdapterError(
 		"PAYLOAD_TOO_LARGE",
-		`estimated ${estimate} input tokens plus a ${reserve} output reserve exceed the ${limits.contextWindow}-token context window (${promptChars} chars, completions capped at ${limits.maxOutputTokens} tokens); split the payload into smaller requests`,
+		`estimated ${estimate} input tokens plus the ${reserve}-token call cap exceed the ${limits.contextWindow}-token context window (${promptChars} chars, completions capped at ${limits.maxOutputTokens} tokens); split the payload into smaller requests`,
 	);
 }
 
@@ -1432,6 +1446,32 @@ async function hardenFile(file: string | undefined): Promise<void> {
 	await fs.chmod(file, PRIVATE_FILE_MODE).catch(() => {});
 }
 
+/**
+ * The resolver's own models.yml: only the pinned model override, no provider settings and
+ * no global config. Declares the route's full output ceiling and the compat flag that makes
+ * the SDK clamp to it instead of the 64k OpenAI-compatible default.
+ */
+export function resolverModelsYaml(): string {
+	return [
+		"providers:",
+		`  ${AI_CONFLICT_MODEL.provider}:`,
+		"    modelOverrides:",
+		`      ${AI_CONFLICT_MODEL.id}:`,
+		`        maxTokens: ${RESOLVER_MAX_OUTPUT_TOKENS}`,
+		"        compat:",
+		"          clampOutputToModelMax: true",
+		"",
+	].join("\n");
+}
+
+/** Write that file under the resolver state root, owner-only, and return its path. */
+export async function writeResolverModelsFile(stateRoot: string): Promise<string> {
+	const file = path.join(stateRoot, "models.yml");
+	await fs.writeFile(file, resolverModelsYaml(), { mode: PRIVATE_FILE_MODE });
+	await fs.chmod(file, PRIVATE_FILE_MODE).catch(() => {});
+	return file;
+}
+
 function dispatchMismatchError(reason: string): AdapterError {
 	return new AdapterError(
 		"MODEL_PROOF_MISMATCH",
@@ -1450,14 +1490,22 @@ async function defaultTurnRunner(request: TurnRequest, runtime: TurnRuntime): Pr
 	const settings = sdk.Settings.isolated({ "autolearn.enabled": false, "retry.modelFallback": false });
 	const agentDir = sdk.getAgentDir();
 	const authStorage = await sdk.discoverAuthStorage(agentDir, { settings, cwd: runtime.cwd });
-	// The install's own models.yml, read-only. The resolver carries no compat override: it
-	// only lowers the session model's output cap to the ceiling its answers are sized for.
-	const registry = new sdk.ModelRegistry(authStorage, path.join(agentDir, "models.yml"), {
+	// The resolver's own models.yml, written owner-only under its state root: it declares the
+	// route's full output ceiling and the compat flag that stops the SDK clamping every
+	// OpenAI-compatible request to 64k. The install's global models.yml is never touched.
+	const modelsFile = await writeResolverModelsFile(runtime.stateRoot);
+	const registry = new sdk.ModelRegistry(authStorage, modelsFile, {
 		settings,
 		cacheDbPath: path.join(cacheDir, "models.db"),
 	});
 	const model = registry.find(AI_CONFLICT_MODEL.provider, AI_CONFLICT_MODEL.id) as
-		| { provider: string; id: string; contextWindow?: unknown; maxTokens?: unknown }
+		| {
+				provider: string;
+				id: string;
+				contextWindow?: unknown;
+				maxTokens?: unknown;
+				compat?: Record<string, unknown>;
+		  }
 		| undefined;
 	if (!model) {
 		throw new AdapterError(
@@ -1469,6 +1517,11 @@ async function defaultTurnRunner(request: TurnRequest, runtime: TurnRuntime): Pr
 	// `maxTokens` as the completion limit, and the caller-owned model object is authoritative
 	// (no rebind to the registry entry). A route advertising a smaller cap lowers it.
 	const outputCap = sessionOutputCap(model.maxTokens);
+	const sessionModel = {
+		...model,
+		maxTokens: outputCap,
+		compat: { ...model.compat, ...RESOLVER_MODEL_COMPAT },
+	};
 	const limits = contextLimitsOf(model);
 	if (limits) assertPayloadFits(request.systemPrompt.length + request.prompt.length, limits, request.mode);
 
@@ -1482,7 +1535,7 @@ async function defaultTurnRunner(request: TurnRequest, runtime: TurnRuntime): Pr
 			settings,
 			authStorage,
 			modelRegistry: registry,
-			model: { ...model, maxTokens: outputCap },
+			model: sessionModel,
 			sessionManager: sdk.SessionManager.create(runtime.cwd, runtime.sessionDir),
 			disableModelFallback: true,
 			disableServerSideFallback: true,

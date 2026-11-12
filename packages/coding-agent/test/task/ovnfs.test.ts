@@ -53,8 +53,14 @@ describe("ovnfs checkout recovery", () => {
 		await fs.rm(root, { recursive: true, force: true });
 	});
 
+	/** Writable stand-in for the daemon's mount, inside this test's temp root. */
+	const mountDir = (): string => path.join(root, "mnt");
+
 	function mockDaemon(handle: (op: DaemonOp) => unknown): void {
-		vi.spyOn(daemon, "startDaemon").mockResolvedValue({ socket: "/tmp/ovnfs-test.sock", mount: "/mnt/ovnfs" });
+		// The daemon's mount carries the workspace directory the runner creates its
+		// child cwd under, so it must be a path this test may write: a real `/mnt/ovnfs`
+		// only exists on machines with a running daemon.
+		vi.spyOn(daemon, "startDaemon").mockResolvedValue({ socket: "/tmp/ovnfs-test.sock", mount: mountDir() });
 		vi.spyOn(client, "callSocket").mockImplementation(
 			async <T>(_socket: string, op: string, args: object): Promise<T> => {
 				const record = args as { checkout?: unknown; name?: unknown; base?: unknown };
@@ -304,7 +310,7 @@ describe("ovnfs checkout recovery", () => {
 		mockDaemon(op => {
 			if (op.op === "new" && op.name && !op.base) {
 				return {
-					checkout: { name: op.name, path: `/mnt/ovnfs/${op.name}`, base: "b_1" },
+					checkout: { name: op.name, path: path.join(mountDir(), op.name), base: "b_1" },
 					capture: { root: repo, repos: [""] },
 				};
 			}
@@ -385,7 +391,8 @@ describe("ovnfs checkout recovery", () => {
 			if (op.op === "diff") return { patch, binary: true };
 			if (op.op === "new") {
 				opened.push(op);
-				return { checkout: { name: op.name, path: `/mnt/ovnfs/${op.name}`, base: op.base } };
+				const name = op.name ?? "";
+				return { checkout: { name, path: path.join(mountDir(), name), base: op.base } };
 			}
 			return {};
 		});
@@ -460,7 +467,7 @@ describe("ovnfs checkout recovery", () => {
 		expect(result.branchName).toBe("omp/task/BranchRun");
 		const start = opened.find(op => op.base);
 		expect(start?.base).toBe("b_1");
-		expect(captured.mock.calls).toEqual([[`/mnt/ovnfs/${start?.name}`, repo]]);
+		expect(captured.mock.calls).toEqual([[path.join(mountDir(), start?.name ?? ""), repo]]);
 		expect(committed).toHaveBeenCalledTimes(1);
 		expect(committed.mock.calls[0]?.[1]).toBe(baseline);
 		expect(committed.mock.calls[0]?.[5]).toEqual({ rootPatch: binaryPatch, nestedPatches: [] });

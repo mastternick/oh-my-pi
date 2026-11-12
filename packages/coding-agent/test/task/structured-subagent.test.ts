@@ -512,7 +512,14 @@ describe("structured subagent primitive", () => {
 		const untagged: AgentDefinition = { ...AGENT, name: "m2", model: [selector], thinkingLevel: Effort.Medium };
 		const settings = Settings.isolated({ "task.maxEffort": "low", "task.isolation.enabled": false });
 		const parent = Object.assign(session({ settings, sessionAgents: [tagged, untagged] }), {
-			modelRegistry: { authStorage: {}, refresh: async () => {}, getAvailable: () => [model] },
+			// The child's auth-fallback resolution reads credentials through the parent
+			// registry, so the stub carries the same key the session hands out.
+			modelRegistry: {
+				authStorage: {},
+				refresh: async () => {},
+				getAvailable: () => [model],
+				getApiKey: async () => "test-key",
+			},
 			getApiKey: async () => "test-key",
 		});
 		const create = vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {

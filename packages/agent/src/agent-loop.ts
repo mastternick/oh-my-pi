@@ -107,6 +107,7 @@ import type {
 	SteeringInterruptSource,
 	SteeringQueueState,
 	StreamFn,
+	ToolApprovalDecision,
 } from "./types";
 import {
 	ASIDE_MESSAGE_COMMIT,
@@ -3646,7 +3647,11 @@ async function executeToolCalls(
 		flushResultMessages();
 	};
 
-	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
+	const runTool = async (
+		record: (typeof records)[number],
+		index: number,
+		earlierEffectsSettled: Promise<void> | undefined,
+	): Promise<void> => {
 		// A pending interrupt preempts not-yet-started interruptible tools,
 		// except receivers that drain the wake with an already-aborted signal.
 		// Non-interruptible work is never skipped, whatever the source: the
@@ -3755,7 +3760,7 @@ async function executeToolCalls(
 				if (abortBeforeToolExecution()) return;
 
 				const speculativeOutcome = speculationCoordinator
-					? await speculationCoordinator.claim(tool, toolCall, executionArgs)
+					? await speculationCoordinator.claim(tool, toolCall, executionArgs, earlierEffectsSettled, record.signal)
 					: undefined;
 				if (speculativeOutcome) {
 					// Normalize exactly like the ordinary execute path below: third-party
@@ -3784,6 +3789,7 @@ async function executeToolCalls(
 						toolCalls: toolCallInfos,
 						steeringSignal: steeringSoftController.signal,
 						providerMetadata: toolCall.providerMetadata,
+						...(earlierEffectsSettled ? { earlierEffectsSettled } : {}),
 						addAdditionalContext: context => {
 							if (isNonBlankContext(context)) record.reportedContext.push(context);
 						},
@@ -3924,6 +3930,10 @@ async function executeToolCalls(
 
 	let lastExclusive: Promise<void> = Promise.resolve();
 	let sharedTasks: Promise<void>[] = [];
+	// The shared calls among `sharedTasks` whose approval, asked with the call's
+	// arguments, is not "read": they may change files that a later call running
+	// beside them reads.
+	let sharedEffects: Promise<void>[] = [];
 	const tasks: Promise<void>[] = [];
 
 	// While tool calls are in flight, queued steering or interrupting IRC would
@@ -4005,9 +4015,13 @@ async function executeToolCalls(
 		// only when validation failed, and those records error out before executing.
 		const concurrency = resolveToolConcurrency(record.tool, record.args);
 		const start = concurrency === "exclusive" ? Promise.all([lastExclusive, ...sharedTasks]) : lastExclusive;
+		const earlierEffectsSettled =
+			concurrency === "shared" && sharedEffects.length > 0
+				? Promise.allSettled(sharedEffects).then(() => undefined)
+				: undefined;
 		const task = start.then(async () => {
 			try {
-				await runTool(record, index);
+				await runTool(record, index, earlierEffectsSettled);
 			} finally {
 				refreshPauseState();
 			}
@@ -4016,8 +4030,23 @@ async function executeToolCalls(
 		if (concurrency === "exclusive") {
 			lastExclusive = task;
 			sharedTasks = [];
+			sharedEffects = [];
 		} else {
 			sharedTasks.push(task);
+			// A dynamic approval is asked with the prepared arguments, as concurrency
+			// is above, and no context; one that throws, or that says anything but
+			// "read", counts as a call that may write. A resolver that says "write"
+			// only with a context or only for transformed arguments is not counted, so
+			// a read after it returns what it read first.
+			const approval = record.tool?.approval;
+			let decision: ToolApprovalDecision | undefined;
+			try {
+				decision = typeof approval === "function" ? approval(record.args) : approval;
+			} catch {
+				decision = undefined;
+			}
+			const tier = typeof decision === "string" ? decision : (decision?.tier ?? "exec");
+			if (tier !== "read") sharedEffects.push(task);
 		}
 	}
 	try {

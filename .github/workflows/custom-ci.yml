@@ -38,6 +38,7 @@ jobs:
           scripts/custom/test-ai-conflict-controller.sh
           scripts/custom/test-ai-conflict-install.sh
           bun test scripts/custom/test-ai-conflict-model.test.ts
+          bun test scripts/custom/test-pack-only-args.test.ts
       - name: Upstream full check
         run: bun run ci:check:full
   test:
@@ -134,9 +135,6 @@ jobs:
           done
           echo "::error::Coding-agent-native tests still fail after two retries; failing test files: ${files[*]}"
           exit 1
-      - name: Test release script
-        if: matrix.mode == 'workspace'
-        run: bun test scripts/release.test.ts
 
   package:
     needs: static

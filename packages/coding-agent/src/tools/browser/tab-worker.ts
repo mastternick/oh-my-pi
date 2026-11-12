@@ -1809,13 +1809,13 @@ export class WorkerCore {
 			client.on("Page.javascriptDialogClosed", this.#onDialogClosed);
 			client.on("OMP.debuggerDetached", this.#onDebuggerDetached);
 			this.#page.on("error", this.#onPageCrashed);
-			if (this.#ownsPage) {
+			if (this.#ownsPage || (payload.mode === "attach" && payload.userDriven)) {
 				// Background Chromium tabs stop producing frames, stalling rAF,
-				// IntersectionObserver, and input acknowledgements. Keep owned tabs
-				// interactive without raising a window; explicit settle-freeze still applies.
-				// An attached user's page is left alone: Chromium's focus emulation reports the
-				// page as active (`document.visibilityState` becomes `visible`), which would
-				// claim the user's background tab had been brought forward during a capture.
+				// IntersectionObserver, and input acknowledgements; in a visible browser a tab
+				// that was never selected drops trusted input outright. Keep the page
+				// interactive without selecting its tab or raising a window, including a user's
+				// page in a background tab; explicit settle-freeze still applies. It ends with
+				// this connection's session (on the relay, with the bridge's last session).
 				await this.#page.emulateFocusedPage(true);
 			}
 			this.#webmcp = new WebMcpController(this.#page);

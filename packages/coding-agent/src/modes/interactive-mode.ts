@@ -255,7 +255,9 @@ import { getSessionAccentAnsi, getSessionAccentHex } from "@oh-my-pi/pi-tui/them
 import { messageHasDisplayableThinking } from "@oh-my-pi/pi-tui/chat/thinking-display";
 import type { TokenRateMeter } from "../utils/token-rate";
 import {
+	type BlockedKind,
 	disposeProgramStatus,
+	holdBlockedStatus,
 	initProgramStatus,
 	resendProgramStatus,
 	setProgramStatusEnabled,
@@ -1731,6 +1733,13 @@ export class InteractiveMode implements InteractiveModeContext {
 	shutdownRequested = false;
 	#isShuttingDown = false;
 	/**
+	 * Cancellation scope of the current `shutdown()`/`restart()` close attempt.
+	 * Every prompt the close shows before teardown (the extension
+	 * `session_before_shutdown` gate, `worktree.onExit` confirmations) runs
+	 * under it; another close request, a signal teardown, or `stop()` aborts it.
+	 */
+	#closeAttempt: AbortController | undefined;
+	/**
 	 * Set once a graceful {@link shutdown} teardown threw. The teardown is
 	 * promise-memoized (and the session manager latches its disk error), so
 	 * re-running it repeats the identical failure — without this flag the user is
@@ -2477,6 +2486,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#signalTeardown = createSessionTeardown({
 			getDraftText: () => this.#inputController.getDraftText(),
 			beginDispose: () => {
+				this.#closeAttempt?.abort();
 				this.session.beginDispose();
 				this.statusLine.dispose();
 			},
@@ -3537,13 +3547,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		// child process that Esc can no longer reach.
 		this.#abortLoopCondition();
 		this.#loopConditionAbort = controller;
+		const sessionId = this.sessionManager.getSessionId();
 		let verdict: LoopConditionVerdict;
 		try {
 			verdict = await evaluateLoopCondition(condition, {
 				cwd: this.sessionManager.getCwd(),
 				timeoutMs: cfgLoopConditionTimeoutMs.get(settings),
 				signal: controller.signal,
-				sessionId: this.sessionManager.getSessionId(),
+				sessionId,
+				isSessionCurrent: () => this.sessionManager.getSessionId() === sessionId,
 			});
 		} finally {
 			if (this.#loopConditionAbort === controller) this.#loopConditionAbort = undefined;
@@ -5067,6 +5079,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		for (const [id, component] of livePendingTools) {
 			this.pendingTools.set(id, component);
 		}
+		this.#eventController.reconcileReadGroupAfterRebuild();
 		// During the pre-streaming window — after `startPendingSubmission` has
 		// optimistically rendered the user's message but before the user
 		// `message_start` event lands it in `session` entries — any rebuild
@@ -7965,7 +7978,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			() => requestDelivered.resolve(),
 			() => requestDelivered.resolve(),
 		);
-		const choice = await choicePromise;
+		// The plan waits on the user's approval, after the turn that proposed it has ended.
+		const release = holdBlockedStatus({ state: "blocked", kind: "permission", msg: `Review plan: ${details.title}` });
+		const choice = await choicePromise.finally(release);
 		if (this.#pendingPlanReview === pending) this.#pendingPlanReview = undefined;
 		const remote = pending.remote;
 		const closePlanReview = (): void => {
@@ -8135,7 +8150,12 @@ export class InteractiveMode implements InteractiveModeContext {
 	async #promptAutoQaConsent(): Promise<boolean | null> {
 		const pool = InteractiveMode.#AUTOQA_CONSENT_PROMPTS;
 		const [headline, body] = pool[Math.floor(Math.random() * pool.length)];
-		const choice = await this.#extensionUiController.showCollabAwareSelector(`${headline}\n${body}`, ["Yes", "No"]);
+		const choice = await this.#extensionUiController.showCollabAwareSelector(
+			`${headline}\n${body}`,
+			["Yes", "No"],
+			undefined,
+			{ kind: "permission" },
+		);
 		return choice === "Yes";
 	}
 
@@ -8175,6 +8195,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					timedOut = true;
 				},
 			},
+			{ kind: "permission" },
 		);
 		if (timedOut) return "timeout";
 		if (choice === CFG_APPROVE_SESSION) return "session";
@@ -8183,6 +8204,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	stop(): void {
+		this.#closeAttempt?.abort();
 		this.syncIdleMaintenanceView(null);
 		this.#hidePlanReview();
 		this.#appearanceRefreshRequest = undefined;
@@ -8273,8 +8295,18 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	async shutdown(): Promise<void> {
-		if (this.#isShuttingDown) return;
+	/**
+	 * Close the session and quit. `cancellable: false` is for closes nobody may
+	 * refuse (fatal workspace states, `ctx.shutdown()`); operator quits are
+	 * cancellable and first ask extensions through `session_before_shutdown`.
+	 */
+	async shutdown(options?: { cancellable?: boolean }): Promise<void> {
+		if (this.#isShuttingDown) {
+			// Another close request ends the pending attempt's prompts; that
+			// attempt keeps ownership of teardown and can no longer be cancelled.
+			this.#closeAttempt?.abort();
+			return;
+		}
 		// The previous graceful teardown failed AT the memoized session.dispose()
 		// (the session is already disposing), so it re-rejects identically forever
 		// and the process can never close (#12238: a corrupted session file makes
@@ -8285,8 +8317,19 @@ export class InteractiveMode implements InteractiveModeContext {
 			await this.#quitHostOwned(130);
 			return;
 		}
-		this.#beginClose();
-		const worktreePlan = await this.#planOwnedWorktreeExit();
+		const signal = this.#beginClose();
+		// Reversible decisions first: nothing has been stopped yet, so a refusal
+		// leaves the session exactly as it was.
+		if (options?.cancellable !== false && !(await this.session.confirmClose(signal))) {
+			this.#abandonClose();
+			this.showStatus("Session close cancelled");
+			// The refusal covers only this quit, not a pending `ctx.shutdown()`.
+			if (this.shutdownRequested) void this.checkShutdownRequested();
+			return;
+		}
+		// A signal teardown or stop() took over while extensions were asked.
+		if (this.session.isDisposed || this.#dialogLifetime.signal.aborted) return;
+		const worktreePlan = await this.#planOwnedWorktreeExit(signal);
 		try {
 			await this.#teardown();
 		} catch (error) {
@@ -8310,7 +8353,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#handleTeardownError(action: "close" | "restart", error: unknown): void {
-		this.#isShuttingDown = false;
+		this.#abandonClose();
 		const detail = error instanceof Error ? error.message : String(error);
 		// Arm the escape hatch only once dispose() has begun: its promise is
 		// memoized, so a retry can only re-fail. A failure BEFORE dispose (a
@@ -8329,7 +8372,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * to remove after teardown. Stops the agent turn and live commands first so the
 	 * prompts describe a worktree nothing is still writing to. Never throws.
 	 */
-	async #planOwnedWorktreeExit(): Promise<WorktreeExitPlan[]> {
+	async #planOwnedWorktreeExit(signal: AbortSignal): Promise<WorktreeExitPlan[]> {
 		const policy = cfgWorktreeOnExit.get(this.settings);
 		if (policy === "keep" || this.#ownedWorktrees.length === 0) return [];
 		this.#abortLoopCondition();
@@ -8343,7 +8386,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		return planWorktreeExit(
 			this.#ownedWorktrees,
 			policy,
-			(title, message) => this.showHookConfirm(title, message),
+			(title, message) => this.showHookConfirm(title, message, { signal }),
 			message => this.showWarning(message),
 		);
 	}
@@ -8422,9 +8465,17 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * any await: worktree exit planning, live commands, and BTW history writes can
 	 * all stall, and the user must see a reason for the pause.
 	 */
-	#beginClose(): void {
+	#beginClose(): AbortSignal {
 		this.#isShuttingDown = true;
+		this.#closeAttempt = new AbortController();
 		this.showStatus("Closing session…");
+		return this.#closeAttempt.signal;
+	}
+
+	/** Return to a usable session after a close attempt was refused or failed. */
+	#abandonClose(): void {
+		this.#isShuttingDown = false;
+		this.#closeAttempt = undefined;
 	}
 
 	/** Shared `shutdown()`/`restart()` teardown: dispose the session and hand the terminal back. */
@@ -8526,7 +8577,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		) {
 			return;
 		}
-		await this.shutdown();
+		await this.shutdown({ cancellable: false });
 	}
 
 	// Extension UI integration
@@ -9967,7 +10018,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		title: string,
 		options: ExtensionUISelectItem[],
 		dialogOptions?: InteractiveSelectorDialogOptions,
-		extra?: { slider?: HookSelectorSlider },
+		extra?: { slider?: HookSelectorSlider; kind?: BlockedKind },
 	): Promise<string | undefined> {
 		return this.#extensionUiController.showHookSelector(title, options, dialogOptions, extra);
 	}

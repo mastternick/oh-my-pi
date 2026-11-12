@@ -38,6 +38,7 @@ jobs:
           scripts/custom/test-ai-conflict-controller.sh
           scripts/custom/test-ai-conflict-install.sh
           bun test scripts/custom/test-ai-conflict-model.test.ts
+          bun test scripts/custom/test-pack-only-args.test.ts
       - name: Upstream full check
         run: bun run ci:check:full
   test:

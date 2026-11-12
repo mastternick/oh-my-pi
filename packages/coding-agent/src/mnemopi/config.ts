@@ -4,6 +4,7 @@ import * as path from "node:path";
 import type { MnemopiOptions } from "@oh-my-pi/pi-mnemopi";
 import { getMemoriesDir, logger, withLoopPhase } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
+import { expandTilde } from "../tools/path-utils";
 
 import {
 	limitBankName,
@@ -96,7 +97,7 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 	const cwd = settings.getCwd();
 	const scoping = cfgMnemopiScoping.get(settings);
 	const dbPath = configuredDbPath?.trim()
-		? configuredDbPath
+		? expandTilde(configuredDbPath.trim())
 		: path.join(getMemoriesDir(agentDir), "mnemopi", "mnemopi.db");
 	const projectIdentity = resolveProjectIdentity(cwd);
 	const repoRoot = resolveProjectRepoRoot(cwd);

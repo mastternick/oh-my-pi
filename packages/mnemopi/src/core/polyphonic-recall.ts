@@ -360,16 +360,16 @@ export class PolyphonicRecallEngine {
 					SELECT me.memory_id, me.embedding_json, 'working' AS embedding_tier
 					FROM memory_embeddings me
 					JOIN working_memory wm ON wm.id = me.memory_id
-					WHERE me.model = ?
-						AND wm.superseded_by IS NULL
+                    WHERE me.model IS ?
+                        AND wm.superseded_by IS NULL
 						AND (wm.valid_until IS NULL OR wm.valid_until > ?)
 						AND ${working.clause}
 					UNION ALL
 					SELECT me.memory_id, me.embedding_json, 'episodic' AS embedding_tier
 					FROM memory_embeddings me
 					JOIN episodic_memory em ON em.id = me.memory_id
-					WHERE me.model = ?
-						AND em.superseded_by IS NULL
+                    WHERE me.model IS ?
+                        AND em.superseded_by IS NULL
 						AND (em.valid_until IS NULL OR em.valid_until > ?)
 						AND ${episodic.clause}
 					LIMIT 50000

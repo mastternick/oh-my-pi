@@ -50,12 +50,10 @@ it("preserves the parent's recalled prompt prefix while adding custom experience
 	// Sessions start Mnemopi in the background: [parent, clone] settle as each start finishes.
 	const mnemopiStarts = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
 	const realStart = mnemopiBackend.start;
-	let nextStart = 0;
+	const pendingStarts = [...mnemopiStarts];
 	vi.spyOn(mnemopiBackend, "start").mockImplementation(async options => {
 		await realStart.call(mnemopiBackend, options);
-		const start = mnemopiStarts[nextStart];
-		nextStart += 1;
-		start?.resolve();
+		pendingStarts.shift()?.resolve();
 	});
 	const settings = Settings.isolated({
 		"async.enabled": true,

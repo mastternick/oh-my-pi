@@ -607,6 +607,8 @@ function vectorSimilarities(
 	) {
 		return out;
 	}
+	// Only vectors stamped with the query's embedding model are comparable to the
+	// query embedding; stale-model rows stay on disk for the rebuild but must not score.
 	for (let offset = 0; offset < memoryIds.length; offset += 500) {
 		const chunk = memoryIds.slice(offset, offset + 500);
 		const rows = queryAll(

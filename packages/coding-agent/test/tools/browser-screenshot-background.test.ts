@@ -3,8 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { findFreeCdpPort, waitForCdp } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
-import { ensureChromiumExecutable } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
+import { findFreeCdpPort, gracefulKillTreeOnce, waitForCdp } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
+import { ensureChromiumExecutable, RENDERER_PRIORITY_ARGS } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import {
 	acquireBrowser,
 	type PuppeteerBrowserHandle,
@@ -68,13 +68,14 @@ async function connectedBrowser(): Promise<PuppeteerBrowserHandle> {
 			"--no-default-browser-check",
 			"--use-mock-keychain",
 			"--password-store=basic",
+			...RENDERER_PRIORITY_ARGS,
 			`--user-data-dir=${root}`,
 			`--remote-debugging-port=${port}`,
 		],
 		{ stdin: "ignore", stdout: "ignore", stderr: "ignore" },
 	);
 	cleanups.push(async () => {
-		child.kill();
+		await gracefulKillTreeOnce(child.pid);
 		await child.exited;
 		await fs.rm(root, { recursive: true, force: true });
 	});
@@ -98,11 +99,15 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser screenshots of background tabs", (
 		cleanups.push(async () => {
 			await releaseTab(name);
 		});
+		// The tab starts in the background: the user's page is the one showing.
+		expect(await visibility(agentPage)).toBe("hidden");
 		await acquireTab(name, handle, { target: "agent-tab", timeoutMs: 30_000 });
 
 		expect(await repaintAndCapture(name, "#00ff00")).toEqual([0, 255, 0]);
+		// Capturing it must not bring it forward. Chromium's focus emulation — which keeps
+		// an attached background tab's input alive — reports the driven page as active, so
+		// `visibilityState` cannot prove non-selection; the user's page staying visible does.
 		expect(await visibility(userPage)).toBe("visible");
-		expect(await visibility(agentPage)).toBe("hidden");
 	}, 45_000);
 
 	it("captures the adopted tab after the user switched away from it", async () => {

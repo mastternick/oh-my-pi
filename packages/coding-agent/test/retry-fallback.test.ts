@@ -335,6 +335,40 @@ describe("retry fallback selector resolution", () => {
 		const modelKey = createContext({ [high]: ["openai/gpt-4o-mini"] });
 		expect(resolveRetryFallbackChainKey(modelKey, xhigh, model)).toBeUndefined();
 	});
+
+	it("adopts only the chain that names the live route, never another role's", () => {
+		const model = getBundledModel("google-antigravity", "gemini-3.8-flash");
+		const webModel = getBundledModel("web", "parallel");
+		if (!model || !webModel) throw new Error("Expected bundled Gemini and web-search test models");
+		const live = "google-antigravity/gemini-3.8-flash:medium";
+		const models = [model, webModel];
+		const roleModels: Record<string, string> = {
+			web: "google-antigravity/gemini-3.8-flash:minimal",
+			task: live,
+		};
+		const withWebChain = (chains: RetryFallbackResolutionContext["chains"]): RetryFallbackResolutionContext => ({
+			chains,
+			getModelRole: role => roleModels[role],
+			modelLookup: {
+				find: (provider, id) => models.find(m => m.provider === provider && m.id === id),
+				hasProvider: provider => models.some(m => m.provider === provider),
+			},
+		});
+
+		// `web` owns the live model at a different effort; its chain is search providers.
+		const webOnly = withWebChain({ web: ["web/parallel"] });
+		expect(resolveRetryFallbackChainKey(webOnly, live, model)).toBeUndefined();
+
+		// A chat role assigned the live model does not lend its chain either, and `default`
+		// is unreachable from a live model identity: both would re-route the turn.
+		const withTask = withWebChain({ web: ["web/parallel"], task: ["google/gemini-3.5-flash"] });
+		expect(resolveRetryFallbackChainKey(withTask, live, model)).toBeUndefined();
+		const withDefault = withWebChain({ web: ["web/parallel"], default: ["google/gemini-3.5-flash"] });
+		expect(resolveRetryFallbackChainKey(withDefault, live, model)).toBeUndefined();
+
+		// A web-search caller names its role explicitly and keeps its own chain.
+		expect(resolveRetryFallbackChainKey(webOnly, live, model, "web")).toBe("web");
+	});
 });
 
 describe("retry fallback kind-role validation", () => {

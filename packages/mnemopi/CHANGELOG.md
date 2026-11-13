@@ -16,6 +16,12 @@
 
 - Fixed dense-only recall dropping semantically matching memories that share no lexical token with the query. The 0.65 cosine gate applied to every embedding model, and nemotron and pplx embeddings score relevant passages around 0.3 to 0.5. Models with a calibrated floor now pass dense-only hits at or above it in both linear recall and the polyphonic vector voice: `nvidia/nemotron-3.5-embed-1b:free` and `nvidia/nemotron-3-embed-1b:free` at 0.18, `perplexity/pplx-embed-v1-0.6b` at 0.28. Other models keep 0.65. Lexical and FTS-matched ranking is unchanged.
 - Fixed Romanian function words (`pentru`, `de`, `cum`, `după`, ...) counting as keyword query terms, so memories sharing only those words ranked as lexical hits above correct results. Romanian function words are now stopwords in both plain and diacritic forms; English stopword behavior is unchanged.
+## [18.20.0] - 2026-11-12
+
+### Fixed
+
+- Fixed fact extraction storing decimals, prices, and IP-address fragments as `version` facts and leaving symbols such as `→` in `metric` fact keys ([#18886](https://github.com/can1357/oh-my-pi/issues/18886))
+
 ## [18.18.4] - 2026-11-09
 
 ### Fixed

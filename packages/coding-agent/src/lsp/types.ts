@@ -369,6 +369,27 @@ export interface ServerConfig {
 	/** Resolved absolute path to the command binary (set during config loading) */
 	resolvedCommand?: string;
 	/**
+	 * Volar override for the `@vue/typescript-plugin` wiring: `location` points at the
+	 * plugin package, `name`/`languages` override the plugin declaration, and `false`
+	 * disables the injection entirely. Resolved from the vue-language-server install
+	 * when omitted.
+	 */
+	vueTsPlugin?: { location?: string; name?: string; languages?: string[] } | false;
+	/**
+	 * Vue-language-server only, set during config loading: the TypeScript server that
+	 * answers its `tsserver/request` notifications, with the Volar plugin configured.
+	 */
+	vueCompanion?: ServerConfig;
+	/** Vue-language-server only: why no companion could be configured (surfaced in `.vue` results). */
+	vueCompanionIssue?: string;
+	/**
+	 * Fallback availability gate for servers whose language has no manifest in a
+	 * plain source checkout (e.g. Python scripts in any git repo). Used only when no
+	 * entry in `rootMarkers` matches: the listed markers must exist and the workspace
+	 * must contain at least one file with one of `fileExtensions`.
+	 */
+	rootFallback?: { markers: string[]; fileExtensions: string[] };
+	/**
 	 * Custom linter client factory. If provided, creates a custom client instead of using LSP.
 	 * The client handles format/lint operations. Useful for tools with buggy LSP implementations.
 	 */

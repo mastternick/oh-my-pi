@@ -34,6 +34,7 @@ import {
 	readTextFromDisk,
 	uriToFile,
 } from "./utils";
+import { supportsTsserverRequest, TSSERVER_REQUEST_COMMAND } from "./volar";
 import { WATCHED_FILES_METHOD, WatchedFilesForwarder } from "./watched-files";
 
 /**
@@ -91,6 +92,8 @@ const pendingDiskWrites = new Map<string, number>();
 const INIT_FAILURE_BACKOFF_MS = 3 * 60 * 1000;
 const initFailures = new Map<string, { at: number; message: string }>();
 const READER_EXIT_GRACE_MS = 100;
+/** Default timeout for LSP requests when no abort signal is provided (30 seconds) */
+const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 
 // Idle timeout configuration (disabled by default)
 let idleTimeoutMs: number | null = null;
@@ -514,6 +517,322 @@ function queueWriteMessage(
 }
 
 // =============================================================================
+// Volar ↔ TypeScript bridge
+// =============================================================================
+
+/** Volar's server→client notification carrying a raw tsserver command. */
+const TSSERVER_REQUEST_NOTIFICATION = "tsserver/request";
+/** Volar releases its pending request once this notification carries the answer. */
+const TSSERVER_RESPONSE_NOTIFICATION = "tsserver/response";
+/** Document notifications a `.vue` companion must receive so tsserver knows the file. */
+const VUE_COMPANION_DOCUMENT_METHODS: Record<string, true> = {
+	"textDocument/didOpen": true,
+	"textDocument/didChange": true,
+	"textDocument/didClose": true,
+};
+/**
+ * Deadline for one bridge step — the companion cold start, a re-open sweep, or
+ * one forwarded command. Each step installs its own `AbortSignal.timeout`, so a
+ * slow start never eats the budget of the request it was started for.
+ */
+const TSSERVER_BRIDGE_TIMEOUT_MS = DEFAULT_REQUEST_TIMEOUT_MS;
+
+interface TsserverBridgeRequest {
+	id: LspJsonRpcId;
+	/** Absent when the entry itself was malformed: it is answered `null`, never forwarded. */
+	command?: string;
+	payload?: unknown;
+}
+
+/**
+ * Parse the `[id, command, payload]` triples Volar sends, one entry at a time.
+ *
+ * The shape is Volar's own, not LSP. A single unusable entry must not cost the
+ * batch: an entry with a usable id but no command is answered `null` in place,
+ * while an entry without an id has nothing to answer and is dropped. Returns
+ * null only when the notification is not a batch at all.
+ */
+function parseTsserverRequests(params: unknown): TsserverBridgeRequest[] | null {
+	if (!Array.isArray(params) || params.length === 0) return null;
+	const requests: TsserverBridgeRequest[] = [];
+	for (const entry of params) {
+		if (!Array.isArray(entry) || entry.length === 0) {
+			logger.warn("LSP dropped a tsserver/request entry without an id", {
+				entry: JSON.stringify(entry)?.slice(0, 120),
+			});
+			continue;
+		}
+		const [id, command, payload] = entry;
+		if (typeof id !== "number" && typeof id !== "string") {
+			logger.warn("LSP dropped a tsserver/request entry without an id", {
+				entry: JSON.stringify(entry)?.slice(0, 120),
+			});
+			continue;
+		}
+		// Volar always serializes a triple with a string command; anything else is
+		// answered without asking TypeScript.
+		if (entry.length !== 3 || typeof command !== "string") {
+			requests.push({ id });
+			continue;
+		}
+		requests.push({ id, command, payload });
+	}
+	return requests;
+}
+
+/**
+ * The live TypeScript server of `cwd` that can answer tsserver commands.
+ *
+ * A client whose process already exited may still sit in the registry until its
+ * exit handler runs; returning it would park the request until the timeout.
+ */
+function findTsserverClient(cwd: string, exclude: LspClient, preferred?: ServerConfig): LspClient | undefined {
+	if (preferred) {
+		const client = clients.get(clientKey(preferred, cwd));
+		if (
+			client &&
+			client !== exclude &&
+			client.proc.exitCode === null &&
+			supportsTsserverRequest(client.serverCapabilities)
+		) {
+			return client;
+		}
+	}
+	const resolvedCwd = path.resolve(cwd);
+	for (const client of clients.values()) {
+		if (
+			client !== exclude &&
+			path.resolve(client.cwd) === resolvedCwd &&
+			client.proc.exitCode === null &&
+			supportsTsserverRequest(client.serverCapabilities)
+		) {
+			return client;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Re-open this client's `.vue` documents in its companion.
+ *
+ * The companion may be brand new (first request after `lsp.lazy` started it, or
+ * after it crashed and was replaced) and therefore holds none of the mirrored
+ * documents; Volar's `tsserver/request`s are answered from tsserver's view of
+ * those documents, so they have to be there before the request is forwarded.
+ * Documents the companion still tracks are left alone.
+ */
+async function mirrorOpenVueDocuments(client: LspClient, companion: LspClient, signal?: AbortSignal): Promise<void> {
+	for (const uri of client.openFiles.keys()) {
+		if (path.extname(uriToFile(uri)).toLowerCase() !== ".vue") continue;
+		if (companion.openFiles.has(uri)) continue;
+		await ensureFileOpen(companion, uriToFile(uri), signal);
+	}
+}
+
+/**
+ * Answer a Volar `tsserver/request` through the workspace TypeScript server.
+ *
+ * A cold companion is started first and awaited: with `lsp.lazy` the first Vue
+ * operation is what brings the TypeScript server up, and answering `null` while
+ * it initializes would drop type information Volar asked for. The start and each
+ * forwarded request get their own deadline: a companion that spent most of one
+ * budget initializing must not leave the answer it carries without time to run.
+ * Every failure path — no companion configured, a start/bridge error, a timeout
+ * — still answers `[[id, null]]`: Volar blocks its pending request until the
+ * response arrives, so silence means a hung `lsp` call.
+ */
+async function handleTsserverRequestNotification(client: LspClient, params: unknown): Promise<void> {
+	const requests = parseTsserverRequests(params);
+	if (!requests) {
+		logger.warn("LSP ignored a malformed tsserver/request notification", {
+			server: client.config?.command,
+			params: JSON.stringify(params)?.slice(0, 200),
+		});
+		return;
+	}
+
+	const companion = client.config?.vueCompanion;
+	let tsClient = findTsserverClient(client.cwd, client, companion);
+	if (!tsClient && companion) {
+		try {
+			tsClient = await getOrCreateClient(
+				companion,
+				client.cwd,
+				undefined,
+				AbortSignal.timeout(TSSERVER_BRIDGE_TIMEOUT_MS),
+			);
+		} catch (err) {
+			logger.warn("LSP could not start the TypeScript server a Vue request needs", {
+				server: client.config?.command,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+	if (!tsClient) {
+		const issue = client.config?.vueCompanionIssue;
+		logger.warn(
+			issue
+				? `LSP has no TypeScript server for Vue type queries: ${issue}`
+				: "LSP has no TypeScript server to answer a Vue tsserver request",
+			{ server: client.config?.command },
+		);
+	} else {
+		await mirrorOpenVueDocuments(client, tsClient, AbortSignal.timeout(TSSERVER_BRIDGE_TIMEOUT_MS)).catch(err => {
+			logger.warn("LSP failed to re-open Vue documents in its TypeScript server", {
+				server: client.config?.command,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		});
+	}
+
+	const answers: Array<[LspJsonRpcId, unknown]> = [];
+	for (const request of requests) {
+		let body: unknown = null;
+		if (tsClient && request.command !== undefined) {
+			try {
+				const result = await sendRequest(
+					tsClient,
+					"workspace/executeCommand",
+					{ command: TSSERVER_REQUEST_COMMAND, arguments: [request.command, request.payload] },
+					undefined,
+					TSSERVER_BRIDGE_TIMEOUT_MS,
+				);
+				// typescript-language-server wraps the tsserver response; Volar wants its body.
+				if (typeof result === "object" && result !== null && "body" in result) body = result.body ?? null;
+			} catch (err) {
+				logger.warn("LSP failed to forward a tsserver request to TypeScript", {
+					server: client.config?.command,
+					command: request.command,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
+		answers.push([request.id, body]);
+	}
+
+	await sendNotification(client, TSSERVER_RESPONSE_NOTIFICATION, answers);
+}
+
+/**
+ * Mirror a `.vue` document notification to the client's TypeScript companion.
+ *
+ * Volar resolves types by running tsserver itself, so tsserver only knows a Vue
+ * component once the same document — language id `vue` — is open in its server.
+ * The first `didOpen` also starts the companion, which is what makes Volar's
+ * subsequent `tsserver/request`s find it ready. Failures never break the primary
+ * notification: a Vue client without a working companion still opens documents.
+ */
+async function mirrorVueCompanionDocument(
+	client: LspClient,
+	method: string,
+	params: unknown,
+	signal?: AbortSignal,
+): Promise<void> {
+	const companion = client.config?.vueCompanion;
+	if (!companion || !VUE_COMPANION_DOCUMENT_METHODS[method]) return;
+	if (typeof params !== "object" || params === null || !("textDocument" in params)) return;
+	const textDocument = params.textDocument;
+	if (typeof textDocument !== "object" || textDocument === null || !("uri" in textDocument)) return;
+	const uri = textDocument.uri;
+	if (typeof uri !== "string" || path.extname(uriToFile(uri)).toLowerCase() !== ".vue") return;
+
+	try {
+		if (method === "textDocument/didOpen") {
+			// Cold start: this is the first Vue operation in the workspace.
+			const tsClient = await getOrCreateClient(companion, client.cwd, undefined, signal);
+			const text = "text" in textDocument ? textDocument.text : undefined;
+			const version = "version" in textDocument ? textDocument.version : undefined;
+			if (typeof text !== "string" || typeof version !== "number") {
+				// Not Volar's didOpen shape: open whatever is on disk.
+				await ensureFileOpen(tsClient, uriToFile(uri), signal);
+				return;
+			}
+			await openCompanionDocument(tsClient, uri, version, text, signal);
+			return;
+		}
+		// Later notifications only follow a server that is already running (or starting).
+		const tsClient = await getActiveOrPendingClient(companion, client.cwd, signal);
+		if (!tsClient) return;
+		if (method === "textDocument/didClose") {
+			if (tsClient.openFiles.has(uri)) await closeDocument(tsClient, uri, signal);
+			return;
+		}
+		if (!("contentChanges" in params)) return;
+		const contentChanges = params.contentChanges;
+		const latest = Array.isArray(contentChanges) ? contentChanges.at(-1) : undefined;
+		if (typeof latest !== "object" || latest === null || !("text" in latest) || typeof latest.text !== "string") {
+			return;
+		}
+		await syncContent(tsClient, uriToFile(uri), latest.text, signal);
+	} catch (err) {
+		logger.warn("LSP failed to mirror a Vue document to its TypeScript server", {
+			server: client.config?.command,
+			method,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+}
+
+/**
+ * Open `uri` in a companion with the exact text and version Volar received.
+ *
+ * The document is forwarded instead of re-read from disk so tsserver sees what
+ * Volar is querying, unsaved edits included; the language id must be `vue` for
+ * the plugin to claim it. A companion that already tracks the document gets a
+ * `didChange` instead of a duplicate `didOpen`.
+ */
+async function openCompanionDocument(
+	client: LspClient,
+	uri: string,
+	version: number,
+	text: string,
+	signal?: AbortSignal,
+): Promise<void> {
+	throwIfAborted(signal);
+	const lockKey = `${client.name}:${uri}`;
+	const existingLock = fileOperationLocks.get(lockKey);
+	if (existingLock) {
+		await untilAborted(signal, () => existingLock);
+	}
+
+	const openPromise = (async () => {
+		throwIfAborted(signal);
+		const openFile = client.openFiles.get(uri);
+		if (openFile) {
+			const nextVersion = ++openFile.version;
+			openFile.lastUsedAt = Date.now();
+			await sendNotification(
+				client,
+				"textDocument/didChange",
+				{ textDocument: { uri, version: nextVersion }, contentChanges: [{ text }] },
+				signal,
+			);
+			openFile.syncedHash = documentSignature(text);
+			return;
+		}
+		// The companion may be rooted elsewhere (monorepo): add the checkout that
+		// holds this component before opening it, exactly as ensureFileOpen and
+		// syncContent do.
+		await ensureWorkspaceFolder(client, uriToFile(uri), signal);
+		closeIdleFiles(client, signal);
+		await sendNotification(
+			client,
+			"textDocument/didOpen",
+			{ textDocument: { uri, languageId: "vue", version, text } },
+			signal,
+		);
+		trackOpenedFile(client, uri, "vue", version, text);
+	})();
+
+	fileOperationLocks.set(lockKey, openPromise);
+	try {
+		await openPromise;
+	} finally {
+		fileOperationLocks.delete(lockKey);
+	}
+}
+
+// =============================================================================
 // Message Reader
 // =============================================================================
 
@@ -613,6 +932,15 @@ async function startMessageReader(client: LspClient): Promise<void> {
 								if (params.state === "idle") status.idleSeq = seq;
 								else status.busySeq = seq;
 								buildStatus.set(params.uri, status);
+							} else if (message.method === TSSERVER_REQUEST_NOTIFICATION) {
+								// Volar blocks the pending request until the answer arrives;
+								// the bridge may start a server, so it must not stall the reader.
+								void handleTsserverRequestNotification(client, message.params).catch(err => {
+									logger.warn("LSP failed to answer a Vue tsserver request", {
+										server: client.config?.command,
+										error: err instanceof Error ? err.message : String(err),
+									});
+								});
 							}
 						}
 					} else if ("id" in message && message.id !== undefined) {
@@ -1036,6 +1364,19 @@ export function supportsDocumentDiagnostics(client: LspClient): boolean {
 	return false;
 }
 
+/** Whether the server advertised `workspace/symbol` statically or through dynamic registration. */
+export function supportsWorkspaceSymbols(client: LspClient): boolean {
+	const provider = client.serverCapabilities?.workspaceSymbolProvider;
+	if (provider === true || (typeof provider === "object" && provider !== null)) return true;
+
+	const registrations = client.dynamicCapabilityRegistrations;
+	if (!registrations) return false;
+	for (const method of registrations.values()) {
+		if (method === "workspace/symbol") return true;
+	}
+	return false;
+}
+
 /**
  * Respond to a server-initiated request.
  */
@@ -1388,9 +1729,11 @@ export async function getOrCreateClient(
 	signal?: AbortSignal,
 ): Promise<LspClient> {
 	const key = clientKey(config, cwd);
-	// Check if client already exists
+	// Check if client already exists. A client whose process is gone stays in the
+	// registry until its exit handler runs; handing it out would park the request
+	// it was created for, so a dead one is replaced here.
 	const existingClient = clients.get(key);
-	if (existingClient && !invalidatedClientKeys.has(key)) {
+	if (existingClient && !invalidatedClientKeys.has(key) && existingClient.proc.exitCode === null) {
 		existingClient.lastActivity = Date.now();
 		maybeStartIdleChecker(existingClient);
 		return existingClient;
@@ -1601,7 +1944,10 @@ export async function getActiveOrPendingClient(
 ): Promise<LspClient | undefined> {
 	throwIfAborted(signal);
 	const client = clients.get(clientKey(config, cwd));
-	if (client) {
+	// A client whose process already exited stays in the registry until its exit
+	// handler runs; handing it out would park the caller until its request times
+	// out, while {@link getOrCreateClient} would have replaced it. Report it absent.
+	if (client && client.proc.exitCode === null) {
 		client.lastActivity = Date.now();
 		return client;
 	}
@@ -1680,6 +2026,8 @@ function closeIdleFiles(client: LspClient, signal?: AbortSignal): void {
 		};
 		// A failed write means the client is torn down or its process is gone.
 		void queueWriteMessage(client, notification, signal, true).catch(() => {});
+		// The companion holds the same `.vue` document; close its copy too.
+		void mirrorVueCompanionDocument(client, "textDocument/didClose", notification.params, signal).catch(() => {});
 	}
 }
 
@@ -2409,9 +2757,6 @@ export async function shutdownClient(key: string): Promise<boolean> {
 // LSP Protocol Methods
 // =============================================================================
 
-/** Default timeout for LSP requests when no abort signal is provided (30 seconds) */
-const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
-
 /**
  * Send an LSP request and wait for response.
  *
@@ -2578,6 +2923,11 @@ export async function sendNotification(
 	};
 
 	client.lastActivity = Date.now();
+	// A Vue client's TypeScript companion only learns about `.vue` documents from
+	// here: every document notification in this module funnels through this call.
+	// Mirror first — the server must hold the document before the request Volar
+	// sends in response to this notification can be answered from it.
+	await mirrorVueCompanionDocument(client, method, params, signal);
 	await queueWriteMessage(client, notification, signal);
 }
 

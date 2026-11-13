@@ -28,16 +28,7 @@ import { type FileDiagnosticsResult, FileFormatResult } from "@oh-my-pi/pi-tui/t
 import { notifyFileSaved, splitServers, syncFileContent } from "./servers";
 import { FileChangeType, type LspClient, type ServerConfig } from "./types";
 import { summarizeDiagnosticMessages } from "./utils";
-
-const TSSERVER_REQUEST_COMMAND = "typescript.tsserverRequest";
-
-function supportsTsserverRequest(capabilities: unknown): boolean {
-	if (!isRecord(capabilities)) return false;
-	const executeCommandProvider = capabilities.executeCommandProvider;
-	if (!isRecord(executeCommandProvider)) return false;
-	const commands = executeCommandProvider.commands;
-	return Array.isArray(commands) && commands.includes(TSSERVER_REQUEST_COMMAND);
-}
+import { supportsTsserverRequest, TSSERVER_REQUEST_COMMAND } from "./volar";
 
 /**
  * Force tsserver to observe a created path before `didOpen` can pin a cached

@@ -25,6 +25,7 @@ import {
 	getOrCreateClient,
 	isRustAnalyzerClient,
 	type LspServerStatus,
+	LspResponseError,
 	reconcileFileFromDisk,
 	reconcileIdleChecker,
 	reconcileOpenFilesFromDisk,
@@ -35,6 +36,7 @@ import {
 	sendRequest,
 	shutdownStaleClients,
 	supportsDocumentDiagnostics,
+	supportsWorkspaceSymbols,
 	waitForProjectLoaded,
 } from "./client";
 import { getLinterClient } from "./clients";
@@ -110,6 +112,7 @@ import {
 	uriToFile,
 } from "./utils";
 import { formatGroupedDiagnosticMessages } from "@oh-my-pi/pi-tui/tools/output-meta";
+import { VUE_COMPANION_SERVER_NAME, VUE_TYPESCRIPT_BACKED_ACTIONS } from "./volar";
 import { runWorkspaceDiagnostics } from "./workspace-diagnostics";
 
 import { cfgToolsMaxTimeout } from "../tools/settings";
@@ -1074,15 +1077,33 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			const aggregatedSymbols: SymbolInformation[] = [];
 			const respondingServers = new Set<string>();
 			const serverFailures: string[] = [];
+			const unsupportedServers: string[] = [];
+			let queriedServers = 0;
 			for (const [workspaceServerName, workspaceServerConfig] of servers) {
 				throwIfAborted(signal);
+				let workspaceClient: LspClient;
 				try {
-					const workspaceClient = await getOrCreateClient(
-						workspaceServerConfig,
-						this.session.cwd,
-						undefined,
-						signal,
-					);
+					workspaceClient = await getOrCreateClient(workspaceServerConfig, this.session.cwd, undefined, signal);
+				} catch (err) {
+					if (err instanceof ToolAbortError || signal?.aborted) {
+						throw err;
+					}
+					// Keep the first line only: a server's failure report is a stack trace
+					// or a multi-line log, and the answer is about symbols, not its launch.
+					const message = replaceTabs(err instanceof Error ? err.message : String(err)).split("\n")[0] ?? "";
+					serverFailures.push(`  ${workspaceServerName}: ${message.trim()}`);
+					continue;
+				}
+				// Only servers that advertise workspace/symbol — statically or by a
+				// `client/registerCapability` — are asked. Volar answers -32601 with a
+				// stack trace for it, so the aggregation used to spend a round trip to
+				// learn what the capabilities already said.
+				if (!supportsWorkspaceSymbols(workspaceClient)) {
+					unsupportedServers.push(`${workspaceServerName}: workspace/symbol not implemented`);
+					continue;
+				}
+				queriedServers++;
+				try {
 					// Results point into every open document, so sync those edited outside OMP first.
 					await reconcileOpenFilesFromDisk(workspaceClient, signal, undefined, "close");
 					const workspaceResult = (await sendRequest(
@@ -1099,18 +1120,31 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					if (err instanceof ToolAbortError || signal?.aborted) {
 						throw err;
 					}
-					const message = replaceTabs(err instanceof Error ? err.message : String(err));
-					serverFailures.push(`  ${workspaceServerName}: ${message}`);
+					if (err instanceof LspResponseError && err.code === -32601) {
+						// Advertised but unimplemented: same answer as not advertising it.
+						unsupportedServers.push(`${workspaceServerName}: workspace/symbol not implemented`);
+						continue;
+					}
+					const message = replaceTabs(err instanceof Error ? err.message : String(err)).split("\n")[0] ?? "";
+					serverFailures.push(`  ${workspaceServerName}: ${message.trim()}`);
 				}
 			}
-			const serverFailureSection =
-				serverFailures.length > 0 ? `\nServer failures:\n${serverFailures.join("\n")}` : "";
+			const noteSections: string[] = [];
+			if (serverFailures.length > 0) noteSections.push(`Server failures:\n${serverFailures.join("\n")}`);
+			if (unsupportedServers.length > 0) {
+				noteSections.push(`Not supported:\n${unsupportedServers.map(line => `  ${line}`).join("\n")}`);
+			}
+			const serverFailureSection = noteSections.length > 0 ? `\n${noteSections.join("\n")}` : "";
 			if (respondingServers.size === 0) {
+				const summary =
+					queriedServers === 0 && unsupportedServers.length > 0
+						? "Workspace symbol search is not implemented by any configured language server"
+						: "Workspace symbol search failed: all language servers failed";
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Workspace symbol search failed: all language servers failed${serverFailureSection}`,
+							text: `${summary}${serverFailureSection}`,
 						},
 					],
 					details: { action, serverName: "", success: false, request: params },
@@ -1225,7 +1259,17 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			};
 		}
 
-		const [serverName, serverConfig] = serverInfo;
+		let [serverName, serverConfig] = serverInfo;
+		// A Vue workspace's bridge diagnostics live on the Volar entry, but they
+		// explain why the companion's type answers are empty, so they follow the
+		// request when it is routed to the companion.
+		const vueCompanionIssue = serverConfig.vueCompanionIssue;
+		// Volar serves the Vue-specific features; its TypeScript-backed ones are
+		// answered by the companion that holds the same `.vue` document.
+		if (serverConfig.vueCompanion && VUE_TYPESCRIPT_BACKED_ACTIONS[action]) {
+			serverName = VUE_COMPANION_SERVER_NAME;
+			serverConfig = serverConfig.vueCompanion;
+		}
 
 		if (action === "reload") clearInitializationFailure(serverConfig, this.session.cwd);
 
@@ -1627,6 +1671,12 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 				default:
 					output = `Unknown action: ${action}`;
+			}
+
+			// A Vue workspace whose type bridge cannot be wired has no type information
+			// behind Volar: say so instead of returning an unexplained empty result.
+			if (vueCompanionIssue) {
+				output = `note: ${vueCompanionIssue}\n${output}`;
 			}
 
 			return {

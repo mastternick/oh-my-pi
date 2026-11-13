@@ -164,6 +164,7 @@
 		"args": ["--stdio"],
 		"fileTypes": [".py", ".pyi"],
 		"rootMarkers": ["pyproject.toml", "pyrightconfig.json", "setup.py", "setup.cfg", "requirements.txt", "Pipfile"],
+		"rootFallback": { "markers": [".git"], "fileExtensions": [".py", ".pyi"] },
 		"settings": {
 			"python": {
 				"analysis": {
@@ -179,6 +180,7 @@
 		"args": ["--stdio"],
 		"fileTypes": [".py", ".pyi"],
 		"rootMarkers": ["pyproject.toml", "pyrightconfig.json", "setup.py", "requirements.txt"],
+		"rootFallback": { "markers": [".git"], "fileExtensions": [".py", ".pyi"] },
 		"settings": {
 			"basedpyright": {
 				"analysis": {

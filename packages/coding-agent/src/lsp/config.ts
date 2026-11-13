@@ -13,6 +13,7 @@ import { BiomeClient } from "./clients/biome-client";
 import { SwiftLintClient } from "./clients/swiftlint-client";
 import DEFAULTS from "./defaults.json" with { type: "json" };
 import type { ServerConfig } from "./types";
+import { attachVueCompanions } from "./volar";
 
 export interface LspConfig {
 	servers: Record<string, ServerConfig>;
@@ -74,6 +75,20 @@ function normalizeExtensionToFileTypes(value: unknown): string[] | null {
 	return extensions.length > 0 ? extensions : null;
 }
 
+/**
+ * `rootFallback` as `{ markers, fileExtensions }` string arrays, or null.
+ *
+ * A partial or wrongly typed object is not a gate the loader can evaluate, so it
+ * is absent rather than thrown from `loadConfig` (which runs while a session is
+ * created) or evaluated as `undefined` markers in the availability scan.
+ */
+function normalizeRootFallback(value: unknown): ServerConfig["rootFallback"] | null {
+	if (!isRecord(value)) return null;
+	const markers = normalizeStringArray(value.markers);
+	const fileExtensions = normalizeStringArray(value.fileExtensions);
+	return markers && fileExtensions ? { markers, fileExtensions } : null;
+}
+
 function normalizeServerConfig(name: string, config: RawServerConfig): ServerConfig | null {
 	const command = typeof config.command === "string" && config.command.length > 0 ? config.command : null;
 	const fileTypes =
@@ -85,6 +100,18 @@ function normalizeServerConfig(name: string, config: RawServerConfig): ServerCon
 	if (!command || !fileTypes || !rootMarkers) {
 		logger.warn("Ignoring invalid LSP server config (missing required fields).", { name });
 		return null;
+	}
+
+	let rootFallback: ServerConfig["rootFallback"];
+	if (config.rootFallback !== undefined) {
+		const normalized = normalizeRootFallback(config.rootFallback);
+		if (normalized) {
+			rootFallback = normalized;
+		} else {
+			logger.warn("Ignoring invalid LSP rootFallback (expected { markers, fileExtensions } string arrays).", {
+				name,
+			});
+		}
 	}
 
 	const args = Array.isArray(config.args)
@@ -103,6 +130,7 @@ function normalizeServerConfig(name: string, config: RawServerConfig): ServerCon
 		fileTypes,
 		rootMarkers,
 		languageId,
+		rootFallback,
 		...(initOptions ? { initOptions } : {}),
 	};
 }
@@ -197,6 +225,68 @@ export function hasRootMarkers(cwd: string, markers: string[]): boolean {
 		const filePath = path.join(cwd, marker);
 		if (fs.existsSync(filePath)) {
 			return true;
+		}
+	}
+	return false;
+}
+
+/** Depth and entry budget for the fallback source scan; keeps it cheap on large checkouts. */
+const SOURCE_SCAN_MAX_DEPTH = 4;
+const SOURCE_SCAN_MAX_ENTRIES = 4000;
+/**
+ * Directories the fallback scan never descends: dependencies, virtualenvs, build
+ * output. Their sources are not the workspace's own code, and vendoring one would
+ * otherwise make every such repo look like a Python project.
+ */
+const SOURCE_SCAN_SKIP_DIRS: Record<string, true> = {
+	node_modules: true,
+	".git": true,
+	".venv": true,
+	venv: true,
+	__pycache__: true,
+	"site-packages": true,
+	".tox": true,
+	".mypy_cache": true,
+	".pytest_cache": true,
+	dist: true,
+	build: true,
+	target: true,
+	".next": true,
+	".nuxt": true,
+};
+
+/**
+ * Whether the workspace holds at least one source file with one of `extensions`,
+ * searched breadth-first within {@link SOURCE_SCAN_MAX_DEPTH} and
+ * {@link SOURCE_SCAN_MAX_ENTRIES}. Used by `rootFallback` availability, never to
+ * decide what a file is: extension routing still gates every request.
+ */
+function workspaceHasSourceFile(cwd: string, extensions: readonly string[]): boolean {
+	const wanted = new Set(
+		extensions.map(extension => (extension.startsWith(".") ? extension : `.${extension}`).toLowerCase()),
+	);
+	let budget = SOURCE_SCAN_MAX_ENTRIES;
+	const pending: Array<{ dir: string; depth: number }> = [{ dir: cwd, depth: 0 }];
+	while (pending.length > 0) {
+		const current = pending.shift();
+		if (!current) break;
+		let entries: fs.Dirent[];
+		try {
+			entries = fs.readdirSync(current.dir, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			if (budget-- <= 0) return false;
+			if (entry.isFile()) {
+				if (wanted.has(path.extname(entry.name).toLowerCase())) return true;
+			} else if (
+				entry.isDirectory() &&
+				current.depth < SOURCE_SCAN_MAX_DEPTH &&
+				!SOURCE_SCAN_SKIP_DIRS[entry.name]
+			) {
+				pending.push({ dir: path.join(current.dir, entry.name), depth: current.depth + 1 });
+			}
 		}
 	}
 	return false;
@@ -458,15 +548,61 @@ export function loadConfig(cwd: string): LspConfig {
 	// Filter to servers whose project markers exist and whose binary resolves (local or $PATH)
 	const servers: Record<string, ServerConfig> = {};
 	const candidates = applyRuntimeDefaults(mergedServers);
+	// pyright and basedpyright share one `rootFallback`, so memoise the bounded
+	// workspace scan per normalised extension set: once per loadConfig call, and
+	// never across calls, so files added afterwards are still seen.
+	const sourceScans = new Map<string, boolean>();
+	const workspaceHasSourceFileOnce = (extensions: readonly string[]): boolean => {
+		const key = extensions
+			.map(extension => (extension.startsWith(".") ? extension : `.${extension}`).toLowerCase())
+			.sort()
+			.join(",");
+		let found = sourceScans.get(key);
+		if (found === undefined) {
+			found = workspaceHasSourceFile(cwd, extensions);
+			sourceScans.set(key, found);
+		}
+		return found;
+	};
 	for (const name in candidates) {
 		const config = candidates[name];
 		if (config.disabled) continue;
-		if (!hasRootMarkers(cwd, config.rootMarkers)) continue;
-		const resolved = resolveCommand(config.command, cwd);
-		if (!resolved) continue;
-		servers[name] = { ...config, resolvedCommand: resolved };
+		// Resolving a binary is a project-local check plus a $PATH lookup, and most
+		// default servers are excluded by their markers. Gate first, and resolve only
+		// for a server that can actually start.
+		let binary: string | null | undefined;
+		// Memoised: the marker gate below and the inclusion check may both need it.
+		const resolveBinary = (): string | null => {
+			if (binary === undefined) binary = resolveCommand(config.command, cwd);
+			return binary;
+		};
+		if (!hasRootMarkers(cwd, config.rootMarkers)) {
+			// Servers whose language may have no manifest at all (Python scripts in a
+			// plain checkout) opt into a content gate: an ordinary project marker plus
+			// at least one matching source file. Anything weaker — `.git` alone — would
+			// make every git repo advertise the server and start it on workspace-wide
+			// requests.
+			const fallback = config.rootFallback;
+			if (
+				!fallback ||
+				!hasRootMarkers(cwd, fallback.markers) ||
+				// A missing executable already excludes the server, so the fallback's
+				// workspace source scan never runs for one that cannot start.
+				!resolveBinary() ||
+				!workspaceHasSourceFileOnce(fallback.fileExtensions)
+			) {
+				continue;
+			}
+		}
+		const resolvedCommand = resolveBinary();
+		if (!resolvedCommand) continue;
+		servers[name] = { ...config, resolvedCommand };
 	}
+	// Volar answers every type query through a TypeScript server; keep the wrapper
+	// (and its tsserver plugin) even when `tsc --lsp` would have replaced it.
+	const beforeSelection = { ...servers };
 	selectTypescriptServer(servers, cwd);
+	attachVueCompanions(servers, { cwd, defaults: beforeSelection });
 
 	return { servers, idleTimeoutMs };
 }

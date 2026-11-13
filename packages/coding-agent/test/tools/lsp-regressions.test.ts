@@ -2966,7 +2966,10 @@ describe("lsp regressions", () => {
 				servers: { empty: serverConfig },
 				idleTimeoutMs: undefined,
 			});
-			vi.spyOn(lspClient, "getOrCreateClient").mockResolvedValue({ openFiles: new Map() } as LspClient);
+			vi.spyOn(lspClient, "getOrCreateClient").mockResolvedValue({
+				openFiles: new Map(),
+				serverCapabilities: { workspaceSymbolProvider: true },
+			} as LspClient);
 			vi.spyOn(lspClient, "sendRequest").mockResolvedValue([]);
 
 			const result = await new LspTool(makeLspSession(tempDir.path())).execute("workspace-symbol-empty", {
@@ -2995,7 +2998,10 @@ describe("lsp regressions", () => {
 			});
 			vi.spyOn(lspClient, "getOrCreateClient").mockImplementation(async config => {
 				if (config.command === "broken-lsp") throw new Error("server exited with code 7");
-				return { openFiles: new Map() } as LspClient;
+				return {
+					openFiles: new Map(),
+					serverCapabilities: { workspaceSymbolProvider: true },
+				} as LspClient;
 			});
 			vi.spyOn(lspClient, "sendRequest").mockResolvedValue([
 				{

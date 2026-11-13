@@ -67,6 +67,18 @@ jobs:
           mkdir -p packages/natives/native
           cp "$RUNNER_TEMP/package/pi_natives.linux-x64-baseline.node" packages/natives/native/
           cp "$RUNNER_TEMP/package/pi_natives.linux-x64-modern.node" packages/natives/native/
+      - name: Install Chrome for Testing for the browser suites
+        if: matrix.mode == 'coding-agent-native'
+        run: |
+          set -euo pipefail
+          # The browser suites drive Chrome's native WebMCP API (`WebMCP.invokeTool`, Chrome
+          # 149+); the image's system Chrome is older, and on Linux omp prefers a system
+          # Chrome over the Chrome for Testing it pins, so the suites would run against a
+          # Chrome that cannot serve them. Install the pinned revision and point every
+          # Puppeteer launch at it.
+          version="$(node --input-type=module -e 'import { PUPPETEER_REVISIONS } from "puppeteer-core/internal/revisions.js"; console.log(PUPPETEER_REVISIONS.chrome)')"
+          node node_modules/@puppeteer/browsers/lib/main-cli.js install "chrome@${version}" --path "$RUNNER_TEMP/puppeteer"
+          echo "PUPPETEER_EXECUTABLE_PATH=$RUNNER_TEMP/puppeteer/chrome/linux-${version}/chrome-linux64/chrome" >> "$GITHUB_ENV"
       - name: Install TUI debug tool dependencies
         if: matrix.mode == 'native'
         run: bun install --cwd .omp/tools --frozen-lockfile

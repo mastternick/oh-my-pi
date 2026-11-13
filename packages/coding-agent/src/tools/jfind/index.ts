@@ -14,6 +14,7 @@ import { sessionResolveContext } from "../../internal-urls/context";
 import { InternalUrlFilesystem } from "../../internal-urls/url-filesystem";
 import {
 	hasNativeJudge,
+	type JudgeDeps,
 	journalJudgmentDecision,
 	journalJudgmentUsage,
 	resolveJudge,
@@ -30,12 +31,13 @@ import {
 	searchPathTier,
 } from "../path-utils";
 import { searchApprovalCacheTargets } from "../search-approval-targets";
+import { cfgFindVerifyModel } from "../settings";
 import { toolResult } from "../tool-result";
 import { type CascadeResult, runCascade } from "./cascade";
 import { rankedHeat } from "./passages";
 import { resolveSearchRoot } from "./tree";
 
-import { cfgFindEnabled } from "../settings";
+import { cfgFindEnabled, cfgFindHitThreshold } from "../settings";
 
 const findSchema = type({
 	query: "string",
@@ -104,7 +106,7 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 				: formatPathRelativeToCwd(root.path, cwd, { trailingSlash: root.type === "directory" });
 		const registry = this.session.modelRegistry;
 		if (!registry) throw new ToolError("find has no model registry to resolve a judge from");
-		const judge = resolveJudge({
+		const judgeDeps: JudgeDeps = {
 			settings: this.session.settings,
 			registry,
 			sessionId: this.session.getSessionId?.() ?? undefined,
@@ -114,7 +116,10 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 			telemetry: this.session.getTelemetry?.(),
 			cache: sharedJudgmentCache(),
 			costGate: this.session.costGate,
-		});
+		};
+		const judge = resolveJudge(judgeDeps);
+		const verifyModel = cfgFindVerifyModel.get(this.session.settings)?.trim();
+		const verifyJudge = verifyModel ? resolveJudge({ ...judgeDeps, leadModel: verifyModel }) : undefined;
 		const experiment = this.session.spotlight;
 		const started = performance.now();
 		const deadline = AbortSignal.timeout(FIND_TIMEOUT_MS);
@@ -128,10 +133,12 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 				query,
 				extraKeywords: params.grep_keywords,
 				judge,
+				verifyJudge,
 				spotlight: experiment ? { client: experiment.client, thinking: experiment.thinking } : undefined,
 				includeHidden: false,
 				signal,
 				deadline,
+				threshold: cfgFindHitThreshold.get(this.session.settings),
 				onProgress: message => {
 					phase = message;
 					onUpdate?.({ content: [{ type: "text", text: message }] });

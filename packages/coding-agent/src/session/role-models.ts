@@ -61,11 +61,6 @@ export function resolveContextPromotionConfiguredTarget(
 	return resolveConfiguredModelTarget(currentModel.contextPromotionTarget, currentModel, availableModels);
 }
 
-/** Resolves a model's configured compaction target. */
-export function resolveCompactionConfiguredTarget(currentModel: Model, availableModels: Model[]): Model | undefined {
-	return resolveConfiguredModelTarget(currentModel.compactionModel, currentModel, availableModels);
-}
-
 /** Resolves a model role and its explicit thinking selection. */
 export function resolveRoleModelFull(
 	settings: Settings,

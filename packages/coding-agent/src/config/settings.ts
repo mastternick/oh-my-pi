@@ -310,11 +310,13 @@ function projectLayerForMerge(project: RawSettings): RawSettings {
 	return filteredRoles ? { ...project, modelRoles: filteredRoles } : project;
 }
 
-/** A session's snapshot of the preset values it runs with: model roles, default thinking level, and fallback chains. */
+/** A session's snapshot of the preset values it runs with: model roles, default thinking level, fallback chains, and compaction models. */
 export interface SessionPresetPin {
 	modelRoles: Record<string, string>;
 	defaultThinkingLevel?: ConfiguredThinkingLevel;
 	fallbackChains: Record<string, string[]>;
+	/** Absent: the pin leaves `compaction.models` to the config layers. */
+	compactionModels?: Record<string, string>;
 }
 
 /** The {@link SessionPresetPin} field that the setting at `segments` takes, or `undefined` when it is not pinned. */
@@ -323,11 +325,12 @@ function pinFieldOf(segments: readonly string[]): keyof SessionPresetPin | undef
 	if (id === "modelRoles") return "modelRoles";
 	if (id === "defaultThinkingLevel") return "defaultThinkingLevel";
 	if (id === "retry.fallbackChains") return "fallbackChains";
+	if (id === "compaction.models") return "compactionModels";
 	return undefined;
 }
 
-/** `global` without the model roles and fallback chains a marked project owns. Copies `retry`; never mutates it. */
-function withoutPresetDefaultKeys(global: RawSettings): RawSettings {
+/** `global` without the model roles and fallback chains a marked project owns, and without compaction models only when the project sets its own. Copies nested objects; never mutates them. */
+function withoutPresetDefaultKeys(global: RawSettings, project: RawSettings): RawSettings {
 	const next: RawSettings = { ...global };
 	delete next.modelRoles;
 	if (isRecord(next.retry)) {
@@ -335,18 +338,27 @@ function withoutPresetDefaultKeys(global: RawSettings): RawSettings {
 		delete retry.fallbackChains;
 		next.retry = retry;
 	}
+	if (isRecord(next.compaction)) {
+		const compaction = { ...next.compaction };
+		if (isRecord(project.compaction) && Object.hasOwn(project.compaction, "models")) delete compaction.models;
+		next.compaction = compaction;
+	}
 	return next;
 }
 
 /** `merged` with the pinned values replacing the inherited ones whole, never key by key. */
 function applySessionPin(merged: RawSettings, pin: SessionPresetPin): RawSettings {
 	const retry = isRecord(merged.retry) ? merged.retry : {};
+	const compaction = isRecord(merged.compaction) ? merged.compaction : {};
 	// Always assigned, so an unset pinned thinking level cannot inherit a later parent value.
 	return {
 		...merged,
 		modelRoles: structuredClone(pin.modelRoles),
 		defaultThinkingLevel: pin.defaultThinkingLevel,
 		retry: { ...retry, fallbackChains: structuredClone(pin.fallbackChains) },
+		...(pin.compactionModels === undefined
+			? {}
+			: { compaction: { ...compaction, models: structuredClone(pin.compactionModels) } }),
 	};
 }
 
@@ -361,6 +373,7 @@ function setPinField(pin: SessionPresetPin, field: keyof SessionPresetPin, value
 	const next: Record<string, unknown> = isRecord(value) ? structuredClone(value) : {};
 	if (settingValuesEqual(pin[field], next)) return false;
 	if (field === "modelRoles") pin.modelRoles = next as Record<string, string>;
+	else if (field === "compactionModels") pin.compactionModels = next as Record<string, string>;
 	else pin.fallbackChains = next as Record<string, string[]>;
 	return true;
 }
@@ -1068,6 +1081,7 @@ export class Settings {
 		this.#writeProjectPaths([
 			[["modelRoles"], pin.modelRoles],
 			[["retry", "fallbackChains"], pin.fallbackChains],
+			[["compaction", "models"], pin.compactionModels],
 			[["defaultThinkingLevel"], pin.defaultThinkingLevel],
 			[["modelPresetDefault"], name],
 		]);
@@ -1116,6 +1130,14 @@ export class Settings {
 			fallbackChains: {
 				...(lookupSetting("retry.fallbackChains")?.get(this) as Record<string, string[]> | undefined),
 			},
+			// Pinned only when this view already pins the map, so baselines never freeze the config map.
+			...(this.#pin?.compactionModels === undefined
+				? {}
+				: {
+						compactionModels: {
+							...(lookupSetting("compaction.models")?.get(this) as Record<string, string> | undefined),
+						},
+					}),
 		};
 	}
 
@@ -1431,7 +1453,7 @@ export class Settings {
 			if (
 				field &&
 				field !== "defaultThinkingLevel" &&
-				this.#mutatePin(setting, pin => setPinEntry(pin[field], key, value))
+				this.#mutatePin(setting, pin => setPinEntry((pin[field] ??= {}), key, value))
 			) {
 				this.#onPinWrite?.();
 			}
@@ -4657,7 +4679,7 @@ export class Settings {
 	#mergeOwnLayers(layers: OwnLayers): RawSettings {
 		const global =
 			typeof layers.project.modelPresetDefault === "string"
-				? withoutPresetDefaultKeys(layers.global)
+				? withoutPresetDefaultKeys(layers.global, layers.project)
 				: layers.global;
 		let merged = this.#deepMerge(this.#deepMerge({}, global), projectLayerForMerge(layers.project));
 		merged = this.#deepMerge(merged, layers.configOverlay);

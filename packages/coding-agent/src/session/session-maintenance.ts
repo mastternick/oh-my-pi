@@ -74,7 +74,6 @@ import { isRecord, logger, prompt, Snowflake, toError, withLoopPhase } from "@oh
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { writeArtifact } from "./artifacts";
 import type { ModelRegistry } from "../config/model-registry";
-import { CHAT_MODEL_ROLE_IDS } from "../config/model-roles";
 import type { Settings } from "../config/settings";
 import type { ExtensionRunner, SessionBeforeCompactResult } from "../extensibility/extensions";
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
@@ -105,11 +104,7 @@ import {
 	stripImagesFromMessage,
 } from "./messages";
 import { isTerminalTextAssistantAnswer } from "./queued-messages";
-import {
-	resolveCompactionConfiguredTarget,
-	resolveContextPromotionConfiguredTarget,
-	resolveRoleModelFull,
-} from "./role-models";
+import { resolveConfiguredModelTarget, resolveContextPromotionConfiguredTarget } from "./role-models";
 import type { BuildSessionContextOptions, SessionContext } from "./session-context";
 import {
 	buildSessionContext,
@@ -130,6 +125,7 @@ import {
 	cfgCompactionAutoContinue,
 	cfgCompactionEnabled,
 	cfgCompactionMethodOrder,
+	cfgCompactionModels,
 	cfgContextPromotionEnabled,
 	cfgSnapcompactShape,
 } from "./context-settings";
@@ -3725,31 +3721,17 @@ export class SessionMaintenance {
 			const key = `${model.provider}/${model.id}`;
 			if (seen.has(key)) return;
 			seen.add(key);
-			// `seen` still tracks rejected models so the largest-context fallback
-			// scan below doesn't reintroduce them; the filter just suppresses
-			// inclusion in this caller's candidate chain.
+			// `seen` also dedupes models the filter rejected, so they are not re-offered.
 			if (filter && !filter(model)) return;
 			candidates.push(model);
 		};
 
 		if (preferredModel) {
-			addCandidate(resolveCompactionConfiguredTarget(preferredModel, availableModels));
+			const mappings: Record<string, string | undefined> = cfgCompactionModels.get(settings);
+			const mapped = mappings[`${preferredModel.provider}/${preferredModel.id}`];
+			if (mapped) addCandidate(resolveConfiguredModelTarget(mapped, preferredModel, availableModels));
 		}
 		addCandidate(preferredModel ?? undefined);
-		for (const role of CHAT_MODEL_ROLE_IDS) {
-			addCandidate(
-				resolveRoleModelFull(this.#host.settings, role, availableModels, preferredModel ?? undefined).model,
-			);
-		}
-
-		const sortedByContext = [...availableModels].sort((a, b) => (b.contextWindow ?? 0) - (a.contextWindow ?? 0));
-		for (const model of sortedByContext) {
-			if (!seen.has(`${model.provider}/${model.id}`)) {
-				addCandidate(model);
-				break;
-			}
-		}
-
 		return candidates;
 	}
 
@@ -3762,7 +3744,7 @@ export class SessionMaintenance {
 		}
 		return new Error(
 			`Compaction requires usable credentials for ${currentModel.provider}/${currentModel.id}. ` +
-				`Configure ${currentModel.provider} credentials or assign an authenticated fallback role such as modelRoles.smol.`,
+				`Configure ${currentModel.provider} credentials or map this model to an authenticated one in compaction.models.`,
 		);
 	}
 

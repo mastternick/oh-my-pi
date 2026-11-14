@@ -31,6 +31,11 @@ export interface ModelPreset {
 	 * applying the preset replaces the live chains with exactly this record.
 	 */
 	fallbackChains?: Record<string, string[]>;
+	/**
+	 * `compaction.models` at save time; absent in presets saved before per-model compaction models and in
+	 * hand-written presets that leave them alone. When present, applying the preset replaces the live map.
+	 */
+	compactionModels?: Record<string, string>;
 }
 
 const EMPTY_STRING_ARRAY: string[] = [];

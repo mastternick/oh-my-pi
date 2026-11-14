@@ -15,6 +15,10 @@ import { assistantMsg, userMsg } from "./utilities";
 
 import { cfgRetryBaseDelayMs, cfgRetryEnabled, cfgRetryMaxRetries } from "@oh-my-pi/pi-coding-agent/session/settings";
 
+/**
+ * Compaction candidate chain: the model mapped to the session model in
+ * `compaction.models` (if any), then the session model itself.
+ */
 describe("issue #986 compaction auth fallback", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
@@ -34,7 +38,7 @@ describe("issue #986 compaction auth fallback", () => {
 		tempDir.removeSync();
 	});
 
-	async function createSession(options?: { fallbackModelRole?: string; configureFallbackAuth?: boolean }) {
+	async function createSession(options?: { mapFallback?: boolean; configureFallbackAuth?: boolean }) {
 		const bundledCurrentModel = getTestModel(
 			"openai-codex",
 			model => model.api === "openai-codex-responses" && model.input.includes("text"),
@@ -54,10 +58,10 @@ describe("issue #986 compaction auth fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.keepRecentTokens": 1,
 			"compaction.methodOrder": ["remote", "soft"],
+			"compaction.models": options?.mapFallback
+				? { [`${currentModel.provider}/${currentModel.id}`]: `${fallbackModel.provider}/${fallbackModel.id}` }
+				: {},
 		});
-		if (options?.fallbackModelRole) {
-			settings.setModelRole(options.fallbackModelRole, `${fallbackModel.provider}/${fallbackModel.id}`);
-		}
 
 		const agent = new Agent({
 			initialState: {
@@ -98,6 +102,7 @@ describe("issue #986 compaction auth fallback", () => {
 	}
 
 	async function createAutoNativeFallbackSession(options?: {
+		alternate?: "sameProvider" | "crossProvider";
 		sameProviderNativeEnabled?: boolean;
 		includeSoftFallback?: boolean;
 	}) {
@@ -132,15 +137,17 @@ describe("issue #986 compaction auth fallback", () => {
 			"anthropic",
 			model => model.api === "anthropic-messages" && model.input.includes("text"),
 		);
+		const alternateModel = options?.alternate === "crossProvider" ? crossProviderModel : sameProviderModel;
 
 		const settings = Settings.isolated({
 			"compaction.autoContinue": false,
 			"compaction.keepRecentTokens": 1,
 			"compaction.methodOrder": options?.includeSoftFallback ? ["remote", "soft"] : ["remote"],
+			"compaction.models": {
+				[`${currentModel.provider}/${currentModel.id}`]: `${alternateModel.provider}/${alternateModel.id}`,
+			},
 			"contextPromotion.enabled": false,
 		});
-		settings.setModelRole("smol", `${sameProviderModel.provider}/${sameProviderModel.id}`);
-		settings.setModelRole("slow", `${crossProviderModel.provider}/${crossProviderModel.id}`);
 		const agent = new Agent({
 			initialState: { model: currentModel, systemPrompt: ["Test"], tools: [], messages: [] },
 		});
@@ -197,43 +204,30 @@ describe("issue #986 compaction auth fallback", () => {
 			await session.waitForIdle();
 		};
 
-		return { apiKeySpy, crossProviderModel, currentModel, sameProviderModel, triggerAutoCompaction };
+		return { alternateModel, apiKeySpy, crossProviderModel, currentModel, sameProviderModel, triggerAutoCompaction };
 	}
 
-	it("continues same-provider native candidates but stops before crossing providers on non-auth failure", async () => {
-		const { crossProviderModel, currentModel, sameProviderModel, triggerAutoCompaction } =
-			await createAutoNativeFallbackSession();
+	it("continues same-provider native candidates after a non-auth native failure", async () => {
+		const { currentModel, sameProviderModel, triggerAutoCompaction } = await createAutoNativeFallbackSession();
 		const attemptedModels: string[] = [];
-		vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => {
+		vi.spyOn(compactionModule, "compact").mockImplementation(async (_preparation, model) => {
 			attemptedModels.push(`${model.provider}/${model.id}`);
 			if (model.provider === currentModel.provider || model.provider === sameProviderModel.provider) {
 				throw new compactionModule.NativeCompactionError(new Error("native compaction transport failed"));
 			}
-			if (model.provider !== crossProviderModel.provider || model.id !== crossProviderModel.id) {
-				throw new Error(`Unexpected compaction model ${model.provider}/${model.id}`);
-			}
-			return {
-				summary: "cross-provider summary",
-				shortSummary: "cross-provider",
-				firstKeptEntryId: preparation.firstKeptEntryId,
-				tokensBefore: 42,
-			};
+			throw new Error(`Unexpected compaction model ${model.provider}/${model.id}`);
 		});
 
 		await triggerAutoCompaction();
 
 		expect(attemptedModels).toEqual([
-			`${currentModel.provider}/${currentModel.id}`,
 			`${sameProviderModel.provider}/${sameProviderModel.id}`,
+			`${currentModel.provider}/${currentModel.id}`,
 		]);
 	});
 
 	it("preserves a native transport failure when a later same-provider candidate fails authentication", async () => {
-		const { apiKeySpy, crossProviderModel, currentModel, sameProviderModel, triggerAutoCompaction } =
-			await createAutoNativeFallbackSession();
-		apiKeySpy.mockImplementation(async model =>
-			model.provider === crossProviderModel.provider ? undefined : "test-key",
-		);
+		const { currentModel, sameProviderModel, triggerAutoCompaction } = await createAutoNativeFallbackSession();
 		const attemptedModels: string[] = [];
 		let errorMessage: string | undefined;
 		session.subscribe(event => {
@@ -241,10 +235,10 @@ describe("issue #986 compaction auth fallback", () => {
 		});
 		vi.spyOn(compactionModule, "compact").mockImplementation(async (_preparation, model) => {
 			attemptedModels.push(`${model.provider}/${model.id}`);
-			if (model.provider === currentModel.provider && model.id === currentModel.id) {
+			if (model.provider === sameProviderModel.provider && model.id === sameProviderModel.id) {
 				throw new compactionModule.NativeCompactionError(new Error("native compaction transport failed"));
 			}
-			if (model.provider === sameProviderModel.provider && model.id === sameProviderModel.id) {
+			if (model.provider === currentModel.provider && model.id === currentModel.id) {
 				throw new compactionModule.NativeCompactionError(
 					Object.assign(new Error("native compaction authentication failed"), { status: 401 }),
 				);
@@ -255,47 +249,36 @@ describe("issue #986 compaction auth fallback", () => {
 		await triggerAutoCompaction();
 
 		expect(attemptedModels).toEqual([
-			`${currentModel.provider}/${currentModel.id}`,
 			`${sameProviderModel.provider}/${sameProviderModel.id}`,
+			`${currentModel.provider}/${currentModel.id}`,
 		]);
 		expect(errorMessage).toContain("native compaction transport failed");
 	});
 
-	it("skips unauthenticated cross-provider candidates before enforcing the native boundary", async () => {
-		const { apiKeySpy, crossProviderModel, currentModel, sameProviderModel, triggerAutoCompaction } =
-			await createAutoNativeFallbackSession();
-		session.settings.setModelRole("smol", `${crossProviderModel.provider}/${crossProviderModel.id}`);
-		session.settings.setModelRole("slow", `${sameProviderModel.provider}/${sameProviderModel.id}`);
+	it("skips an unauthenticated mapped candidate and surfaces the session model's native failure", async () => {
+		const { apiKeySpy, crossProviderModel, currentModel } = await createAutoNativeFallbackSession({
+			alternate: "crossProvider",
+		});
 		apiKeySpy.mockImplementation(async model =>
 			model.provider === crossProviderModel.provider ? undefined : "test-key",
 		);
 		const attemptedModels: string[] = [];
-		vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => {
+		vi.spyOn(compactionModule, "compact").mockImplementation(async (_preparation, model) => {
 			attemptedModels.push(`${model.provider}/${model.id}`);
 			if (model.provider === currentModel.provider && model.id === currentModel.id) {
 				throw new compactionModule.NativeCompactionError(new Error("native compaction transport failed"));
 			}
-			if (model.provider === sameProviderModel.provider && model.id === sameProviderModel.id) {
-				return {
-					summary: "authenticated same-provider summary",
-					shortSummary: "authenticated same-provider",
-					firstKeptEntryId: preparation.firstKeptEntryId,
-					tokensBefore: 42,
-				};
-			}
 			throw new Error(`Unexpected compaction model ${model.provider}/${model.id}`);
 		});
 
-		await triggerAutoCompaction();
+		const error: unknown = await session.compact().catch((err: unknown) => err);
 
-		expect(attemptedModels).toEqual([
-			`${currentModel.provider}/${currentModel.id}`,
-			`${sameProviderModel.provider}/${sameProviderModel.id}`,
-		]);
+		expect(error).toBeInstanceOf(compactionModule.NativeCompactionError);
+		expect(attemptedModels).toEqual([`${currentModel.provider}/${currentModel.id}`]);
 	});
 
 	it("retries a transient native compaction failure on the same candidate", async () => {
-		const { currentModel, triggerAutoCompaction } = await createAutoNativeFallbackSession();
+		const { sameProviderModel, triggerAutoCompaction } = await createAutoNativeFallbackSession();
 		cfgRetryEnabled.set(session.settings, true);
 		cfgRetryBaseDelayMs.set(session.settings, 1);
 		cfgRetryMaxRetries.set(session.settings, 1);
@@ -303,7 +286,7 @@ describe("issue #986 compaction auth fallback", () => {
 		const attemptedModels: string[] = [];
 		vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => {
 			attemptedModels.push(`${model.provider}/${model.id}`);
-			if (model.provider !== currentModel.provider || model.id !== currentModel.id) {
+			if (model.provider !== sameProviderModel.provider || model.id !== sameProviderModel.id) {
 				throw new Error(`Unexpected compaction model ${model.provider}/${model.id}`);
 			}
 			if (attemptedModels.length === 1) {
@@ -322,38 +305,34 @@ describe("issue #986 compaction auth fallback", () => {
 		await triggerAutoCompaction();
 
 		expect(attemptedModels).toEqual([
-			`${currentModel.provider}/${currentModel.id}`,
-			`${currentModel.provider}/${currentModel.id}`,
+			`${sameProviderModel.provider}/${sameProviderModel.id}`,
+			`${sameProviderModel.provider}/${sameProviderModel.id}`,
 		]);
 		expect(waitSpy).toHaveBeenCalledTimes(1);
 	});
 
-	it("preserves native timeout failures before crossing providers", async () => {
-		const { crossProviderModel, currentModel, sameProviderModel, triggerAutoCompaction } =
-			await createAutoNativeFallbackSession();
+	it("preserves native timeout failures without crossing providers", async () => {
+		const { currentModel, sameProviderModel, triggerAutoCompaction } = await createAutoNativeFallbackSession();
 		const attemptedModels: string[] = [];
-		vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => {
+		let errorMessage: string | undefined;
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") errorMessage = event.errorMessage;
+		});
+		vi.spyOn(compactionModule, "compact").mockImplementation(async (_preparation, model) => {
 			attemptedModels.push(`${model.provider}/${model.id}`);
 			if (model.provider === currentModel.provider || model.provider === sameProviderModel.provider) {
 				throw new compactionModule.NativeCompactionError(new Error("provider stream stall timeout"));
 			}
-			if (model.provider !== crossProviderModel.provider || model.id !== crossProviderModel.id) {
-				throw new Error(`Unexpected compaction model ${model.provider}/${model.id}`);
-			}
-			return {
-				summary: "cross-provider summary",
-				shortSummary: "cross-provider",
-				firstKeptEntryId: preparation.firstKeptEntryId,
-				tokensBefore: 42,
-			};
+			throw new Error(`Unexpected compaction model ${model.provider}/${model.id}`);
 		});
 
 		await triggerAutoCompaction();
 
 		expect(attemptedModels).toEqual([
-			`${currentModel.provider}/${currentModel.id}`,
 			`${sameProviderModel.provider}/${sameProviderModel.id}`,
+			`${currentModel.provider}/${currentModel.id}`,
 		]);
+		expect(errorMessage).toContain("provider stream stall timeout");
 	});
 
 	it("stops auto-compaction before a same-provider candidate with native compaction disabled", async () => {
@@ -381,20 +360,22 @@ describe("issue #986 compaction auth fallback", () => {
 	});
 
 	it("falls through to cross-provider soft compaction after native authentication failures", async () => {
-		const { crossProviderModel, currentModel, sameProviderModel, triggerAutoCompaction } =
-			await createAutoNativeFallbackSession({ includeSoftFallback: true });
+		const { crossProviderModel, currentModel, triggerAutoCompaction } = await createAutoNativeFallbackSession({
+			alternate: "crossProvider",
+			includeSoftFallback: true,
+		});
 		const attemptedModels: string[] = [];
 		vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => {
 			attemptedModels.push(`${model.provider}/${model.id}`);
 			if (preparation.settings.remoteEnabled === true) {
-				if (model.provider === currentModel.provider || model.provider === sameProviderModel.provider) {
+				if (model.provider === currentModel.provider && model.id === currentModel.id) {
 					throw new compactionModule.NativeCompactionError(
 						Object.assign(new Error("native compaction authentication failed"), { status: 401 }),
 					);
 				}
 				throw new Error(`Unexpected remote compaction model ${model.provider}/${model.id}`);
 			}
-			if (model.provider === currentModel.provider || model.provider === sameProviderModel.provider) {
+			if (model.provider === currentModel.provider && model.id === currentModel.id) {
 				throw new AIError.ProviderHttpError("local compaction authentication failed", 401);
 			}
 			if (model.provider !== crossProviderModel.provider || model.id !== crossProviderModel.id) {
@@ -410,27 +391,25 @@ describe("issue #986 compaction auth fallback", () => {
 
 		await triggerAutoCompaction();
 
+		// Attempts concatenate phases: the remote method sees only the native session model (cross-provider is filtered out), then the soft method tries the mapped cross-provider candidate first.
 		expect(attemptedModels).toEqual([
 			`${currentModel.provider}/${currentModel.id}`,
-			`${sameProviderModel.provider}/${sameProviderModel.id}`,
-			`${currentModel.provider}/${currentModel.id}`,
-			`${sameProviderModel.provider}/${sameProviderModel.id}`,
 			`${crossProviderModel.provider}/${crossProviderModel.id}`,
 		]);
 	});
 
-	it("tries same-provider native candidates during manual compaction before crossing providers", async () => {
-		const { crossProviderModel, currentModel, sameProviderModel } = await createAutoNativeFallbackSession();
+	it("tries the same-provider mapped candidate first during manual compaction and falls back to the session model", async () => {
+		const { currentModel, sameProviderModel } = await createAutoNativeFallbackSession();
 		const attemptedModels: string[] = [];
 		vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => {
 			attemptedModels.push(`${model.provider}/${model.id}`);
-			if (model.provider === currentModel.provider && model.id === currentModel.id) {
+			if (model.provider === sameProviderModel.provider && model.id === sameProviderModel.id) {
 				throw new compactionModule.NativeCompactionError(new Error("native manual compaction failed"));
 			}
-			if (model.provider === sameProviderModel.provider && model.id === sameProviderModel.id) {
+			if (model.provider === currentModel.provider && model.id === currentModel.id) {
 				return {
-					summary: "same-provider manual summary",
-					shortSummary: "same-provider manual",
+					summary: "session model manual summary",
+					shortSummary: "session model manual",
 					firstKeptEntryId: preparation.firstKeptEntryId,
 					tokensBefore: 42,
 				};
@@ -440,16 +419,15 @@ describe("issue #986 compaction auth fallback", () => {
 
 		const result = await session.compact();
 
-		expect(result.summary).toBe("same-provider manual summary");
+		expect(result.summary).toBe("session model manual summary");
 		expect(attemptedModels).toEqual([
-			`${currentModel.provider}/${currentModel.id}`,
 			`${sameProviderModel.provider}/${sameProviderModel.id}`,
+			`${currentModel.provider}/${currentModel.id}`,
 		]);
-		expect(attemptedModels).not.toContain(`${crossProviderModel.provider}/${crossProviderModel.id}`);
 	});
 
 	it("falls back across providers when server compaction receives auth_unavailable", async () => {
-		const { currentModel, fallbackModel } = await createSession({ fallbackModelRole: "smol" });
+		const { currentModel, fallbackModel } = await createSession({ mapFallback: true });
 		const originalCompact = compactionModule.compact;
 		const fetchMock = vi.fn(async () =>
 			Response.json(
@@ -499,13 +477,12 @@ describe("issue #986 compaction auth fallback", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 		expect(compactSpy.mock.calls.map(([, model]) => `${model.provider}/${model.id}`)).toEqual([
 			`${currentModel.provider}/${currentModel.id}`,
-			`${currentModel.provider}/${currentModel.id}`,
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 		]);
 	});
 
 	it("fails fast with a clear provider-specific error when no authenticated fallback exists", async () => {
-		const { currentModel } = await createSession({ configureFallbackAuth: false });
+		const { currentModel } = await createSession({ configureFallbackAuth: false, mapFallback: true });
 		vi.spyOn(compactionModule, "compact").mockImplementation(async (_preparation, model) => {
 			if (model.provider === currentModel.provider && model.id === currentModel.id) {
 				throw new Error(
@@ -536,7 +513,7 @@ describe("issue #986 compaction auth fallback", () => {
 		// status-aware detector landed, only the synthetic was caught — a real
 		// 401 from the provider bypassed the fallback and dumped the raw HTTP
 		// body into the UI as "Compaction failed: 401 {...}".
-		const { currentModel, fallbackModel } = await createSession({ fallbackModelRole: "smol" });
+		const { currentModel, fallbackModel } = await createSession({ mapFallback: true });
 		const originalCompact = compactionModule.compact;
 		const fetchMock = vi.fn(async () =>
 			Response.json(
@@ -587,16 +564,15 @@ describe("issue #986 compaction auth fallback", () => {
 
 		expect(result.summary).toBe("fallback summary");
 		expect(fetchMock).toHaveBeenCalledTimes(1);
-		expect(compactSpy).toHaveBeenCalledTimes(3);
+		expect(compactSpy).toHaveBeenCalledTimes(2);
 		expect(compactSpy.mock.calls.map(([, model]) => `${model.provider}/${model.id}`)).toEqual([
-			`${currentModel.provider}/${currentModel.id}`,
 			`${currentModel.provider}/${currentModel.id}`,
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 		]);
 	});
 
 	it("fails fast with the configured-credentials hint when a 401 has no authenticated fallback", async () => {
-		const { currentModel } = await createSession({ configureFallbackAuth: false });
+		const { currentModel } = await createSession({ configureFallbackAuth: false, mapFallback: true });
 		const originalCompact = compactionModule.compact;
 		const fetchMock = vi.fn(async () =>
 			Response.json(

@@ -2,12 +2,14 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:te
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
 import { Effort } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
 	acquireModelRoleMutation,
 	applyModelPreset,
 	deleteModelPreset,
+	findActiveModelPreset,
 	getModelPreset,
 	getModelPresetNames,
 	formatModelPresetSwitch,
@@ -21,6 +23,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { cfgCompactionModels } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import { cfgDefaultThinkingLevel, cfgRetryFallbackChains } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -149,6 +152,93 @@ describe("model presets", () => {
 		const bare = await applyModelPreset(session, "bare", { scope: "project" });
 		expect(bare.kind).toBe("switched");
 		expect(cfgRetryFallbackChains.get(session.settings)).toEqual({});
+	});
+
+	it("round-trips compaction models per preset and matches them as active", async () => {
+		const settings = Settings.isolated();
+		settings.setModelRole("default", OPUS);
+		cfgCompactionModels.override(settings, { [SONNET]: "openai/gpt-5" });
+		saveModelPreset(settings, "compacting");
+		cfgModelPresets.setEntry(settings, "bare", { modelRoles: { default: SONNET } });
+
+		// Drift after save: the live mapping no longer matches the snapshot.
+		cfgCompactionModels.override(settings, { [OPUS]: "openai/gpt-5" });
+		expect(findActiveModelPreset(settings)).toBeUndefined();
+
+		const session = createSession(settings, SONNET, Effort.High);
+		const applied = await applyModelPreset(session, "compacting", { scope: "project" });
+		expect(applied.kind).toBe("switched");
+		expect(cfgCompactionModels.get(session.settings)).toEqual({ [SONNET]: "openai/gpt-5" });
+		expect(findActiveModelPreset(session.settings)).toBe("compacting");
+	});
+
+	it("a preset without compactionModels leaves config compaction.models in force, through the real compaction flow", async () => {
+		const settings = Settings.isolated({ "compaction.keepRecentTokens": 1, "compaction.methodOrder": ["soft"] });
+		cfgModelPresets.setEntry(settings, "bare", { modelRoles: { default: SONNET } });
+		authStorage.keys.setRuntime("openai", "openai-token");
+		const session = createSession(settings, SONNET, Effort.High);
+
+		const applied = await applyModelPreset(session, "bare", { scope: "project" });
+		expect(applied.kind).toBe("switched");
+
+		// Config set after the preset is applied: the absent preset map must not hide it.
+		cfgCompactionModels.override(session.settings, { [SONNET]: "openai/gpt-5" });
+		expect(cfgCompactionModels.get(session.settings)).toEqual({ [SONNET]: "openai/gpt-5" });
+
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => ({
+			summary: "ok",
+			shortSummary: "ok short",
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: 1,
+			details: { provider: model.provider },
+		}));
+		for (const [userText, assistantText] of [
+			["first question", "first answer"],
+			["second question", "second answer"],
+		] as const) {
+			const user = { role: "user" as const, content: userText, timestamp: Date.now() };
+			const assistant = {
+				role: "assistant" as const,
+				content: [{ type: "text" as const, text: assistantText }],
+				api: "anthropic-messages" as const,
+				provider: "anthropic",
+				model: SONNET,
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop" as const,
+				timestamp: Date.now(),
+			};
+			session.agent.appendMessage(user as never);
+			session.sessionManager.appendMessage(user as never);
+			session.agent.appendMessage(assistant as never);
+			session.sessionManager.appendMessage(assistant as never);
+		}
+		await session.compact();
+		expect(compactSpy).toHaveBeenCalled();
+		const used = compactSpy.mock.calls[0]?.[1];
+		expect(`${used?.provider}/${used?.id}`).toBe("openai/gpt-5");
+
+		// Saving snapshots the map, and reapplying restores it.
+		saveModelPreset(session.settings, "snap");
+		const saved = getModelPreset(session.settings, "snap");
+		expect(saved.kind === "found" && saved.preset.compactionModels).toEqual({ [SONNET]: "openai/gpt-5" });
+		const reapplied = await applyModelPreset(session, "snap", { scope: "project" });
+		expect(reapplied.kind).toBe("switched");
+		expect(cfgCompactionModels.get(session.settings)).toEqual({ [SONNET]: "openai/gpt-5" });
+	});
+
+	it("omits an empty compaction map from a saved preset so config stays in force", () => {
+		const settings = Settings.isolated();
+		settings.setModelRole("default", SONNET);
+		saveModelPreset(settings, "plain");
+		const saved = getModelPreset(settings, "plain");
+		expect(saved.kind === "found" && "compactionModels" in saved.preset).toBe(false);
 	});
 
 	it("an explicit selector level on the preset's default beats its defaultThinkingLevel", async () => {

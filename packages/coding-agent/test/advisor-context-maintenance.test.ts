@@ -20,6 +20,7 @@ import { asGlobalFetch } from "./helpers/fetch-mock";
 
 import {
 	cfgCompaction,
+	cfgCompactionModels,
 	cfgCompactionKeepRecentTokens,
 	cfgCompactionThresholdTokens,
 } from "@oh-my-pi/pi-coding-agent/session/context-settings";
@@ -194,6 +195,9 @@ describe("AgentSession advisor context maintenance", () => {
 		settings.setModelRole("advisor", `${nativeModel.provider}/${nativeModel.id}`);
 		settings.setModelRole("smol", `${sameProviderModel.provider}/${sameProviderModel.id}`);
 		settings.setModelRole("slow", `${crossProviderModel.provider}/${crossProviderModel.id}`);
+		cfgCompactionModels.set(settings, {
+			[`${nativeModel.provider}/${nativeModel.id}`]: `${sameProviderModel.provider}/${sameProviderModel.id}`,
+		});
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model: primaryMock, systemPrompt: [], tools: [] },
@@ -508,7 +512,9 @@ describe("AgentSession advisor context maintenance", () => {
 					enabled: readerNativeEnabled,
 					v2StreamingEnabled: false,
 				},
-				compactionModel: `${writer.provider}/${writer.id}`,
+			});
+			cfgCompactionModels.set(settings, {
+				[`${nativeModel.provider}/${nativeModel.id}`]: `${writer.provider}/${writer.id}`,
 			});
 			vi.spyOn(session.modelRegistry, "getAvailable").mockReturnValue([advisor.state.model, writer]);
 			cfgCompactionKeepRecentTokens.set(settings, 1);
@@ -589,9 +595,11 @@ describe("AgentSession advisor context maintenance", () => {
 				...getBundledModel<"anthropic-messages">("anthropic", "claude-sonnet-4-5"),
 				provider,
 				contextWindow: CONTEXT_WINDOW,
-				compactionModel: `${summarizer.provider}/${summarizer.id}`,
 			};
 			advisor.setModel(active);
+			cfgCompactionModels.set(settings, {
+				[`${active.provider}/${active.id}`]: `${summarizer.provider}/${summarizer.id}`,
+			});
 			cfgCompactionKeepRecentTokens.set(settings, 1);
 			vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([active, summarizer]);
 			vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("test-key");
@@ -638,7 +646,6 @@ describe("AgentSession advisor context maintenance", () => {
 		const promoted = {
 			...crossProviderModel,
 			contextWindow: 200_000,
-			compactionModel: `${summarizer.provider}/${summarizer.id}`,
 		};
 		const active = {
 			...nativeModel,
@@ -647,6 +654,9 @@ describe("AgentSession advisor context maintenance", () => {
 			remoteCompaction: { ...nativeModel.remoteCompaction, v2StreamingEnabled: false },
 		};
 		advisor.setModel(active);
+		cfgCompactionModels.set(settings, {
+			[`${promoted.provider}/${promoted.id}`]: `${summarizer.provider}/${summarizer.id}`,
+		});
 		cfgCompactionKeepRecentTokens.set(settings, 1);
 		apiKeySpy.mockResolvedValue("test-key");
 		vi.spyOn(session.modelRegistry, "getAvailable").mockReturnValue([active, promoted, summarizer]);
@@ -669,7 +679,7 @@ describe("AgentSession advisor context maintenance", () => {
 		"preserves native replay across a context promotion with %s compaction",
 		async policy => {
 			const compatible = policy !== "foreign";
-			const { advisor, advisorMock, nativeModel, crossProviderModel, sameProviderModel } =
+			const { advisor, advisorMock, nativeModel, crossProviderModel, sameProviderModel, settings } =
 				createAdvisorFallbackHarness({
 					contextPromotionEnabled: true,
 					remoteEnabled: policy !== "remote-disabled",
@@ -680,9 +690,11 @@ describe("AgentSession advisor context maintenance", () => {
 				...nativeModel,
 				contextPromotionTarget: `${target.provider}/${target.id}`,
 				remoteCompaction: { ...nativeModel.remoteCompaction, v2StreamingEnabled: false },
-				compactionModel: `${target.provider}/${target.id}`,
 			};
 			advisor.setModel(active);
+			cfgCompactionModels.set(settings, {
+				[`${nativeModel.provider}/${nativeModel.id}`]: `${target.provider}/${target.id}`,
+			});
 			advisor.replaceMessages([
 				nativeSummary(nativeModel.provider),
 				usageAnchor(advisorMock, Date.now() - 1_000),
@@ -838,8 +850,8 @@ describe("AgentSession advisor context maintenance", () => {
 		await session.prompt("small current update");
 
 		expect(compactSpy.mock.calls.map(([, model]) => `${model.provider}/${model.id}`)).toEqual([
-			`${nativeModel.provider}/${nativeModel.id}`,
 			`${sameProviderModel.provider}/${sameProviderModel.id}`,
+			`${nativeModel.provider}/${nativeModel.id}`,
 		]);
 		expect(JSON.stringify(advisor.state.messages)).toContain("prior advisor output");
 	});
@@ -847,10 +859,10 @@ describe("AgentSession advisor context maintenance", () => {
 	it("applies a successful same-provider native advisor fallback", async () => {
 		const { advisor, crossProviderModel, nativeModel, sameProviderModel } = createAdvisorFallbackHarness();
 		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => {
-			if (model.provider === nativeModel.provider && model.id === nativeModel.id) {
+			if (model.provider === sameProviderModel.provider && model.id === sameProviderModel.id) {
 				throw new compactionModule.NativeCompactionError(new Error("V2 native compaction transport failed"));
 			}
-			if (model.provider === sameProviderModel.provider && model.id === sameProviderModel.id) {
+			if (model.provider === nativeModel.provider && model.id === nativeModel.id) {
 				return {
 					summary: "same-provider native summary",
 					shortSummary: "same-provider native",
@@ -866,8 +878,8 @@ describe("AgentSession advisor context maintenance", () => {
 		await session.prompt("small current update");
 
 		expect(compactSpy.mock.calls.map(([, model]) => `${model.provider}/${model.id}`)).toEqual([
-			`${nativeModel.provider}/${nativeModel.id}`,
 			`${sameProviderModel.provider}/${sameProviderModel.id}`,
+			`${nativeModel.provider}/${nativeModel.id}`,
 		]);
 		// Provider-native compaction re-issues the advisor's own request, so
 		// every candidate receives the advisor's live system prompt.
@@ -933,13 +945,12 @@ describe("AgentSession advisor context maintenance", () => {
 		await session.prompt("small current update");
 
 		expect(compactSpy.mock.calls.map(([, model]) => `${model.provider}/${model.id}`)).toEqual([
-			`${nativeModel.provider}/${nativeModel.id}`,
 			`${sameProviderModel.provider}/${sameProviderModel.id}`,
 		]);
 		expect(JSON.stringify(advisor.state.messages)).toContain("authenticated same-provider advisor summary");
 	});
 
-	it("stops before a same-provider advisor candidate with native compaction disabled", async () => {
+	it("runs a same-provider advisor candidate even with native compaction disabled", async () => {
 		const { advisor, nativeModel, sameProviderModel } = createAdvisorFallbackHarness({
 			sameProviderNativeEnabled: false,
 		});
@@ -958,39 +969,9 @@ describe("AgentSession advisor context maintenance", () => {
 		await session.prompt("small current update");
 
 		expect(compactSpy.mock.calls.map(([, model]) => `${model.provider}/${model.id}`)).toEqual([
-			`${nativeModel.provider}/${nativeModel.id}`,
-		]);
-		expect(JSON.stringify(advisor.state.messages)).not.toContain("generic same-provider summary");
-		expect(sameProviderModel.remoteCompaction?.enabled).toBe(false);
-	});
-
-	it("allows advisor compaction to cross providers after auth-classified native failures", async () => {
-		const { advisor, crossProviderModel, nativeModel, sameProviderModel } = createAdvisorFallbackHarness();
-		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => {
-			if (model.provider === nativeModel.provider || model.provider === sameProviderModel.provider) {
-				throw new compactionModule.NativeCompactionError(
-					Object.assign(new Error("native compaction authentication failed"), { status: 401 }),
-				);
-			}
-			if (model.provider !== crossProviderModel.provider || model.id !== crossProviderModel.id) {
-				throw new Error(`Unexpected compaction model ${model.provider}/${model.id}`);
-			}
-			return {
-				summary: "authenticated fallback summary",
-				shortSummary: "authenticated fallback",
-				firstKeptEntryId: preparation.firstKeptEntryId,
-				tokensBefore: 42,
-			};
-		});
-
-		await session.prompt("small current update");
-
-		expect(compactSpy.mock.calls.map(([, model]) => `${model.provider}/${model.id}`)).toEqual([
-			`${nativeModel.provider}/${nativeModel.id}`,
 			`${sameProviderModel.provider}/${sameProviderModel.id}`,
-			`${crossProviderModel.provider}/${crossProviderModel.id}`,
 		]);
-		expect(JSON.stringify(advisor.state.messages)).toContain("authenticated fallback summary");
+		expect(JSON.stringify(advisor.state.messages)).toContain("generic same-provider summary");
 	});
 
 	it("preserves native compaction state across advisor compactions", async () => {

@@ -226,7 +226,7 @@ override matching model tags. These fields do not configure the Anthropic Messag
 
 ### Compaction options
 
-- `compactionModel` (per model, including `modelOverrides`) — preferred compaction model, tried before the active model, chat-role candidates, and a largest-context fallback. It does not switch the active conversation model.
+- `compaction.models` (setting, default `{}`) — maps an exact active model selector (`provider/id`) to the model that writes its compaction summaries. Compaction tries the mapped model first, then the session model; an unmapped model compacts with the session model alone. It does not switch the active conversation model. Model presets carry the same map as `compactionModels`. The per-model `compactionModel` field is ignored for compaction.
 - `remoteCompaction` (provider level or per model) — opts eligible models into provider-native compaction. Supported keys: `enabled`, `api`, `endpoint`, `model`, `v2StreamingEnabled`, `v2Endpoint`, `streamingEndpoint`. Provider-level settings are the baseline; per-model keys override them.
 
 ### Allowed provider/model `api` values
@@ -382,7 +382,7 @@ its own [setup](./models.md#claude-on-bedrocks-anthropic-messages-api-anthropic)
 
 ### Model value checks
 
-- `id` is required and non-empty; optional `name`, model `baseUrl`, `contextPromotionTarget`, and `compactionModel` must also be non-empty
+- `id` is required and non-empty; optional `name`, model `baseUrl`, `contextPromotionTarget`, and `compactionModel` must also be non-empty. `compactionModel` is ignored for compaction; use `compaction.models` instead.
 - custom `models` entries require positive `contextWindow` and `maxTokens` when provided; the current auxiliary positivity check does not cover `modelOverrides`
 - on both custom models and overrides, `maxContextWindow` must be a positive safe integer no smaller than `contextWindow` when both are set
 
@@ -459,7 +459,7 @@ Provider defaults vs per-model overrides:
 - `modelOverrides` can override model metadata (`name`, `api`, `kind`, `reasoning`, `thinking`, `input`,
   `imageInputDecoder`, `imageCountBudget`, `tokenizer`, `supportsTools`, `cost`, `promptCache`, `premiumMultiplier`, `contextWindow`,
   `maxContextWindow`, `maxTokens`, `omitMaxOutputTokens`, `preferWebsockets`, `headers`, `compat`,
-  `contextPromotionTarget`, `compactionModel`, and `remoteCompaction`).
+  `contextPromotionTarget`, `compactionModel` (ignored for compaction; see `compaction.models`), and `remoteCompaction`).
 - `compat` is deep-merged for nested routing blocks (`openRouterRouting`, `vercelGatewayRouting`,
   `extraBody`, and `whenThinking`).
 

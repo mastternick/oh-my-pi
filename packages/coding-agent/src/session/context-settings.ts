@@ -232,6 +232,23 @@ export const cfgCompactionModelThresholdsEnabled = register({
 	default: true,
 });
 
+/**
+ * Compaction model per model being compacted: the key is that model's exact `provider/model-id`, the value the model
+ * selector that compacts it. A model with no entry is compacted by itself. Presets pin this record like `retry.fallbackChains`.
+ */
+export const cfgCompactionModels = register({
+	id: "compaction.models",
+	type: "record",
+	default: {},
+	ui: {
+		tab: "context",
+		group: "Compaction",
+		label: "Compaction Models",
+		description:
+			'JSON object mapping a model selector ("provider/model-id") to the model selector that compacts it, e.g. {"openai-codex/gpt-6.1-sol":"openai-codex/gpt-6-luna"}. Unmapped models are compacted by themselves',
+	},
+});
+
 export const cfgCompactionHandoffSaveToDisk = register({
 	id: "compaction.handoffSaveToDisk",
 	type: "boolean",

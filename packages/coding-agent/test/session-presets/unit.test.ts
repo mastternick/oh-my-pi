@@ -19,6 +19,7 @@ const {
 } = await import(`${SRC}/config/model-presets.ts`);
 const { Settings } = await import(`${SRC}/config/settings.ts`);
 const { cfgDefaultThinkingLevel, cfgRetryFallbackChains } = await import(`${SRC}/session/settings.ts`);
+const { cfgCompactionModels } = await import(`${SRC}/session/context-settings.ts`);
 const { SessionManager } = await import(`${SRC}/session/session-manager.ts`);
 
 interface SessionPresetPin {
@@ -91,6 +92,22 @@ const model = (id: string): Model =>
 		maxTokens: 100,
 	}) as unknown as Model;
 
+/** Preset M snapshots its own compaction map; A and the other presets carry none. */
+const PRESET_M = `  M:
+    modelRoles:
+      default: fakeprov/alpha
+    compactionModels:
+      fakeprov/beta: fakeprov/alpha
+`;
+
+/** Global config: the fixture, preset M, and `compaction.models` set to `models`. */
+function writeGlobal(models: Record<string, string>): void {
+	const entries = Object.entries(models)
+		.map(([key, target]) => `    ${key}: ${target}`)
+		.join("\n");
+	fs.writeFileSync(GLOBAL_CONFIG, `${GLOBAL_YAML}${PRESET_M}compaction:\n  models:\n${entries}\n`);
+}
+
 const MODELS = { alpha: model("alpha"), beta: model("beta"), gamma: model("gamma"), locked: model("locked") };
 
 interface Stub {
@@ -154,6 +171,8 @@ function consumerOf(s: InstanceType<typeof Settings>) {
 		thinking: cfgDefaultThinkingLevel.get(s),
 	};
 }
+
+const projectFile = (): Record<string, any> => Bun.YAML.parse(fs.readFileSync(P_CONFIG, "utf8")) as Record<string, any>;
 
 const digest = (file: string) => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 const lastSnapshot = (mgr: InstanceType<typeof SessionManager>) =>
@@ -432,4 +451,48 @@ test("resolveSessionDefault returns a reason for an unauthed project candidate a
 	expect(sess.thinking).toBe("medium");
 	expect(consumerOf(sess.settings)).toEqual(consumerBefore);
 	expect(lastSnapshot(mgr)).toBe(snapBefore);
+});
+
+test("marked default without compactionModels leaves the global compaction map in force", async () => {
+	await seedProjectA();
+	expect(projectFile().modelPresetDefault).toBe("A");
+	expect(projectFile().compaction?.models).toBeUndefined();
+	writeGlobal({ "fakeprov/alpha": "fakeprov/gamma" });
+
+	const view = (await load(P)).sessionView();
+	expect(cfgCompactionModels.get(view)).toEqual({ "fakeprov/alpha": "fakeprov/gamma" });
+	const sess = makeSession(view, SessionManager.create(P, SESSIONS));
+	expect(cfgCompactionModels.get(sess.settings)).toEqual({ "fakeprov/alpha": "fakeprov/gamma" });
+});
+
+test("switching the marked default to a preset without compactionModels drops the project map; global map takes effect", async () => {
+	writeGlobal({ "fakeprov/alpha": "fakeprov/gamma" });
+	const root = await load(P);
+	const sess = makeSession(root.sessionView(), SessionManager.create(P, SESSIONS));
+
+	expect((await applyModelPreset(sess, "M", { scope: "project" })).kind).toBe("switched");
+	await root.flush();
+	expect(projectFile().compaction?.models).toEqual({ "fakeprov/beta": "fakeprov/alpha" });
+	expect(cfgCompactionModels.get((await load(P)).sessionView())).toEqual({ "fakeprov/beta": "fakeprov/alpha" });
+
+	expect((await applyModelPreset(sess, "A", { scope: "project" })).kind).toBe("switched");
+	await root.flush();
+	expect(projectFile().modelPresetDefault).toBe("A");
+	expect(projectFile().compaction?.models).toBeUndefined();
+	expect(cfgCompactionModels.get(sess.settings)).toEqual({ "fakeprov/alpha": "fakeprov/gamma" });
+	expect(cfgCompactionModels.get((await load(P)).sessionView())).toEqual({ "fakeprov/alpha": "fakeprov/gamma" });
+});
+
+test("a session reopened from its recorded baseline picks up a later global compaction.models change", async () => {
+	writeGlobal({ "fakeprov/alpha": "fakeprov/gamma" });
+	const mgr = SessionManager.create(P, SESSIONS);
+	const view = (await load(P)).sessionView();
+	expect(attachSessionPreset(view, mgr, { record: true })).toBe(false);
+	expect(JSON.parse(lastSnapshot(mgr)).data).not.toHaveProperty("compactionModels");
+
+	writeGlobal({ "fakeprov/beta": "fakeprov/alpha" });
+	const reopened = await SessionManager.open(mgr.getSessionFile(), SESSIONS);
+	const reopenedView = (await load(P)).sessionView();
+	expect(attachSessionPreset(reopenedView, reopened, { record: false })).toBe(true);
+	expect(cfgCompactionModels.get(reopenedView)).toEqual({ "fakeprov/beta": "fakeprov/alpha" });
 });

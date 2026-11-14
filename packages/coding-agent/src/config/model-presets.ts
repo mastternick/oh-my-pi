@@ -1,10 +1,10 @@
 /**
- * Model presets: named snapshots of the role assignments (`modelRoles`), `defaultThinkingLevel`, and
- * `retry.fallbackChains`, saved and applied as a whole.
+ * Model presets: named snapshots of the role assignments (`modelRoles`), `defaultThinkingLevel`,
+ * `retry.fallbackChains` and, when non-empty, `compaction.models`, saved and applied as a whole.
  *
  * Presets persist to the global config (`modelPresets.<name>`); a project config may also define presets,
  * which are listed and applied but never copied into the global file. Applying a preset pins the current
- * session to all three values and logs that snapshot in the session, so reopening restores it. A
+ * session to these values and logs that snapshot in the session, so reopening restores it. A
  * project-scope switch also saves the preset as the project default, which only sessions created afterwards
  * inherit. A preset without `defaultThinkingLevel` takes the session's configured default level; one without
  * `fallbackChains` has no chains. Values another layer still decides (a `--config` overlay or a launch
@@ -17,6 +17,7 @@ import { AUTO_THINKING, type ConfiguredThinkingLevel, parseConfiguredThinkingLev
 import { isRecord } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionManager } from "../session/session-manager";
+import { cfgCompactionModels } from "../session/context-settings";
 import { cfgDefaultThinkingLevel, cfgRetryFallbackChains } from "../session/settings";
 import { pickDefaultAvailableModel, resolveModelRoleValue } from "./model-resolver";
 import { cfgModelPresets, type ModelPreset } from "./model-settings";
@@ -58,17 +59,31 @@ function parseModelPreset(raw: unknown): ModelPreset | string {
 			fallbackChains[key] = [...chain];
 		}
 	}
+	const rawCompaction = raw.compactionModels;
+	let compactionModels: Record<string, string> | undefined;
+	if (rawCompaction !== undefined) {
+		if (!isRecord(rawCompaction)) return "`compactionModels` is not a mapping";
+		compactionModels = {};
+		for (const key of Object.keys(rawCompaction)) {
+			const target = rawCompaction[key];
+			if (typeof target !== "string" || target.trim() === "") {
+				return `compaction model for \`${key}\` is not a model selector`;
+			}
+			compactionModels[key] = target;
+		}
+	}
+	const preset: ModelPreset = { modelRoles };
 	const level = raw.defaultThinkingLevel;
-	if (level === undefined) {
-		return fallbackChains === undefined ? { modelRoles } : { modelRoles, fallbackChains };
+	if (level !== undefined) {
+		const thinking = typeof level === "string" ? parseConfiguredThinkingLevel(level) : undefined;
+		if (thinking === undefined || !isDefaultThinkingLevel(thinking)) {
+			return "`defaultThinkingLevel` is not a thinking level";
+		}
+		preset.defaultThinkingLevel = thinking;
 	}
-	const thinking = typeof level === "string" ? parseConfiguredThinkingLevel(level) : undefined;
-	if (thinking === undefined || !isDefaultThinkingLevel(thinking)) {
-		return "`defaultThinkingLevel` is not a thinking level";
-	}
-	return fallbackChains === undefined
-		? { modelRoles, defaultThinkingLevel: thinking }
-		: { modelRoles, defaultThinkingLevel: thinking, fallbackChains };
+	if (fallbackChains !== undefined) preset.fallbackChains = fallbackChains;
+	if (compactionModels !== undefined) preset.compactionModels = compactionModels;
+	return preset;
 }
 
 function isDefaultThinkingLevel(
@@ -105,6 +120,21 @@ function sanitizeFallbackChains(raw: Record<string, unknown>): Record<string, st
 		if (isSelectorList(value)) chains[key] = [...value];
 	}
 	return chains;
+}
+
+/** Well-formed `compaction.models` entries from the live record, as fresh strings. Malformed entries are dropped. */
+function sanitizeCompactionModels(raw: Record<string, unknown>): Record<string, string> {
+	const models: Record<string, string> = {};
+	for (const [key, value] of Object.entries(raw)) {
+		if (typeof value === "string" && value.trim() !== "") models[key] = value;
+	}
+	return models;
+}
+
+/** Order-insensitive equality for two `compaction.models` records; lookup is by key, so order is irrelevant. */
+function sameCompactionModels(a: Record<string, string>, b: Record<string, string>): boolean {
+	const aKeys = Object.keys(a);
+	return aKeys.length === Object.keys(b).length && aKeys.every(key => Object.hasOwn(b, key) && a[key] === b[key]);
 }
 
 /** Order-sensitive equality for two selector lists; `undefined` matches only `undefined`. */
@@ -145,8 +175,15 @@ export function findActiveModelPreset(settings: Settings): string | undefined {
 		if (lookup.kind !== "found") return false;
 		const { modelRoles, defaultThinkingLevel } = lookup.preset;
 		if (defaultThinkingLevel !== undefined && defaultThinkingLevel !== thinking) return false;
+		const liveCompaction = sanitizeCompactionModels(cfgCompactionModels.get(settings));
 		const presetChains = lookup.preset.fallbackChains;
 		if (presetChains !== undefined && !sameFallbackChains(presetChains, liveChains)) return false;
+		if (
+			lookup.preset.compactionModels !== undefined &&
+			!sameCompactionModels(lookup.preset.compactionModels, liveCompaction)
+		) {
+			return false;
+		}
 		const presetIds = Object.keys(modelRoles);
 		return (
 			presetIds.length === roleIds.length &&
@@ -156,7 +193,7 @@ export function findActiveModelPreset(settings: Settings): string | undefined {
 }
 
 /**
- * Save the effective role assignments, `defaultThinkingLevel` and `retry.fallbackChains`
+ * Save the effective role assignments, `defaultThinkingLevel`, `retry.fallbackChains` and a non-empty `compaction.models`
  * as `name` in the global config, overwriting a preset of the same name. Only this entry
  * is written, so presets defined by a project config are never copied globally.
  *
@@ -170,10 +207,13 @@ export function saveModelPreset(settings: Settings, name: string): ModelPreset {
 	for (const [role, selector] of Object.entries(settings.getModelRoles())) {
 		if (selector) modelRoles[role] = selector;
 	}
+	const compactionModels = sanitizeCompactionModels(cfgCompactionModels.get(settings));
 	const preset: ModelPreset = {
 		modelRoles,
 		defaultThinkingLevel: cfgDefaultThinkingLevel.get(settings),
 		fallbackChains: sanitizeFallbackChains(cfgRetryFallbackChains.get(settings)),
+		// An empty map is omitted, so applying the preset leaves config compaction models in force.
+		...(Object.keys(compactionModels).length === 0 ? {} : { compactionModels }),
 	};
 	cfgModelPresets.setEntry(settings, name, preset);
 	return preset;
@@ -484,6 +524,7 @@ async function applyModelPresetLocked(
 		modelRoles: { ...preset.modelRoles },
 		defaultThinkingLevel: preset.defaultThinkingLevel ?? cfgDefaultThinkingLevel.get(settings),
 		fallbackChains: structuredClone(preset.fallbackChains ?? {}),
+		...(preset.compactionModels === undefined ? {} : { compactionModels: structuredClone(preset.compactionModels) }),
 	};
 	const previousPin = settings.sessionPin();
 	const previousModel = session.model;
@@ -565,6 +606,7 @@ export function resolveSessionDefault(
 	return resolvePresetDefault(session.settings, session, presetCandidates(session), {
 		modelRoles: pin.modelRoles,
 		fallbackChains: pin.fallbackChains,
+		compactionModels: pin.compactionModels,
 		defaultThinkingLevel:
 			pin.defaultThinkingLevel !== undefined && isDefaultThinkingLevel(pin.defaultThinkingLevel)
 				? pin.defaultThinkingLevel

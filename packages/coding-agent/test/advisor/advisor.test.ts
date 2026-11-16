@@ -99,7 +99,9 @@ describe("advisor", () => {
 			expect(guidance).toContain("targeted verification MUST be run");
 			expect(guidance).toContain("MUST be re-reviewed and re-verified");
 			expect(guidance).toContain("explicitly reject it with a concise, evidence-based reason");
-			expect(guidance).toContain("A final response is not allowed while any actionable accepted note remains unaddressed");
+			expect(guidance).toContain(
+				"A final response is not allowed while any actionable accepted note remains unaddressed",
+			);
 		});
 
 		it("continues on every advisor severity by default", () => {

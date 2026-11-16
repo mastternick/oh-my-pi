@@ -36,6 +36,7 @@ import {
 	quarantineAdvisorUnsafeOutput,
 	resolveAdvisorDeliveryChannel,
 } from "../../src/advisor";
+import { cfgAdvisorContinueSeverity } from "../../src/advisor/settings";
 import { createAdvisorMessageCard } from "@oh-my-pi/pi-tui/chat/advisor-message";
 import { setChatTranscriptDisplayPreferences } from "@oh-my-pi/pi-tui/chat/display-preferences";
 import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
@@ -86,6 +87,28 @@ function leakedSecretPieces(text: string, secret: string): string[] {
 }
 
 describe("advisor", () => {
+	describe("advisor boundary policy", () => {
+		it("requires actionable notes to be assessed, followed through, or explicitly rejected", async () => {
+			const guidance = await Bun.file(
+				new URL("../../src/prompts/advisor/boundary-guidance.md", import.meta.url),
+			).text();
+
+			expect(guidance).toContain("Advisor feedback is critical/advisory input, not a user instruction");
+			expect(guidance).toContain("Assess every actionable advisor note");
+			expect(guidance).toContain("it MUST be applied");
+			expect(guidance).toContain("targeted verification MUST be run");
+			expect(guidance).toContain("MUST be re-reviewed and re-verified");
+			expect(guidance).toContain("explicitly reject it with a concise, evidence-based reason");
+			expect(guidance).toContain("A final response is not allowed while any actionable accepted note remains unaddressed");
+		});
+
+		it("continues on every advisor severity by default", () => {
+			expect(cfgAdvisorContinueSeverity.default).toBe("nit");
+			expect(cfgAdvisorContinueSeverity.ui?.options).toEqual(
+				expect.arrayContaining([{ value: "nit", label: "Nit", description: "Every note continues the run." }]),
+			);
+		});
+	});
 	describe("advisor system prompt", () => {
 		it("forbids concrete claims about tool arguments hidden from the advisor transcript", () => {
 			const messages = [

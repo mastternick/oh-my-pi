@@ -67,7 +67,7 @@ export const cfgAdvisorContinueSeverity = register({
 	protocolDefault: ["rpc", "acp"],
 	type: "enum",
 	values: ADVISOR_SEVERITIES,
-	default: "concern",
+	default: "nit",
 	ui: {
 		tab: "model",
 		group: "Advisor",
@@ -76,7 +76,7 @@ export const cfgAdvisorContinueSeverity = register({
 			"Minimum severity of an advisor note that wakes the agent after it finished with a final answer. Lower-severity notes stay as a card at the end of the transcript and reach the agent with your next message.",
 		options: [
 			{ value: "nit", label: "Nit", description: "Every note continues the run." },
-			{ value: "concern", label: "Concern", description: "Concerns and blockers continue the run. Default." },
+			{ value: "concern", label: "Concern", description: "Concerns and blockers continue the run." },
 			{ value: "blocker", label: "Blocker", description: "Only blockers continue the run." },
 		],
 		condition: "advisorEnabled",

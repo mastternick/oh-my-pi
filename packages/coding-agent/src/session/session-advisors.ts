@@ -237,10 +237,10 @@ export function planAdvisorUsageLimitWait(args: {
 /**
  * Header prepended to the merged terminal-boundary delivery, sourced from
  * `prompts/advisor/boundary-guidance.md`. The reviewed work has already
- * finished, so notes may be stale or wrong — the primary is told to treat the
- * batch critically and may silently ignore what does not apply. This is the
- * guard against #4840's spurious post-completion tool calls, enforced by
- * prompt rather than channel.
+ * finished, so notes may be stale or wrong — the primary must assess each
+ * note: valid, in-scope notes are applied and verified, while invalid or stale
+ * ones are explicitly rejected with a reason. This is the guard against #4840's
+ * spurious post-completion tool calls, enforced by prompt rather than channel.
  *
  * Shown on the first merged delivery of a session, then at most once every
  * {@link ADVISOR_BOUNDARY_GUIDANCE_TURNS} primary turns: strong guidance, not

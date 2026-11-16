@@ -183,7 +183,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		};
 	}
 
-	/** Completed one-answer session whose advisor raises one `severity` note (default `nit`, below the default continue threshold). */
+	/** Completed one-answer session whose advisor raises one note; tests set an explicit threshold when they need preservation. */
 	async function createCompletedAdvisorSession(
 		opts: {
 			severity?: "nit" | "concern" | "blocker";
@@ -375,7 +375,10 @@ describe("AgentSession advisor auto-resume suppression", () => {
 				await releaseHook.promise;
 			},
 		};
-		const { session, sessionManager, mock } = await createCompletedAdvisorSession({ extensionRunner });
+		const { session, sessionManager, mock } = await createCompletedAdvisorSession({
+			extensionRunner,
+			continueSeverity: "blocker",
+		});
 		const persisted = capturePersistedAdvice(sessionManager);
 
 		expect(session.setAdvisorEnabled(true)).toBe(true);
@@ -413,7 +416,10 @@ describe("AgentSession advisor auto-resume suppression", () => {
 				await releaseHook.promise;
 			},
 		};
-		const { session, mock } = await createCompletedAdvisorSession({ extensionRunner });
+		const { session, mock } = await createCompletedAdvisorSession({
+			extensionRunner,
+			continueSeverity: "blocker",
+		});
 
 		expect(session.setAdvisorEnabled(true)).toBe(true);
 		await session.prompt("answer with exactly one line");
@@ -453,7 +459,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 	);
 
 	it("preserves another late advisor note after an existing advisor card", async () => {
-		const { session, mock } = await createCompletedAdvisorSession();
+		const { session, mock } = await createCompletedAdvisorSession({ continueSeverity: "blocker" });
 
 		await session.prompt("answer with exactly one line");
 		await session.waitForIdle();
@@ -474,7 +480,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 	});
 
 	it("preserves late advice after terminal text with provider metadata blocks", async () => {
-		const { session, mock } = await createCompletedAdvisorSession();
+		const { session, mock } = await createCompletedAdvisorSession({ continueSeverity: "blocker" });
 
 		await session.prompt("answer with exactly one line");
 		await session.waitForIdle();

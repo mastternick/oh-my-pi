@@ -417,7 +417,7 @@ describe("advisor tool-call loop guard", () => {
 	});
 
 	it.each([
-		{ severity: "nit", settings: {} },
+		{ severity: "nit", settings: { "advisor.continueSeverity": "concern" } },
 		{ severity: "concern", settings: { "advisor.continueSeverity": "blocker" } },
 	] as const)(
 		"preserves terminal-boundary notes below advisor.continueSeverity as cards %j",
@@ -587,7 +587,7 @@ describe("advisor tool-call loop guard", () => {
 		expect(merged).toContain("aggregated review from other models");
 	});
 
-	it("steers one continuation turn for a terminal-boundary concern at the default advisor.continueSeverity", async () => {
+	it("steers one continuation turn for a terminal-boundary concern", async () => {
 		// A concern means a material issue in finished work — it deserves one
 		// steering turn, not a silent preserved card; that continuation schedules
 		// no review of its own.
@@ -868,6 +868,7 @@ describe("advisor tool-call loop guard", () => {
 				: finalMock.stream(streamModel, context, options);
 		const settings = Settings.isolated({
 			"advisor.syncBacklog": "strict",
+			"advisor.continueSeverity": "concern",
 			"compaction.enabled": false,
 			"todo.enabled": false,
 		});

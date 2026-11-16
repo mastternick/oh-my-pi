@@ -64,7 +64,7 @@ it.each([
 	},
 	{
 		severity: "nit",
-		continueSeverity: undefined,
+		continueSeverity: "concern",
 		continues: false,
 		continuation: undefined,
 		immuneTurns: undefined,

@@ -1132,7 +1132,7 @@ describe("AgentSession advisor toggle", () => {
 			},
 			streamFn: mock.stream,
 		});
-		const settings = Settings.isolated({ "compaction.enabled": false });
+		const settings = Settings.isolated({ "compaction.enabled": false, "advisor.continueSeverity": "concern" });
 		settings.setModelRole("advisor", `${model.provider}/${model.id}`);
 		const quotaSession = new AgentSession({
 			agent: primaryAgent,

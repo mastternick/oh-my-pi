@@ -390,6 +390,23 @@ function setPinEntry(record: Record<string, unknown>, key: string, value: unknow
 	return true;
 }
 
+/**
+ * Sets `key` of the pinned record `field`. A pin without that record is seeded from `seed` (the effective map
+ * before the write), so the pin keeps the other entries; the record is created only when the write changes it.
+ */
+function setPinRecordEntry(
+	pin: SessionPresetPin,
+	field: "modelRoles" | "fallbackChains" | "compactionModels",
+	key: string,
+	value: unknown,
+	seed: Record<string, unknown> | undefined,
+): boolean {
+	const current = pin[field];
+	if (current !== undefined) return setPinEntry(current, key, value);
+	const record = { ...seed };
+	return setPinEntry(record, key, value) && setPinField(pin, field, record);
+}
+
 /** One instance's own layers, lowest precedence first. */
 interface OwnLayers {
 	global: RawSettings;
@@ -1161,9 +1178,12 @@ export class Settings {
 	 * Applies `mutate` to this session view's snapshot. On change, re-merges and notifies `setting`. Returns whether
 	 * the snapshot changed (false for instances without a snapshot).
 	 */
-	#mutatePin(setting: AnySetting, mutate: (pin: SessionPresetPin) => boolean): boolean {
+	#mutatePin(
+		setting: AnySetting,
+		mutate: (pin: SessionPresetPin) => boolean,
+		prev: unknown = setting.get(this),
+	): boolean {
 		if (!this.#pin) return false;
-		const prev = setting.get(this);
 		if (!mutate(this.#pin)) return false;
 		this.#rebuildMerged();
 		this.#fireIfChanged(setting, prev);
@@ -1449,11 +1469,17 @@ export class Settings {
 		const field = pinFieldOf(setting.segments);
 		if (this.#pin) {
 			// Global entry writes persist through the parent; a pinned record also updates this session's snapshot.
+			// The effective map from before the write seeds a pin that lacks the record, keeping its other entries.
+			const prev = setting.get(this);
 			this.#parent?.writeEntry(setting, key, value);
 			if (
 				field &&
 				field !== "defaultThinkingLevel" &&
-				this.#mutatePin(setting, pin => setPinEntry((pin[field] ??= {}), key, value))
+				this.#mutatePin(
+					setting,
+					pin => setPinRecordEntry(pin, field, key, value, prev as Record<string, unknown> | undefined),
+					prev,
+				)
 			) {
 				this.#onPinWrite?.();
 			}

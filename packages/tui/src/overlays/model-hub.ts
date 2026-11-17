@@ -90,6 +90,7 @@ type RolesRow =
 	| { kind: "fallback"; role: string; chainIndex: number; selector: string }
 	| { kind: "separator" }
 	| { kind: "newFallback" }
+	| { kind: "compaction"; parent: string; model: string; compactor: string | undefined }
 	| { kind: "newRole" };
 
 /**
@@ -100,12 +101,14 @@ type RolesRow =
 type AssignTarget =
 	| { kind: "role"; role: string }
 	| { kind: "fallback"; role: string; index: number | null }
-	| { kind: "fallbackKey" };
+	| { kind: "fallbackKey" }
+	| { kind: "compactor"; model: string };
 
 /** Live preferences and selector operations supplied by the host. */
 export interface ModelHubSource extends ModelBrowserSource {
 	readonly disabledProviders: readonly string[];
 	readonly fallbackChains: Record<string, string[]>;
+	readonly compactionModels: Record<string, string>;
 	readonly modelRoleStorage: "global" | "project";
 	readonly cycleOrder: readonly string[];
 	getProjectModelRole(role: string): string | undefined;
@@ -163,6 +166,11 @@ export interface ModelHubCallbacks {
 	 * `false` reports a refused/failed write (the host has already surfaced it), which a compound trade rolls back.
 	 */
 	onFallbackChainChange?: (role: string, chain: string[]) => void | boolean;
+	/**
+	 * Persist a `compaction.models` entry: `modelSelector` (exact `provider/model-id`) is compacted by `compactor`; an undefined `compactor` clears it so the model compacts itself.
+	 * `false` reports a refused/failed write (the host has already surfaced it).
+	 */
+	onCompactionModelChange?: (modelSelector: string, compactor: string | undefined) => void | boolean;
 	/** Locked provider activation: forward to the /login flow. */
 	onLoginRequest?: (providerId: string) => void;
 	/** Returns the rebuilt `--models` scope for the hub to list; `undefined` keeps the current one. */
@@ -284,6 +292,7 @@ type RolesAction =
 	| "new"
 	| "thinking"
 	| "compaction"
+	| "compactor"
 	| "save"
 	| "nextPreset"
 	| "prevPreset";
@@ -296,6 +305,7 @@ const ROLES_ACTION_KEYS: Record<string, RolesAction> = {
 	n: "new",
 	t: "thinking",
 	k: "compaction",
+	m: "compactor",
 	s: "save",
 	// Letter twins of ctrl+←/→, which macOS reserves for switching Spaces.
 	p: "nextPreset",
@@ -373,6 +383,8 @@ function rolesRowKey(row: RolesRow, index: number): string {
 			return `chain:${row.role}`;
 		case "fallback":
 			return `fallback:${row.role}:${row.chainIndex}`;
+		case "compaction":
+			return `compaction:${row.parent}:${row.model}`;
 		case "separator":
 			return `sep:${index}`;
 		case "newRole":
@@ -937,12 +949,26 @@ export class ModelHubComponent implements Component {
 	#buildRolesRows(): void {
 		const rows: RolesRow[] = [];
 		const chains = this.#fallbackChains();
+		// Each role or fallback row whose model resolves gets a compaction sub-row beneath it.
+		const addRow = (row: RolesRow): void => {
+			rows.push(row);
+			const model = this.#compactionSubject(row);
+			if (model) {
+				const parent = rolesRowKey(row, rows.length - 1);
+				rows.push({
+					kind: "compaction",
+					parent,
+					model,
+					compactor: this.#settings.compactionModels[model] || undefined,
+				});
+			}
+		};
 		const appendRoles = (roles: ReadonlyArray<string>): void => {
 			for (const role of roles) {
-				rows.push({ kind: "role", role });
+				addRow({ kind: "role", role });
 				const chain = chains[role] ?? [];
 				for (let i = 0; i < chain.length; i++) {
-					rows.push({ kind: "fallback", role, chainIndex: i, selector: chain[i] });
+					addRow({ kind: "fallback", role, chainIndex: i, selector: chain[i] });
 				}
 			}
 		};
@@ -965,7 +991,7 @@ export class ModelHubComponent implements Component {
 			const chain = chains[key] ?? [];
 			rows.push({ kind: "chainKey", role: key });
 			for (let i = 0; i < chain.length; i++) {
-				rows.push({ kind: "fallback", role: key, chainIndex: i, selector: chain[i] });
+				addRow({ kind: "fallback", role: key, chainIndex: i, selector: chain[i] });
 			}
 		}
 		rows.push({ kind: "newFallback" });
@@ -978,10 +1004,22 @@ export class ModelHubComponent implements Component {
 	 */
 	#allRolesRowCount(): number {
 		const chains = this.#fallbackChains();
-		// "New role…" and "New fallback chain…", then each role and model chain with its fallback entries.
+		const rowCount = (row: RolesRow): number => (this.#compactionSubject(row) ? 2 : 1);
+		// "New role…" and "New fallback chain…", then each role and model chain with its fallback entries (plus compaction sub-rows).
 		let count = 2;
-		for (const role of this.#visibleRoleIds()) count += 1 + (chains[role]?.length ?? 0);
-		for (const key in chains) if (key.includes("/")) count += 1 + chains[key].length;
+		for (const role of this.#visibleRoleIds()) {
+			count += rowCount({ kind: "role", role });
+			for (const [chainIndex, selector] of (chains[role] ?? []).entries()) {
+				count += rowCount({ kind: "fallback", role, chainIndex, selector });
+			}
+		}
+		for (const key in chains) {
+			if (!key.includes("/")) continue;
+			count += 1;
+			for (const [chainIndex, selector] of chains[key].entries()) {
+				count += rowCount({ kind: "fallback", role: key, chainIndex, selector });
+			}
+		}
 		return count;
 	}
 
@@ -1234,6 +1272,8 @@ export class ModelHubComponent implements Component {
 				this.#assignRole(item, target.role, true);
 			} else if (target.kind === "fallbackKey") {
 				this.#openFallbackKeyStrip(item);
+			} else if (target.kind === "compactor") {
+				this.#commitCompactor(item, target.model);
 			} else {
 				this.#commitFallback(item, target);
 			}
@@ -1765,6 +1805,42 @@ export class ModelHubComponent implements Component {
 		if (rowIndex >= 0) this.#roleIndex = rowIndex;
 	}
 
+	/** `provider/id` of the model a Roles row runs; a compaction row is keyed by its own model. */
+	#compactionSubject(row: RolesRow | undefined): string | undefined {
+		if (row?.kind === "compaction") return row.model;
+		let model: Model | undefined;
+		if (row?.kind === "role") model = this.#roles[row.role]?.model;
+		else if (row?.kind === "fallback") model = this.#resolveFallbackEntry(row.role, row.chainIndex)?.item.model;
+		return model ? `${model.provider}/${model.id}` : undefined;
+	}
+
+	/** Persist one `compaction.models` entry; an undefined compactor clears it so the model compacts itself. */
+	#setCompactionModel(model: string, compactor: string | undefined): void {
+		this.#callbacks.onCompactionModelChange?.(model, compactor);
+		this.#refreshAfterMutation();
+	}
+
+	/** Browse the catalog for the model that compacts `model`, preselecting its current compactor. */
+	#startAssignCompactor(model: string): void {
+		this.#assigning = { kind: "compactor", model };
+		this.#focus = "list";
+		this.#browser.setShowProvider(true);
+		this.#setCandidateItems(this.#availableItems);
+		this.#browser.setQuery("");
+		const compactor = this.#settings.compactionModels[model];
+		if (compactor) this.#browser.selectSelector(compactor);
+	}
+
+	/** Second step of the compactor picker: picking the model itself clears its entry. */
+	#commitCompactor(item: ModelBrowserItem, model: string): void {
+		this.#setCompactionModel(model, item.selector === model ? undefined : item.selector);
+		this.#browser.setQuery("");
+		this.#setActiveEntry("roles");
+		this.#focus = "list";
+		const rowIndex = this.#rolesRows.findIndex(row => row.kind === "compaction" && row.model === model);
+		if (rowIndex >= 0) this.#roleIndex = rowIndex;
+	}
+
 	/** Persist `role`'s chain through the host callback and rebuild dependent state. */
 	#setFallbackChain(role: string, chain: string[]): void {
 		this.#callbacks.onFallbackChainChange?.(role, chain);
@@ -1795,7 +1871,11 @@ export class ModelHubComponent implements Component {
 		if (row.chainIndex >= chain.length || target < 0 || target >= chain.length) return;
 		[chain[row.chainIndex], chain[target]] = [chain[target], chain[row.chainIndex]];
 		this.#setFallbackChain(row.role, chain);
-		this.#roleIndex += delta;
+		// Compaction sub-rows sit between fallback rows, so follow the moved entry by key, not by offset.
+		const index = this.#rolesRows.findIndex(
+			r => r.kind === "fallback" && r.role === row.role && r.chainIndex === target,
+		);
+		if (index >= 0) this.#roleIndex = index;
 	}
 
 	/** Whether `role` has an explicit primary to trade with; an auto-selected primary has no selector to demote. */
@@ -2360,6 +2440,9 @@ export class ModelHubComponent implements Component {
 			case "newFallback":
 				this.#startAssignFallbackKey();
 				return;
+			case "compaction":
+				this.#startAssignCompactor(row.model);
+				return;
 			case "newRole":
 				this.#openNameStrip("role");
 				return;
@@ -2458,13 +2541,19 @@ export class ModelHubComponent implements Component {
 				if (role) this.#unassignRole(role);
 				else if (row?.kind === "fallback") this.#removeFallback(row);
 				else if (row?.kind === "chainKey") this.#setFallbackChain(row.role, []);
+				else if (row?.kind === "compaction" && row.compactor) this.#setCompactionModel(row.model, undefined);
 				return;
 			case "fallback":
 				if (row?.kind === "newFallback") this.#startAssignFallbackKey();
-				else if (row && row.kind !== "newRole" && row.kind !== "separator") {
+				else if (row && row.kind !== "newRole" && row.kind !== "separator" && row.kind !== "compaction") {
 					this.#startAssignFallback(row.role, null);
 				}
 				return;
+			case "compactor": {
+				const subject = this.#compactionSubject(row);
+				if (subject) this.#startAssignCompactor(subject);
+				return;
+			}
 			case "cycle":
 				if (role) this.#toggleCycleMembership(role);
 				return;
@@ -2729,6 +2818,15 @@ export class ModelHubComponent implements Component {
 					width,
 				);
 			}
+			if (this.#assigning.kind === "compactor") {
+				return truncateToWidth(
+					theme.fg(
+						"accent",
+						` Compaction model for ${this.#assigning.model} — ${enter} picks it, ${cancel} cancels`,
+					),
+					width,
+				);
+			}
 			const info = this.#settings.getRoleInfo(this.#assigning.role);
 			const label = info.tag ?? info.name ?? this.#assigning.role;
 			if (this.#assigning.kind === "fallback") {
@@ -2848,6 +2946,15 @@ export class ModelHubComponent implements Component {
 				const branch = theme.fg("dim", `${"".padEnd(tagWidth + 3)}↳`);
 				const selector = selected ? theme.fg("accent", rowDef.selector) : theme.fg("muted", rowDef.selector);
 				let line = ` ${cursor} ${branch} ${selector}`;
+				line = this.#finishRolesRow(line, width, hovered);
+				lines.push(line);
+				continue;
+			}
+
+			if (rowDef.kind === "compaction") {
+				const branch = theme.fg("dim", `${"".padEnd(tagWidth + 3)}↳`);
+				const label = theme.fg("dim", `compaction: ${rowDef.compactor ?? "(itself)"}`);
+				let line = ` ${cursor} ${branch} ${label}`;
 				line = this.#finishRolesRow(line, width, hovered);
 				lines.push(line);
 				continue;
@@ -3024,13 +3131,17 @@ export class ModelHubComponent implements Component {
 				this.#callbacks.onCompactionPointChange && this.#roleRowModel()
 					? ` · ${formatKeyHint("k")} compaction limit`
 					: "";
+			const compactor = this.#compactionSubject(row) ? ` · ${formatKeyHint("m")} compactor` : "";
+			if (row?.kind === "compaction") {
+				return `${upDown} rows · ${enter} pick compactor · ${formatKeyHint("x")} use itself · ${left} providers`;
+			}
 			if (row?.kind === "fallback") {
 				// Advertise `t` only when the entry resolves: wildcards always
 				// inherit and unknown models have no ladder to offer, so the
 				// action would be inert there.
 				const editable = this.#resolveFallbackEntry(row.role, row.chainIndex) !== undefined;
 				const thinking = editable ? ` · ${formatKeyHint("t")} thinking` : "";
-				return `${upDown} rows · ${enter} replace · ${formatKeyHint("f")} add another · ${formatKeyHint("x")} remove${thinking}${compaction}${this.#reorderFooterHint(row)} · ${left} providers`;
+				return `${upDown} rows · ${enter} replace · ${formatKeyHint("f")} add another · ${formatKeyHint("x")} remove${thinking}${compaction}${compactor}${this.#reorderFooterHint(row)} · ${left} providers`;
 			}
 			if (row?.kind === "chainKey") {
 				return `${upDown} rows · ${formatKeyHints(["enter", "f"])} add fallback · ${formatKeyHint("x")} clear chain · ${left} providers`;
@@ -3044,7 +3155,7 @@ export class ModelHubComponent implements Component {
 			const thinking = editable ? ` · ${formatKeyHint("t")} thinking` : "";
 			const savePreset = this.#callbacks.onSavePreset ? ` · ${formatKeyHint("s")} save preset` : "";
 			const switchPreset = this.#presets().names.length > 0 ? ` · ${formatKeyHints(["p", "shift+p"])} preset` : "";
-			return `${upDown} rows · ${enter} pick · ${formatKeyHint("f")} fallback · ${formatKeyHint("x")} clear${thinking}${compaction} · ${formatKeyHint("c")} cycle${this.#reorderFooterHint(row)} · ${formatKeyHints(["shift+up", "shift+down"])} cycle order · ${formatKeyHint("n")} new${savePreset}${switchPreset}`;
+			return `${upDown} rows · ${enter} pick · ${formatKeyHint("f")} fallback · ${formatKeyHint("x")} clear${thinking}${compaction}${compactor} · ${formatKeyHint("c")} cycle${this.#reorderFooterHint(row)} · ${formatKeyHints(["shift+up", "shift+down"])} cycle order · ${formatKeyHint("n")} new${savePreset}${switchPreset}`;
 		}
 		if (entry.kind === "provider" && entry.locked) {
 			return entry.oauth
@@ -3271,6 +3382,8 @@ export class ModelHubComponent implements Component {
 		if (assigning !== null) {
 			if (assigning.kind === "fallbackKey") {
 				spans = [span("New fallback chain — pick the model it protects", "accent")];
+			} else if (assigning.kind === "compactor") {
+				spans = [span(`Compaction model for ${assigning.model}`, "accent")];
 			} else {
 				const info = this.#settings.getRoleInfo(assigning.role);
 				const label = info.tag ?? info.name ?? assigning.role;
@@ -3383,6 +3496,19 @@ export class ModelHubComponent implements Component {
 			}
 			case "fallback":
 				return node("item", { label: [span("  ↳ ", "dim"), span(rowDef.selector, "muted")] }, undefined, key);
+			case "compaction":
+				return node(
+					"item",
+					{
+						label: [
+							span("  ↳ ", "dim"),
+							span("compaction: ", "dim"),
+							span(rowDef.compactor ?? "(itself)", "dim"),
+						],
+					},
+					undefined,
+					key,
+				);
 			case "role":
 				break;
 		}
@@ -3599,6 +3725,7 @@ export class ModelHubComponent implements Component {
 		const assigning = this.#assigning;
 		if (assigning !== null) {
 			if (assigning.kind === "fallbackKey") return "New fallback chain — pick the model it protects";
+			if (assigning.kind === "compactor") return `Compaction model for ${assigning.model}`;
 			const info = this.#settings.getRoleInfo(assigning.role);
 			const label = info.tag ?? info.name ?? assigning.role;
 			const verb =
@@ -3796,6 +3923,7 @@ export class ModelHubComponent implements Component {
 						this.#primarySwapTarget(row.role) ? roleAction("lower", "Swap with fallback", "f2") : undefined,
 						this.#roleThinkingTarget(row.role) ? roleAction("thinking", "Thinking", "t") : undefined,
 						compaction,
+						this.#compactionSubject(row) ? roleAction("compactor", "Compaction model", "m") : undefined,
 						roleAction("cycle", this.#cycleOrder().includes(row.role) ? "Leave cycle" : "Add to cycle", "c"),
 						roleAction("new", "New role", "n"),
 						this.#callbacks.onSavePreset ? roleAction("save", "Save preset", "s") : undefined,
@@ -3812,8 +3940,15 @@ export class ModelHubComponent implements Component {
 							? roleAction("thinking", "Thinking", "t")
 							: undefined,
 						compaction,
+						this.#compactionSubject(row) ? roleAction("compactor", "Compaction model", "m") : undefined,
 						raise ? roleAction("raise", raise === "promote" ? "Promote" : "Raise", "f1") : undefined,
 						lower ? roleAction("lower", "Lower", "f2") : undefined,
+					);
+					break;
+				case "compaction":
+					actions.push(
+						roleAction("pick", "Pick compaction model", "enter", true),
+						roleAction("clear", "Use itself", "x"),
 					);
 					break;
 				case "chainKey":
@@ -3933,6 +4068,9 @@ export class ModelHubComponent implements Component {
 					return;
 				case "fallback":
 					items.push({ id, label: row.selector, mono: true, depth: 1, detail: `fallback ${row.chainIndex + 1}` });
+					return;
+				case "compaction":
+					items.push({ id, label: row.compactor ?? "(itself)", mono: true, depth: 1, detail: "compaction" });
 					return;
 				case "role":
 					break;
@@ -4358,6 +4496,15 @@ export class ModelHubComponent implements Component {
 			const lower = row ? this.#lowerLabel(row) : undefined;
 			const compaction =
 				this.#callbacks.onCompactionPointChange && this.#roleRowModel() ? keys("compaction limit", "k") : undefined;
+			const compactor = this.#compactionSubject(row) ? keys("compactor", "m") : undefined;
+			if (row?.kind === "compaction") {
+				return [
+					upDown("rows"),
+					keys("pick compactor", "enter"),
+					keys("use itself", "x"),
+					keys("providers", "left"),
+				];
+			}
 			if (row?.kind === "fallback") {
 				// Advertise `t` only where a strip would open, as the ANSI footer does.
 				const editable = this.#resolveFallbackEntry(row.role, row.chainIndex) !== undefined;
@@ -4368,6 +4515,7 @@ export class ModelHubComponent implements Component {
 					keys("remove", "x"),
 					editable ? keys("thinking", "t") : undefined,
 					compaction,
+					compactor,
 					raise ? keys(raise, "f1") : undefined,
 					lower ? keys(lower, "f2") : undefined,
 					keys("providers", "left"),
@@ -4392,6 +4540,7 @@ export class ModelHubComponent implements Component {
 				keys("clear", "x"),
 				editable ? keys("thinking", "t") : undefined,
 				compaction,
+				compactor,
 				keys("cycle", "c"),
 				lower ? keys(lower, "f2") : undefined,
 				keys("cycle order", "shift+up", "shift+down"),

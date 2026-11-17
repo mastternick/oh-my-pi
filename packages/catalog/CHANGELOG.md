@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `gpt-6.2-astra` and `gpt-6.2-sol` not appearing in `openai-codex` discovery: the Codex client version pin is now 0.169.1 (latest `@openai/codex` on npm), above the 0.166.0 the backend lists those rows behind.
+
 ## [18.20.0] - 2026-11-12
 
 ### Added

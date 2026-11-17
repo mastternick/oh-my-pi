@@ -136,7 +136,7 @@ import { renderUsageReports } from "./command-controller";
 import type { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 
 import { cfgAdvisorSyncBacklog } from "../../advisor/settings";
-import { cfgBranchSummaryEnabled } from "../../session/context-settings";
+import { cfgBranchSummaryEnabled, cfgCompactionModels } from "../../session/context-settings";
 import { cfgCycleOrder, cfgDisabledProviders, cfgModelRoleStorage } from "../../config/model-settings";
 import { cfgDefaultThinkingLevel, cfgRetryFallbackChains, cfgSessionWorktreeScope } from "../../session/settings";
 import {
@@ -1130,6 +1130,18 @@ export class SelectorController {
 							chain.length > 0
 								? `${roleInfo?.tag ?? roleInfo?.name ?? role} fallbacks: ${chain.join(" → ")}`
 								: `${roleInfo?.tag ?? roleInfo?.name ?? role} fallbacks cleared`,
+						);
+						return true;
+					} catch (error) {
+						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						return false;
+					}
+				},
+				onCompactionModelChange: (model, compactor) => {
+					try {
+						cfgCompactionModels.setEntry(this.ctx.settings, model, compactor);
+						this.ctx.showStatus(
+							compactor ? `Compaction for ${model}: ${compactor}` : `Compaction for ${model} uses itself`,
 						);
 						return true;
 					} catch (error) {

@@ -227,6 +227,7 @@ override matching model tags. These fields do not configure the Anthropic Messag
 ### Compaction options
 
 - `compaction.models` (setting, default `{}`) — maps an exact active model selector (`provider/id`) to the model that writes its compaction summaries. Compaction tries the mapped model first, then the session model; an unmapped model compacts with the session model alone. It does not switch the active conversation model. Model presets carry the same map as `compactionModels`. The per-model `compactionModel` field is ignored for compaction.
+- In `/models`, the Roles view lists each role and fallback model with a `↳ compaction:` row: `m` picks the compacting model for it, and `x` on that row restores `(itself)`. Each edit writes its one `compaction.models[provider/id]` entry through the same path as `retry.fallbackChains` edits, and pins it into the current session so `s` saves it as the preset's `compactionModels`. The first edit under a preset without mappings starts from the effective map, so its other mappings carry over.
 - `remoteCompaction` (provider level or per model) — opts eligible models into provider-native compaction. Supported keys: `enabled`, `api`, `endpoint`, `model`, `v2StreamingEnabled`, `v2Endpoint`, `streamingEndpoint`. Provider-level settings are the baseline; per-model keys override them.
 
 ### Allowed provider/model `api` values

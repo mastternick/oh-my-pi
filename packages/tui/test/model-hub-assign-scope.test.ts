@@ -48,6 +48,7 @@ function createSource(): ModelHubSource {
 		revision: 0,
 		disabledProviders: [],
 		fallbackChains: {},
+		compactionModels: {},
 		modelRoleStorage: "global",
 		cycleOrder: [],
 		getProjectModelRole: () => undefined,

@@ -241,6 +241,46 @@ describe("model presets", () => {
 		expect(saved.kind === "found" && "compactionModels" in saved.preset).toBe(false);
 	});
 
+	it("a session pinned to a preset without compactionModels seeds its first map edit from the config map", () => {
+		const config = { "fakeprov/a": "fakeprov/l", "fakeprov/b": "fakeprov/l" };
+		const root = Settings.isolated({ "compaction.models": config });
+		const view = root.sessionView({ modelRoles: {}, fallbackChains: {} });
+		cfgCompactionModels.setEntry(view, "fakeprov/c", "fakeprov/x");
+		const expected = { ...config, "fakeprov/c": "fakeprov/x" };
+		expect(cfgCompactionModels.get(view)).toEqual(expected);
+		expect(view.sessionPin()?.compactionModels).toEqual(expected);
+
+		saveModelPreset(view, "seeded");
+		const saved = getModelPreset(view, "seeded");
+		expect(saved.kind === "found" && saved.preset.compactionModels).toEqual(expected);
+	});
+
+	it("a no-op clear on a session pinned without compactionModels leaves the pin unset and the config map in force", () => {
+		const config = { "fakeprov/a": "fakeprov/l", "fakeprov/b": "fakeprov/l" };
+		const root = Settings.isolated({ "compaction.models": config });
+		const view = root.sessionView({ modelRoles: {}, fallbackChains: {} });
+		cfgCompactionModels.setEntry(view, "fakeprov/unmapped", undefined);
+		expect(view.sessionPin()?.compactionModels).toBeUndefined();
+		expect(cfgCompactionModels.get(view)).toEqual(config);
+
+		// A later config write shows through the view: the pin never froze the map.
+		cfgCompactionModels.setEntry(root, "fakeprov/c", "fakeprov/x");
+		expect(cfgCompactionModels.get(view)).toEqual({ ...config, "fakeprov/c": "fakeprov/x" });
+	});
+
+	it("clearing one entry of a session's pinned compaction map keeps the rest of the pin", () => {
+		const root = Settings.isolated({ "compaction.models": { "fakeprov/a": "fakeprov/l" } });
+		const view = root.sessionView({
+			modelRoles: {},
+			fallbackChains: {},
+			compactionModels: { "fakeprov/a": "fakeprov/l" },
+		});
+		cfgCompactionModels.setEntry(view, "fakeprov/c", "fakeprov/x");
+		cfgCompactionModels.setEntry(view, "fakeprov/a", undefined);
+		expect(view.sessionPin()?.compactionModels).toEqual({ "fakeprov/c": "fakeprov/x" });
+		expect(cfgCompactionModels.get(view)).toEqual({ "fakeprov/c": "fakeprov/x" });
+	});
+
 	it("an explicit selector level on the preset's default beats its defaultThinkingLevel", async () => {
 		const settings = Settings.isolated();
 		cfgModelPresets.setEntry(settings, "deep", {

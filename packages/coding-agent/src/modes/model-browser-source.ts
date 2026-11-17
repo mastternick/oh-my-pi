@@ -13,6 +13,7 @@ import {
 	cfgModelProviderOrder,
 	cfgModelRoleStorage,
 } from "../config/model-settings";
+import { cfgCompactionModels } from "../session/context-settings";
 import {
 	cfgDefaultThinkingLevel,
 	cfgRetryFallbackChains,
@@ -71,6 +72,9 @@ export function createModelBrowserSource(
 		},
 		get fallbackChains() {
 			return cfgRetryFallbackChains.get(settings);
+		},
+		get compactionModels() {
+			return cfgCompactionModels.get(settings);
 		},
 		get modelRoleStorage() {
 			return cfgModelRoleStorage.get(settings);

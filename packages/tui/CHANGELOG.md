@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a Roles-view compaction sub-row under each role and fallback model (`↳ compaction: <selector>`, or `(itself)`), with `m` to pick its compactor and `x` to clear it, through the new `ModelHubSource.compactionModels` and `ModelHubCallbacks.onCompactionModelChange` hooks.
+
 ## [18.20.0] - 2026-11-12
 
 ### Added

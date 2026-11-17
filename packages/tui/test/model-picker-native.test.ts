@@ -62,6 +62,7 @@ function source(roles: Record<string, string>, mru: string[]): ModelHubSource {
 		getModelRole: role => roles[role],
 		disabledProviders: [],
 		fallbackChains: { default: ["openai/gpt-5.6"] },
+		compactionModels: {},
 		modelRoleStorage: "global",
 		cycleOrder: [],
 		getProjectModelRole: () => undefined,

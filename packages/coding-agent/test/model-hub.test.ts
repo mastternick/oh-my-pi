@@ -22,6 +22,7 @@ import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 import type { TUI } from "@oh-my-pi/pi-tui";
 
 import { cfgCycleOrder, cfgModelPresets } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import { cfgCompactionModels } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import { cfgRetryFallbackChains } from "@oh-my-pi/pi-coding-agent/session/settings";
 
 function normalize(lines: readonly string[]): string {
@@ -105,6 +106,7 @@ interface HubHarness {
 	onLoginRequest: ReturnType<typeof vi.fn>;
 	onCancel: ReturnType<typeof vi.fn>;
 	onFallbackChainChange: Mock<(role: string, chain: string[]) => void>;
+	onCompactionModelChange: Mock<(model: string, compactor: string | undefined) => void>;
 	/** The component's repaint request, to assert a closed hub stays silent. */
 	requestRender: ReturnType<typeof vi.fn>;
 }
@@ -140,6 +142,10 @@ function createHub(options: {
 		}
 		cfgRetryFallbackChains.override(settings, chains);
 	});
+	// The host callback (selector-controller) is the same single-entry write: an undefined compactor clears it.
+	const onCompactionModelChange = vi.fn((model: string, compactor: string | undefined) => {
+		cfgCompactionModels.setEntry(settings, model, compactor);
+	});
 	const hub = new ModelHubComponent(
 		ui,
 		createModelBrowserSource(settings),
@@ -153,12 +159,22 @@ function createHub(options: {
 			onSavePreset: options.callbacks?.onSavePreset,
 			onSwitchPreset: options.callbacks?.onSwitchPreset,
 			onFallbackChainChange: options.callbacks?.onFallbackChainChange ?? onFallbackChainChange,
+			onCompactionModelChange: options.callbacks?.onCompactionModelChange ?? onCompactionModelChange,
 			onCancel: options.callbacks?.onCancel ?? onCancel,
 		},
 		options.hub,
 	);
 	openHubs.push(hub);
-	return { hub, onAssign, onUnassign, onLoginRequest, onCancel, onFallbackChainChange, requestRender };
+	return {
+		hub,
+		onAssign,
+		onUnassign,
+		onLoginRequest,
+		onCancel,
+		onFallbackChainChange,
+		onCompactionModelChange,
+		requestRender,
+	};
 }
 
 const DOWN = "\x1b[B";
@@ -1186,6 +1202,93 @@ describe("ModelHub", () => {
 		});
 	});
 
+	describe("compaction models in the roles view", () => {
+		/** Hop to the Roles sidebar entry and dive into its rows. */
+		function enterRolesView(hub: ModelHubComponent): void {
+			hub.handleInput(UP); // All models → Roles
+			hub.handleInput("\n"); // dive into the rows
+		}
+
+		test("shows '(itself)' under a role and the mapped compactor under a fallback", () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const settings = Settings.isolated({
+				modelRoles: { default: "test/model-a" },
+				"retry.fallbackChains": { default: ["test/model-b"] },
+				"compaction.models": { "test/model-b": "test/model-a" },
+			});
+			const { hub } = createHub({ models: [a, b], scoped: true, settings });
+
+			enterRolesView(hub);
+			const rendered = normalize(hub.render(220));
+			expect(rendered).toContain("↳ compaction: (itself)");
+			expect(rendered).toContain("↳ compaction: test/model-a");
+		});
+
+		test("m on a fallback row opens the compactor picker and Enter writes its mapping", () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const settings = Settings.isolated({
+				"retry.fallbackChains": { default: ["test/model-b"] },
+			});
+			const { hub, onCompactionModelChange, onFallbackChainChange } = createHub({
+				models: [a, b],
+				scoped: true,
+				settings,
+			});
+
+			enterRolesView(hub);
+			hub.handleInput(DOWN); // role row → its fallback row (test/model-b)
+			hub.handleInput("m");
+			expect(normalize(hub.render(220))).toContain("Compaction model for test/model-b");
+
+			// focus already starts on the first model (model-a)
+			hub.handleInput("\n");
+			expect(onCompactionModelChange).toHaveBeenCalledWith("test/model-b", "test/model-a");
+			expect(onFallbackChainChange).not.toHaveBeenCalled();
+			expect(cfgCompactionModels.get(settings)).toEqual({ "test/model-b": "test/model-a" });
+			expect(normalize(hub.render(220))).toContain("↳ compaction: test/model-a");
+		});
+
+		test("x on a compaction row clears the mapping so the model compacts itself", () => {
+			const a = makeModel("test", "model-a");
+			const settings = Settings.isolated({ modelRoles: { default: "test/model-a" } });
+			cfgCompactionModels.set(settings, { "test/model-a": "test/model-a" });
+			const { hub, onCompactionModelChange } = createHub({ models: [a], scoped: true, settings });
+
+			enterRolesView(hub);
+			hub.handleInput(DOWN); // role row → its compaction sub-row
+			hub.handleInput("x");
+
+			expect(onCompactionModelChange).toHaveBeenCalledWith("test/model-a", undefined);
+			expect(cfgCompactionModels.get(settings)).toEqual({});
+			expect(normalize(hub.render(220))).toContain("↳ compaction: (itself)");
+		});
+
+		test("a model used by several rows shows a compaction row under each, all backed by one mapping", () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const settings = Settings.isolated({
+				modelRoles: { default: "test/model-a" },
+				"retry.fallbackChains": { default: ["test/model-a"] },
+			});
+			cfgCompactionModels.set(settings, { "test/model-a": "test/model-b" });
+			const { hub, onCompactionModelChange } = createHub({ models: [a, b], scoped: true, settings });
+
+			enterRolesView(hub);
+			// default's role row, its fallback entry, and JUDGE (auto → model-a) each carry a compaction row for model-a
+			expect(normalize(hub.render(220)).split("↳ compaction: test/model-b").length - 1).toBe(3);
+
+			hub.handleInput(DOWN); // default's role row → its compaction sub-row
+			hub.handleInput("x");
+			expect(onCompactionModelChange).toHaveBeenCalledTimes(1);
+			expect(onCompactionModelChange).toHaveBeenCalledWith("test/model-a", undefined);
+			expect(cfgCompactionModels.get(settings)).toEqual({});
+			expect(normalize(hub.render(220))).not.toContain("↳ compaction: test/model-b");
+			expect(normalize(hub.render(220)).split("↳ compaction: (itself)").length - 1).toBe(3);
+		});
+	});
+
 	describe("fallback chains in the roles view", () => {
 		/** Hop to the Roles sidebar entry and dive into its rows. */
 		function enterRolesView(hub: ModelHubComponent): void {
@@ -1271,7 +1374,8 @@ describe("ModelHub", () => {
 			const { hub, onFallbackChainChange } = createHub({ models: [a, b, c], scoped: true, settings });
 
 			enterRolesView(hub);
-			hub.handleInput(DOWN);
+			hub.handleInput(DOWN); // first chain entry (model-a)
+			hub.handleInput(DOWN); // model-a's compaction sub-row
 			hub.handleInput(DOWN); // second chain entry (model-b)
 			hub.handleInput(F1);
 			expect(onFallbackChainChange).toHaveBeenLastCalledWith("default", [
@@ -1495,7 +1599,9 @@ describe("ModelHub", () => {
 			expect(onAssign).not.toHaveBeenCalled();
 
 			// Raw chain editing still reorders the out-of-scope entry's neighbours.
+			hub.handleInput(DOWN); // smol's compaction sub-row
 			hub.handleInput(DOWN); // model-outside
+			hub.handleInput(DOWN); // model-outside's compaction sub-row
 			hub.handleInput(DOWN); // model-b
 			hub.handleInput(SHIFT_UP);
 			expect(onFallbackChainChange).toHaveBeenCalledWith("smol", ["test/model-b", "test/model-outside"]);
@@ -1528,8 +1634,10 @@ describe("ModelHub", () => {
 
 			enterRolesView(hub);
 			hub.handleInput(F1); // primary: nothing above it
+			hub.handleInput(DOWN); // role row → primary's compaction sub-row
 			hub.handleInput(DOWN); // model-b
 			hub.handleInput(SHIFT_UP); // plain neighbour move: nothing above model-b
+			hub.handleInput(DOWN); // model-b's compaction sub-row
 			hub.handleInput(DOWN); // model-c, the last entry
 			hub.handleInput(F2); // nothing below it
 			expect(onAssign).not.toHaveBeenCalled();

@@ -1762,7 +1762,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 				if (!stallTracker) return;
 				// A tool still running or owner async work pending means the answer judges evidence that moved on. Hold it;
 				// flushHeldVerdict applies it once they finish. A non-repeat result stales it by epoch, so it is then ignored.
-				if (activeTools.size > 0 || activeSession?.wakeSources !== undefined) heldVerdict = { token: suspicion.token, answer };
+				if (activeTools.size > 0 || activeSession?.wakeSources !== undefined)
+					heldVerdict = { token: suspicion.token, answer };
 				else applyStallDecision(stallTracker.resolveSuspicion(suspicion.token, answer));
 			});
 	};

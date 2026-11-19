@@ -12785,7 +12785,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// One pin is captured before any await and used for both the resolved default and the new session's snapshot,
 		// so a project default changed by a hook or another session during the transition cannot split the two.
 		const nextPin = this.settings.isSessionView ? this.settings.projectSessionPin() : undefined;
-		const nextDefault = nextPin ? resolveSessionDefault(this, nextPin) : undefined;
+		// A baseline that names no `default` role configures no project default, so there is
+		// nothing to resolve: an unavailable credential must not abort the switch, and the
+		// pin still carries through to the new session unchanged.
+		const nextDefault =
+			nextPin && Object.hasOwn(nextPin.modelRoles, "default") ? resolveSessionDefault(this, nextPin) : undefined;
 		if (typeof nextDefault === "string") {
 			throw new Error(`New session not started: project default model unavailable (${nextDefault})`);
 		}

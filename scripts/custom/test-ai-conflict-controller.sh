@@ -65,6 +65,16 @@ if [[ "$mode" == "review" && "${FAKE_ADVANCE:-0}" == "1" ]]; then
   git -C "$adv/repo" push -q origin custom
 fi
 
+# A sync branch published while this run resolves (the pre-push guard must still refuse it).
+if [[ "$mode" == "review" && -n "${FAKE_PUBLISH_SYNC:-}" ]]; then
+  adv="$(mktemp -d "$fake/sync.XXXXXX")"
+  git clone -q "$FAKE_ORIGIN" "$adv/repo"
+  git -C "$adv/repo" checkout -q custom
+  printf 'someone else resolution\n' >"$adv/repo/shared.txt"
+  git -C "$adv/repo" commit -qam 'concurrent sync branch'
+  git -C "$adv/repo" push -q origin "HEAD:refs/heads/$FAKE_PUBLISH_SYNC"
+fi
+
 # The plan a real adapter derives from each merged marker file: one region per conflict
 # block, one whole-file region when git left no block (modify/delete).
 region_count() { # jq filter over .merged
@@ -179,14 +189,18 @@ emit_resolve() { # variant
 }
 
 emit_review() { # verdict [selector: path | "all"]
-  local verdict="$1" sel="${2:-}" first paths wire_verdict="$1" severity="error"
-  if [[ "$verdict" == "rejected-warning" ]]; then wire_verdict="rejected"; severity="warning"; fi
+  local verdict="$1" sel="${2:-}" first paths wire_verdict="$1" severity="error" with_findings=1
+  case "$verdict" in
+    accepted) with_findings=0 ;;
+    rejected-warning) wire_verdict="rejected"; severity="warning" ;;
+    accepted-error) wire_verdict="accepted" ;;
+  esac
   first="$(jq -r '.conflicts[0].path // ""' <<<"$input")"
   [[ -n "$sel" ]] || sel="$first"
   paths="$(jq -c '[.conflicts[].path]' <<<"$input")"
   name="OMP — Upstream Conflict Review — $job"
   jq -cn --arg job "$job" --arg name "$name" --arg sel "$sel" --arg verdict "$wire_verdict" \
-    --arg severity "$severity" --argjson paths "$paths" '
+    --arg severity "$severity" --argjson paths "$paths" --argjson with_findings "$with_findings" '
     {ok: true, mode: "review", jobKey: $job,
      model: {provider: "opencode-go", id: "deepseek-v4.1-flash"},
      session: {id: ("review-" + $job), name: $name},
@@ -195,7 +209,7 @@ emit_review() { # verdict [selector: path | "all"]
              assistantMessages: 1, toolCalls: 0, toolsExposed: 0,
              retryRecoveries: []},
      verdict: $verdict,
-     findings: (if $verdict == "rejected"
+     findings: (if $with_findings == 1
                 then (if $sel == "all"
                       then [$paths[] | {path: ., severity: $severity, message: "still broken"}]
                       else [{path: $sel, severity: $severity, message: "still broken"}] end)
@@ -234,6 +248,10 @@ elif [[ "$mode" == "review" ]]; then
         if (( review_pass == 1 )); then response="$(emit_review rejected all)"; else response="$(emit_review rejected)"; fi ;;
       reviewone)
         if (( review_pass == 1 )); then response="$(emit_review rejected)"; else response="$(emit_review accepted)"; fi ;;
+      # A re-review of the retried path rejects without naming an error finding: nothing
+      # further can be retried, so the candidate escalates with a zero error count.
+      reviewwarnretry)
+        if (( review_pass == 1 )); then response="$(emit_review rejected)"; else response="$(emit_review rejected-warning)"; fi ;;
       reviewmix)
         if (( review_pass == 1 )); then
           response="$(emit_review rejected all)"
@@ -242,6 +260,10 @@ elif [[ "$mode" == "review" ]]; then
         fi ;;
       copyreview)
         response="$(emit_review rejected)" ;;
+      # An otherwise well-formed resolution reviewed as "accepted" beside an error finding:
+      # incoherent but well formed, so the run escalates instead of refusing the answer.
+      accepterror)
+        response="$(emit_review accepted-error)" ;;
       # One batch rejects with a warning only while another names an error: the warning-only
       # rejection has no path to retry, so the run must fail instead of dropping it.
       warnbatch)
@@ -534,21 +556,46 @@ assert_no_push() { # case-dir label
 
 d="$(new_case clean clean)"
 clean_base="$(git -C "$d/origin.git" rev-parse refs/heads/custom)"
+printf 'stale\tv1.2.2\told escalation\n' >"$d/state/needs-attention"
 rc="$(run_ctrl "$d")"
 is "clean merge exits 0" 0 "$rc"
 is "clean merge never calls the model" "" "$(calls "$d")"
 assert_no_push "$d" "clean merge"
 is "clean merge leaves custom untouched" "$clean_base" "$(git -C "$d/origin.git" rev-parse refs/heads/custom)"
 is "clean merge writes a noop status" noop "$(awk -F'\t' '$1=="status"{print $2}' "$d/state/last-result" 2>/dev/null)"
+is "clean merge clears the stale needs-attention line" absent \
+  "$([[ -e "$d/state/needs-attention" ]] && echo present || echo absent)"
+
+# --- 1b. an upstream tag already merged into custom is a no-op that clears it too ---
+
+d="$(new_case already-merged clean)"
+work="$workroot/merged.$RANDOM"
+git clone -q "$d/origin.git" "$work"
+git -C "$work" fetch -q "$d/upstream.git" '+refs/tags/v*:refs/tags/upstream/v*'
+git -C "$work" merge -q --no-ff --no-edit upstream/v1.2.3
+git -C "$work" push -q origin custom
+rm -rf "$work"
+printf 'stale\tv1.2.2\told escalation\n' >"$d/state/needs-attention"
+rc="$(run_ctrl "$d")"
+is "already-merged tag exits 0" 0 "$rc"
+is "already-merged tag never calls the model" "" "$(calls "$d")"
+assert_no_push "$d" "already-merged tag"
+is "already-merged tag writes a noop status" noop \
+  "$(awk -F'\t' '$1=="status"{print $2}' "$d/state/last-result" 2>/dev/null)"
+is "already-merged tag clears the stale needs-attention line" absent \
+  "$([[ -e "$d/state/needs-attention" ]] && echo present || echo absent)"
 
 # --- 2. accepted text conflict: exact reviewed branch, exact dispatch guards ------
 
 d="$(new_case text text)"
 base_sha="$(git -C "$d/origin.git" rev-parse refs/heads/custom)"
 up_sha="$(git -C "$d/upstream.git" rev-parse 'refs/tags/v1.2.3^{commit}')"
+printf 'stale\tv1.2.2\told escalation\n' >"$d/state/needs-attention"
 rc="$(run_ctrl "$d" OMP_AI_CONFLICTS_GH_USER=botowner)"
 is "text conflict exits 0" 0 "$rc"
 is "resolve then fresh review" "resolve,review" "$(calls "$d")"
+is "accepted review clears the stale needs-attention line" absent \
+  "$([[ -e "$d/state/needs-attention" ]] && echo present || echo absent)"
 br="$(git -C "$d/origin.git" rev-parse --verify --quiet refs/heads/sync/upstream-v1.2.3)"
 is_not "text conflict publishes sync/upstream-v1.2.3" "" "$br"
 is "candidate parent 1 is the reviewed base" "$base_sha" "$(git -C "$d/origin.git" rev-parse "$br^1")"
@@ -676,16 +723,80 @@ is "deleted-directory conflict writes the resolved content" "resolved" \
 is "deleted-directory conflict keeps the mode" "100644" \
   "$(git -C "$d/origin.git" ls-tree "$nbr" nested/deep.txt | awk '{print $1}')"
 
-# --- 3. rejected review: nothing published ---------------------------------------
+# --- 3. a rejected review is advisory: the candidate is published and gated by CI ----
+# The review disowns the resolution but the resolution itself is well formed, so the work is
+# not discarded: the branch is pushed, the dispatch carries the same base/tree guards, the
+# commit records the escalation, and the operator-facing line is written.
 
 d="$(new_case reject text)"
+base_sha="$(git -C "$d/origin.git" rev-parse refs/heads/custom)"
 rc="$(run_ctrl "$d" FAKE_VERDICT=rejected)"
-is "rejected review exits 1" 1 "$rc"
+is "rejected review exits 0" 0 "$rc"
 is "rejected review retries the named path once, then reviews again" \
   "resolve,review,resolve,review" "$(calls "$d")"
-is "rejected review names the retry in the failure" yes \
-  "$(grep -qF 'review rejected the resolution again after one retry' "$d/stderr.log" && echo yes || echo no)"
-assert_no_push "$d" "rejected review"
+wbr="$(git -C "$d/origin.git" rev-parse --verify --quiet refs/heads/sync/upstream-v1.2.3)"
+is_not "rejected review publishes the sync branch" "" "$wbr"
+is "rejected review builds on the reviewed base" "$base_sha" \
+  "$(git -C "$d/origin.git" rev-parse "$wbr^1")"
+is "rejected review dispatch binds the upstream tag" "v1.2.3" "$(cut -d'|' -f1 "$d/fake/dispatch.log")"
+is "rejected review dispatch binds the reviewed base" "$base_sha" "$(cut -d'|' -f2 "$d/fake/dispatch.log")"
+is "rejected review dispatch binds the candidate tree" "$(git -C "$d/origin.git" rev-parse "$wbr^{tree}")" \
+  "$(cut -d'|' -f3 "$d/fake/dispatch.log")"
+wtrailers="$(git -C "$d/origin.git" log -1 --format=%B "$wbr" | git interpret-trailers --parse)"
+is "rejected review keeps the four certificate trailers" 4 \
+  "$(grep -c '^OMP-AI-\(Conflict-Review\|Reviewed-Base\|Reviewed-Tree\|Model\):' <<<"$wtrailers" || true)"
+is "rejected review writes the exact escalation trailer" \
+  "OMP-AI-Review-Escalated: v1 1 error finding(s); custom-feature.txt" \
+  "$(grep '^OMP-AI-Review-Escalated:' <<<"$wtrailers" || true)"
+is "rejected review binds the reviewed tree to the pushed candidate" \
+  "$(git -C "$d/origin.git" rev-parse "$wbr^{tree}")" \
+  "$(awk -F': ' '$1=="OMP-AI-Reviewed-Tree"{print $2}' <<<"$wtrailers")"
+is "rejected review logs one warning naming paths and findings" yes \
+  "$(grep -qF 'warning: review did not accept the resolution (rejected); escalating the candidate' "$d/stderr.log" \
+    && grep -qF 'rejected paths: custom-feature.txt' "$d/stderr.log" \
+    && grep -qF 'error custom-feature.txt: still broken' "$d/stderr.log" && echo yes || echo no)"
+is "rejected review records an escalated status" escalated \
+  "$(awk -F'\t' '$1=="status"{print $2}' "$d/state/last-result")"
+is "rejected review puts the findings in the detail" yes \
+  "$(awk -F'\t' '$1=="detail"{print $2}' "$d/state/last-result" | grep -qF 'still broken' && echo yes || echo no)"
+is "rejected review writes needs-attention for the operator" "v1.2.3" \
+  "$(cut -f2 "$d/state/needs-attention" 2>/dev/null || true)"
+is "rejected review's needs-attention line has timestamp, tag, reason" 3 \
+  "$(awk -F'\t' '{print NF}' "$d/state/needs-attention" 2>/dev/null || true)"
+is "rejected review names the reason in needs-attention" yes \
+  "$(grep -qF 'still broken' "$d/state/needs-attention" 2>/dev/null && echo yes || echo no)"
+
+# --- 3b. an "accepted" verdict beside an error finding is escalated, not trusted -----
+
+d="$(new_case accept-error text)"
+rc="$(run_ctrl "$d" FAKE_ADAPTER_MODE=accepterror)"
+is "accepted verdict with an error finding exits 0" 0 "$rc"
+is "accepted verdict with an error finding is never retried" "resolve,review" "$(calls "$d")"
+aebr="$(git -C "$d/origin.git" rev-parse --verify --quiet refs/heads/sync/upstream-v1.2.3)"
+is_not "accepted verdict with an error finding publishes the branch" "" "$aebr"
+is "accepted verdict with an error finding records the escalation" \
+  "OMP-AI-Review-Escalated: v1 1 error finding(s); custom-feature.txt" \
+  "$(git -C "$d/origin.git" log -1 --format=%B "$aebr" | grep '^OMP-AI-Review-Escalated:' || true)"
+is "accepted verdict with an error finding is escalated in the state" escalated \
+  "$(awk -F'\t' '$1=="status"{print $2}' "$d/state/last-result")"
+
+# --- 3c. a re-review rejecting with warnings only escalates with a zero count -------
+# The retried path is re-reviewed and still rejected, but with no error finding: nothing
+# further can be retried, so the certificate records the escalation with 0, which
+# sync-upstream.sh accepts as a valid certificate.
+
+d="$(new_case review-warn-retry text)"
+rc="$(run_ctrl "$d" FAKE_ADAPTER_MODE=reviewwarnretry)"
+is "warning-only re-review exits 0" 0 "$rc"
+is "warning-only re-review retried the error path once, then re-reviewed" \
+  "resolve,review,resolve,review" "$(calls "$d")"
+wrbr="$(git -C "$d/origin.git" rev-parse --verify --quiet refs/heads/sync/upstream-v1.2.3)"
+is_not "warning-only re-review publishes the candidate" "" "$wrbr"
+is "warning-only re-review records a zero-count escalation" \
+  "OMP-AI-Review-Escalated: v1 0 error finding(s); custom-feature.txt" \
+  "$(git -C "$d/origin.git" log -1 --format=%B "$wrbr" | grep '^OMP-AI-Review-Escalated:' || true)"
+is "warning-only re-review records an escalated status" escalated \
+  "$(awk -F'\t' '$1=="status"{print $2}' "$d/state/last-result")"
 
 # --- malformed or off-contract adapter output -----------------------------------
 
@@ -716,17 +827,33 @@ assert_no_push "$d" "moved base"
 is "moved base keeps the concurrent advance" 3 \
   "$(git -C "$d/origin.git" rev-list --count refs/heads/custom)"
 
-# --- 14. a pre-existing sync branch is never overwritten -------------------------
+# --- 14. a candidate already published for this tag is deferred, not failed ----------
+# The second window of the day sees the branch the first window pushed; the CI gate owns
+# that candidate, so the run is work already in flight: exit 75, no model, nothing touched.
 
 d="$(new_case existingbranch text)"
 existing_base="$(git -C "$d/origin.git" rev-parse refs/heads/custom)"
 git -C "$d/origin.git" branch sync/upstream-v1.2.3 "$existing_base"
 rc="$(run_ctrl "$d")"
-is "existing sync branch exits 1" 1 "$rc"
+is "existing sync branch defers with 75" 75 "$rc"
 is "existing sync branch avoids model work" "" "$(calls "$d")"
 is "existing sync branch is left alone" "$existing_base" \
   "$(git -C "$d/origin.git" rev-parse refs/heads/sync/upstream-v1.2.3)"
 is "existing sync branch blocks the dispatch" "" "$(cat "$d/fake/dispatch.log" 2>/dev/null || true)"
+is "existing sync branch records a deferred status" deferred \
+  "$(awk -F'\t' '$1=="status"{print $2}' "$d/state/last-result" 2>/dev/null)"
+
+# --- 14b. a sync branch that appears mid-run is still a hard stop --------------------
+# Only the branch that predates the run is benign; one published while this run resolves
+# may not be the reviewed candidate, so the pre-push guard must refuse it.
+
+d="$(new_case existingbranch-race text)"
+rc="$(run_ctrl "$d" FAKE_PUBLISH_SYNC=sync/upstream-v1.2.3)"
+is "sync branch published mid-run exits 1" 1 "$rc"
+is "sync branch published mid-run reaches the model before the guard" "resolve,review" "$(calls "$d")"
+is "sync branch published mid-run is never overwritten" yes \
+  "$(grep -qF 'already exists on origin; refusing to overwrite' "$d/stderr.log" && echo yes || echo no)"
+is "sync branch published mid-run blocks the dispatch" "" "$(cat "$d/fake/dispatch.log" 2>/dev/null || true)"
 
 # --- 15. lock busy defers with exit 75 -------------------------------------------
 
@@ -1215,31 +1342,37 @@ is "the certificate names the retried path" yes \
     && ! git -C "$d/origin.git" log -1 --format=%B "$orbr" | grep -qF 'scripts/tool.sh#' \
     && echo yes || echo no)"
 
-# --- 37. a retry that does not clear the review fails the run ---------------------
+# --- 37. a retry that does not clear the review escalates instead of failing ------
 
 d="$(new_case review-retry-fail text)"
 rc="$(run_ctrl "$d" FAKE_ADAPTER_MODE=reviewretryfail)"
-is "a still-rejected retry exits 1" 1 "$rc"
+is "a still-rejected retry exits 0" 0 "$rc"
 is "a still-rejected retry is not repeated" 3 "$(count_calls "$d" resolve)"
 is "a still-rejected retry gets one re-review" 2 "$(count_calls "$d" review)"
-is "a still-rejected retry fails with the findings" yes \
-  "$(grep -qF 'review rejected the resolution again after one retry' "$d/stderr.log" \
-    && grep -qF 'still broken' "$d/stderr.log" && echo yes || echo no)"
-is "a still-rejected retry names the retried path" yes \
-  "$(grep -qF 'custom-feature.txt#' "$d/stderr.log" && echo yes || echo no)"
-assert_no_push "$d" "a still-rejected retry"
+srbr="$(git -C "$d/origin.git" rev-parse --verify --quiet refs/heads/sync/upstream-v1.2.3)"
+is_not "a still-rejected retry publishes the candidate" "" "$srbr"
+is "a still-rejected retry records the escalation with its path" \
+  "OMP-AI-Review-Escalated: v1 1 error finding(s); custom-feature.txt" \
+  "$(git -C "$d/origin.git" log -1 --format=%B "$srbr" | grep '^OMP-AI-Review-Escalated:' || true)"
+is "a still-rejected retry records an escalated status" escalated \
+  "$(awk -F'\t' '$1=="status"{print $2}' "$d/state/last-result")"
+is "a still-rejected retry keeps the retry record out of the trailers" 0 \
+  "$(git -C "$d/origin.git" log -1 --format=%B "$srbr" | grep -c '^Review-Retry:' || true)"
 
-# --- 38. a mixed retry fails as a whole when one path stays rejected -------------
+# --- 38. a mixed retry still escalates the path the re-review kept rejecting ------
 
 d="$(new_case review-retry-mixed text)"
 rc="$(run_ctrl "$d" FAKE_ADAPTER_MODE=reviewmix)"
-is "a mixed review retry exits 1" 1 "$rc"
+is "a mixed review retry exits 0" 0 "$rc"
 is "a mixed review retry re-resolves both paths then re-reviews" \
   "resolve,review,resolve,resolve,review" "$(calls "$d")"
-is "a mixed review retry names the still-rejected path" yes \
-  "$(grep -qF 'review rejected the resolution again after one retry' "$d/stderr.log" \
-    && grep -qF "$(cat "$d/fake/unfixed.path")" "$d/stderr.log" && echo yes || echo no)"
-assert_no_push "$d" "a mixed review retry"
+mrbr="$(git -C "$d/origin.git" rev-parse --verify --quiet refs/heads/sync/upstream-v1.2.3)"
+is_not "a mixed review retry publishes the candidate" "" "$mrbr"
+is "a mixed review retry escalates the still-rejected path" \
+  "OMP-AI-Review-Escalated: v1 1 error finding(s); $(cat "$d/fake/unfixed.path")" \
+  "$(git -C "$d/origin.git" log -1 --format=%B "$mrbr" | grep '^OMP-AI-Review-Escalated:' || true)"
+is "a mixed review retry records an escalated status" escalated \
+  "$(awk -F'\t' '$1=="status"{print $2}' "$d/state/last-result")"
 
 # --- 39. a review rejection with no error finding is never retried ----------------
 
@@ -1267,16 +1400,23 @@ is "a warning-only batch rejection is named with its batch" yes \
     "$d/stderr.log" && echo yes || echo no)"
 assert_no_push "$d" "a warning-only batch rejection"
 
-# --- 41. a side-copy retry is never spent a second time on a review rejection ------
+# --- 41. a review rejection after a side-copy retry escalates instead of failing ---
 
 d="$(new_case review-after-copy big)"
 rc="$(run_ctrl "$d" FAKE_ADAPTER_MODE=copyreview)"
-is "a review rejection after a side-copy retry exits 1" 1 "$rc"
+is "a review rejection after a side-copy retry exits 0" 0 "$rc"
 is "a review rejection after a side-copy retry re-resolves exactly once" \
   "resolve,resolve,review" "$(calls "$d")"
-is "a review rejection after a side-copy retry is named" yes \
-  "$(grep -qF 'after its one retry (a side-copy retry already ran)' "$d/stderr.log" && echo yes || echo no)"
-assert_no_push "$d" "a review rejection after a side-copy retry"
+is "a review rejection after a side-copy retry is named as unretryable" yes \
+  "$(grep -qF 'already spent its one retry on a side copy; escalating it instead' "$d/stderr.log" \
+    && echo yes || echo no)"
+crbr="$(git -C "$d/origin.git" rev-parse --verify --quiet refs/heads/sync/upstream-v1.2.3)"
+is_not "a review rejection after a side-copy retry publishes the candidate" "" "$crbr"
+is "a review rejection after a side-copy retry records the escalation" \
+  "OMP-AI-Review-Escalated: v1 1 error finding(s); big/f1.txt" \
+  "$(git -C "$d/origin.git" log -1 --format=%B "$crbr" | grep '^OMP-AI-Review-Escalated:' || true)"
+is "a review rejection after a side-copy retry records an escalated status" escalated \
+  "$(awk -F'\t' '$1=="status"{print $2}' "$d/state/last-result")"
 
 # --- 42. a maximal path still produces a valid side-copy refusal -------------------
 

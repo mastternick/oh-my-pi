@@ -51,6 +51,11 @@ if [[ -n "${OMP_LAUNCHER_REAL_BIN:-}" ]]; then
 fi
 : "${OMP_REAL_BIN:=}"
 : "${OMP_REAL_RUNNER:=}"
+# `OMP_REAL_BIN` is the custom channel's marker: a variable sourced from the config is not
+# in the environment of the build this shell execs. Only a fresh install gets this export;
+# install.sh never overwrites an existing launcher, so an upgraded box keeps the launcher it
+# has and detection falls back to the `versions/<label>` build layout (custom-channel.ts).
+export OMP_REAL_BIN
 # idle auto-close: minutes with no attached client AND no pane output before a
 # session is closed (0 disables). See 'omp sweep'.
 IDLE_TIMEOUT_MIN="${OMP_LAUNCHER_IDLE_MIN:-${IDLE_TIMEOUT_MIN:-30}}"

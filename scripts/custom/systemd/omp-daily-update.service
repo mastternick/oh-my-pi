@@ -5,6 +5,10 @@ Description=omp-custom daily release installer
 Type=oneshot
 ExecStart=%h/.local/bin/omp-daily-update.sh
 Environment="PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+# The needs-attention notice reads OMP_AI_CONFLICTS_STATE_DIR. This unit reads no
+# ai-conflicts.env, and systemd does not inherit another unit's environment, so a custom
+# value set for omp-ai-conflicts.service must be set here as well (for example through a
+# drop-in under omp-daily-update.service.d/).
 TimeoutStartSec=30min
 TimeoutStopSec=2min
 KillMode=mixed

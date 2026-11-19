@@ -40,6 +40,7 @@ import {
 	fetchBuild,
 	type UpdateChannel,
 } from "./build-service";
+import { CUSTOM_UPDATER_ENV, customInstallRoot, customUpdaterPath, isCustomChannelInstall } from "./custom-channel";
 import { managedInstallName } from "./managed-install";
 import {
 	DEFAULT_NPM_REGISTRY,
@@ -2305,19 +2306,71 @@ async function runManagedUpdate(
 	return { kind: "installed", version: installed };
 }
 
+/** Version label (e.g. `19.0.2-c1`) the custom install last recorded, or undefined. */
+function customInstalledLabel(root: string): string | undefined {
+	try {
+		const tag = fs.readFileSync(path.join(root, "state", "installed-tag"), "utf8").trim();
+		return tag.startsWith("custom-v") ? tag.slice("custom-v".length) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Update a custom-channel install through its deployed updater.
+ *
+ * `scripts/custom/install.sh` verifies every `custom-v*` release (tag/git/API
+ * agreement, workflow success, SHA256SUMS, bundle match, smoke test), so this
+ * command never installs anything itself here: npm's `latest` is upstream omp,
+ * and the build service publishes nothing for the custom channel. The updater
+ * streams its own output; a nonzero exit is thrown like any other update
+ * failure, so the caller records a failed status instead of dying under it.
+ */
+async function runCustomChannelUpdate(opts: UpdateOptions): Promise<UpdateOutcome> {
+	const updater = customUpdaterPath();
+	if (!fs.existsSync(updater)) {
+		throw new Error(
+			`This is the ${APP_NAME} custom channel, but its updater is missing at ${updater}; reinstall it with scripts/custom/install.sh or point ${CUSTOM_UPDATER_ENV} at it.`,
+		);
+	}
+	console.log(chalk.dim(`This is the ${APP_NAME} custom channel; ${updater} installs the newest custom-v* release.`));
+	if (opts.channel === "canary") {
+		console.log(chalk.dim("The custom channel has no canary releases; using its newest published release."));
+	}
+	if (opts.force) console.log(chalk.dim("The custom updater installs only newer releases; --force has no effect."));
+	const child = Bun.spawn({
+		cmd: [updater, ...(opts.check ? ["--check"] : [])],
+		env: process.env,
+		stdin: "inherit",
+		stdout: "inherit",
+		stderr: "inherit",
+	});
+	const status = await child.exited;
+	if (status !== 0) throw new Error(`${updater} exited with status ${status}`);
+	if (opts.check) return { kind: "current" };
+	const label = customInstalledLabel(customInstallRoot());
+	return label ? { kind: "installed", version: label } : { kind: "current" };
+}
+
 /**
  * Run the update command.
  *
  * The installer that owns the PATH `omp` decides where the version comes
  * from: a standalone binary asks the build service, a package-manager install
- * asks npm. When no target resolves, the running build's kind decides, so
- * `--check` still answers; installing then fails on the unresolved target.
+ * asks npm. A custom-channel install asks neither: its deployed updater installs
+ * the verified `custom-v*` release. When no target resolves, the running build's
+ * kind decides, so `--check` still answers; installing then fails on the
+ * unresolved target.
  *
  * Progress and results print to stdout. Throws when the check or the install
  * fails, or when another update holds the install lock.
  */
 export async function runUpdateCommand(opts: UpdateOptions): Promise<UpdateOutcome> {
 	const ompPath = resolveOmpPath();
+	// The custom channel owns its install (verified `custom-v*` releases under
+	// `<root>/current`). Resolving a package manager or the build service here
+	// would replace it with upstream omp.
+	if (isCustomChannelInstall({ ompPath })) return await runCustomChannelUpdate(opts);
 	const manager = ompPath ? await managedInstallName(ompPath) : undefined;
 	if (manager) {
 		const reason = `${ompPath} is installed and kept up to date by ${manager}; update it from ${manager}.`;

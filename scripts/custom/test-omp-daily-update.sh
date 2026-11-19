@@ -44,6 +44,10 @@ for arg in "$@"; do
 done
 
 if [[ "${1:-}" == "api" && $is_releases -eq 1 ]]; then
+  if [[ "${FAKE_GH_FAIL:-0}" == "1" ]]; then
+    printf 'gh: HTTP 502 from api.github.com\n' >&2
+    exit 1
+  fi
   jqf="${FAKE_RELEASES:?FAKE_RELEASES not set}"
   args=("$@")
   for i in "${!args[@]}"; do
@@ -342,6 +346,110 @@ out="$("$SCRIPT" 2>&1)"; rc=$?
    && "$(readlink "$OMP_CUSTOM_HOME/current")" == "versions/18.12.6-c5" ]] \
   && check "16b. installer relinks previous<-old current, current<-new" 1 \
   || { echo "$out"; check "16b. installer relinks previous<-old current, current<-new" 0; }
+
+# 17. Staleness notice: newest release is current but published four days ago. Warns once,
+#     notifies once through OMP_DAILY_NOTIFY_CMD, and still exits 0 without an install.
+cat > "$SANDBOX/stale_releases.json" <<EOF
+[
+  {"tag_name": "custom-v18.12.6-c5", "draft": false, "prerelease": false, "published_at": "$(date -u -d '-4 days' +%FT%TZ)"}
+]
+EOF
+export FAKE_RELEASES="$SANDBOX/stale_releases.json"
+rm -f "$OMP_DAILY_STATE_DIR/installed-tag"
+mkdir -p "$OMP_CUSTOM_HOME/versions/18.12.6-c5"
+ln -sfn "versions/18.12.6-c5" "$OMP_CUSTOM_HOME/current"
+export FAKE_NOTIFY_OUT="$SANDBOX/notify-stale.out"
+rm -f "$FAKE_NOTIFY_OUT"
+export OMP_DAILY_NOTIFY_CMD='printf "NOTIFY:%s\n" "$MESSAGE" >> "$FAKE_NOTIFY_OUT"'
+before="$(wc -l < "$OMP_DAILY_STATE_DIR/install-calls")"
+out="$("$SCRIPT" 2>&1)"; rc=$?
+stale_notices="$(grep -c 'omp custom update is stale: newest release custom-v18.12.6-c5 published' "$FAKE_NOTIFY_OUT" 2>/dev/null || true)"
+[[ $rc -eq 0 && "$out" == *"warning: omp custom update is stale: newest release custom-v18.12.6-c5 published"* \
+   && "${stale_notices:-0}" == "1" && "$(wc -l < "$OMP_DAILY_STATE_DIR/install-calls")" == "$before" ]] \
+  && check "17. stale release warns and notifies once, exit status unchanged" 1 \
+  || { echo "$out"; echo "notifications: $(cat "$FAKE_NOTIFY_OUT" 2>/dev/null)"; check "17. stale release warns and notifies once, exit status unchanged" 0; }
+
+# 17b. No staleness notice while the newest release is fresh.
+cat > "$SANDBOX/fresh_releases.json" <<EOF
+[
+  {"tag_name": "custom-v18.12.6-c5", "draft": false, "prerelease": false, "published_at": "$(date -u -d '-4 hours' +%FT%TZ)"}
+]
+EOF
+export FAKE_RELEASES="$SANDBOX/fresh_releases.json"
+rm -f "$FAKE_NOTIFY_OUT" "$OMP_DAILY_STATE_DIR/installed-tag"
+out="$("$SCRIPT" 2>&1)"; rc=$?
+[[ $rc -eq 0 && "$out" != *"is stale"* && ! -s "$FAKE_NOTIFY_OUT" ]] \
+  && check "17b. fresh release stays silent" 1 \
+  || { echo "$out"; check "17b. fresh release stays silent" 0; }
+
+# 18. the conflict controller's needs-attention line, newer than the installed tree, is
+#     surfaced once with its content; an older note is ignored. The controller writes it
+#     under $ROOT/state/ai-conflicts, not beside the updater's own state.
+export FAKE_RELEASES="$SANDBOX/releases.json"
+unset OMP_AI_CONFLICTS_STATE_DIR
+attention_dir="$OMP_CUSTOM_HOME/state/ai-conflicts"
+mkdir -p "$attention_dir"
+mkdir -p "$OMP_CUSTOM_HOME/versions/18.12.6-c5"
+ln -sfn "versions/18.12.6-c5" "$OMP_CUSTOM_HOME/current"
+touch -d '-2 hours' "$OMP_CUSTOM_HOME/versions/18.12.6-c5"
+printf 'disk nearly full: free 800M\n' > "$attention_dir/needs-attention"
+rm -f "$FAKE_NOTIFY_OUT" "$OMP_DAILY_STATE_DIR/installed-tag"
+out="$("$SCRIPT" 2>&1)"; rc=$?
+attention_notices="$(grep -c 'omp custom update needs attention: disk nearly full: free 800M' "$FAKE_NOTIFY_OUT" 2>/dev/null || true)"
+[[ $rc -eq 0 && "$out" == *"warning: omp custom update needs attention: disk nearly full: free 800M"* \
+   && "${attention_notices:-0}" == "1" ]] \
+  && check "18. needs-attention newer than the install is reported once" 1 \
+  || { echo "$out"; echo "notifications: $(cat "$FAKE_NOTIFY_OUT" 2>/dev/null)"; check "18. needs-attention newer than the install is reported once" 0; }
+
+touch -d '-2 days' "$attention_dir/needs-attention"
+touch "$OMP_CUSTOM_HOME/versions/18.12.6-c5"
+rm -f "$FAKE_NOTIFY_OUT" "$OMP_DAILY_STATE_DIR/installed-tag"
+out="$("$SCRIPT" 2>&1)"; rc=$?
+[[ $rc -eq 0 && "$out" != *"needs attention"* && ! -s "$FAKE_NOTIFY_OUT" ]] \
+  && check "18b. needs-attention older than the install stays silent" 1 \
+  || { echo "$out"; check "18b. needs-attention older than the install stays silent" 0; }
+unset OMP_DAILY_NOTIFY_CMD FAKE_NOTIFY_OUT
+rm -rf "$attention_dir"
+
+# 19. --check reports current and newest without installing, recording, or notifying.
+rm -f "$OMP_DAILY_STATE_DIR/installed-tag"
+before="$(wc -l < "$OMP_DAILY_STATE_DIR/install-calls")"
+out="$("$SCRIPT" --check 2>&1)"; rc=$?
+[[ $rc -eq 0 && "$out" == *"current: custom-v18.12.6-c5"* && "$out" == *"newest: custom-v18.12.6-c5"* \
+   && "$(wc -l < "$OMP_DAILY_STATE_DIR/install-calls")" == "$before" \
+   && ! -f "$OMP_DAILY_STATE_DIR/installed-tag" ]] \
+  && check "19. --check reports without installing or recording" 1 \
+  || { echo "$out"; check "19. --check reports without installing or recording" 0; }
+
+# 19b. --check is independent of the install lock and the installer: a run that is
+#      installing right now (both locks held) still answers, and a deploy without a
+#      reachable installer still reports instead of failing.
+(
+  exec 8>"$OMP_CUSTOM_HOME/.daily-update.lock"
+  flock -n 8 || exit 1
+  exec 9>"$OMP_CUSTOM_HOME/.lock"
+  flock -n 9 || exit 1
+  OMP_INSTALL_SH="$SANDBOX/bin/missing-install.sh" "$SCRIPT" --check >"$SANDBOX/check-lock.out" 2>&1
+  printf 'rc=%s\n' "$?" >>"$SANDBOX/check-lock.out"
+)
+out="$(cat "$SANDBOX/check-lock.out")"
+[[ "$out" == *"newest: custom-v18.12.6-c5"* && "$out" == *"rc=0"* \
+   && "$out" != *"install in progress"* && "$out" != *"installer not found"* ]] \
+  && check "19b. --check answers while an install holds the locks and no installer is reachable" 1 \
+  || { echo "$out"; check "19b. --check answers while an install holds the locks and no installer is reachable" 0; }
+
+# 20. A failed --check reports on stderr only: it must not write the failure state a daily
+#     run would read, and must not fire the critical failure notification.
+rm -f "$OMP_DAILY_STATE_DIR/last-failure"
+export FAKE_NOTIFY_OUT="$SANDBOX/notify-check-fail.out"
+rm -f "$FAKE_NOTIFY_OUT"
+export OMP_DAILY_NOTIFY_CMD='printf "NOTIFY:%s\n" "$MESSAGE" >> "$FAKE_NOTIFY_OUT"'
+out="$(FAKE_GH_FAIL=1 "$SCRIPT" --check 2>&1)"; rc=$?
+[[ $rc -ne 0 && "$out" == *"error: could not list releases for"* \
+   && ! -f "$OMP_DAILY_STATE_DIR/last-failure" && ! -s "$FAKE_NOTIFY_OUT" ]] \
+  && check "20. failed --check records no failure and sends no notification" 1 \
+  || { echo "$out"; echo "failure state: $(cat "$OMP_DAILY_STATE_DIR/last-failure" 2>/dev/null)"; check "20. failed --check records no failure and sends no notification" 0; }
+unset FAKE_GH_FAIL OMP_DAILY_NOTIFY_CMD FAKE_NOTIFY_OUT
 
 echo "---"
 echo "passed=$pass failed=$fail"

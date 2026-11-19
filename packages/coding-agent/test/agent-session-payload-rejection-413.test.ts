@@ -1175,6 +1175,7 @@ describe("AgentSession payload-rejection 413 handling", () => {
 					return fallbackMock.stream(model, context, options);
 				},
 				extraSettings: {
+					modelRoles: { default: "anthropic/claude-sonnet-4-5" },
 					"retry.baseDelayMs": 5,
 					"retry.modelFallback": true,
 					"retry.fallbackChains": { default: [`${fallbackModel.provider}/${fallbackModel.id}`] },

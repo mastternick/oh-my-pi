@@ -1000,6 +1000,13 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 			signal,
 		});
 		if (signal?.aborted) return undefined;
+		// Nothing recalled means nothing to inject: consume the task key (see
+		// {@link #commitExperienceRecall}) but leave the prompt untouched, so a turn
+		// with no lesson does not patch the system prompt with an empty block.
+		if (result.memories.length === 0 && !result.context) {
+			this.#commitExperienceRecall(generation, key, taskText, result.memories, result.context);
+			return undefined;
+		}
 		return {
 			context: result.context,
 			commit: () => this.#commitExperienceRecall(generation, key, taskText, result.memories, result.context),

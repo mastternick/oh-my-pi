@@ -1732,9 +1732,11 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	};
 
 	// Verdict held while a tool or owner async work runs; applied when they finish.
+	// A live wake source (async job, IRC wake, queued input) means the run still has
+	// work to settle, so a verdict judged on the old evidence is held.
 	let heldVerdict: { token: number; answer: StallVerdict | undefined } | undefined;
 	const flushHeldVerdict = () => {
-		if (!stallTracker || !heldVerdict || activeTools.size > 0 || sessionHasPendingAsyncWork()) return;
+		if (!stallTracker || !heldVerdict || activeTools.size > 0 || activeSession?.wakeSources !== undefined) return;
 		const { token, answer } = heldVerdict;
 		heldVerdict = undefined;
 		applyStallDecision(stallTracker.resolveSuspicion(token, answer));
@@ -1760,7 +1762,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 				if (!stallTracker) return;
 				// A tool still running or owner async work pending means the answer judges evidence that moved on. Hold it;
 				// flushHeldVerdict applies it once they finish. A non-repeat result stales it by epoch, so it is then ignored.
-				if (activeTools.size > 0 || sessionHasPendingAsyncWork()) heldVerdict = { token: suspicion.token, answer };
+				if (activeTools.size > 0 || activeSession?.wakeSources !== undefined) heldVerdict = { token: suspicion.token, answer };
 				else applyStallDecision(stallTracker.resolveSuspicion(suspicion.token, answer));
 			});
 	};
@@ -3828,7 +3830,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			const stalled = turnMonitor.stallStopReason() !== undefined;
 			const driven = stalled
 				? await driveSessionToResult(session, turnMonitor, ircTask, {
-						structured: options.structured !== false,
+						structured: usesYield(options.outputSchema),
 						alreadyDispatched: true,
 					})
 				: undefined;

@@ -1099,7 +1099,6 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 	 */
 	#maybeCaptureExperienceOnAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
 		if (this.aliasOf || this.config.experienceEnabled !== true) return;
-		if (event.isTerminal === false) return;
 		const lastUser = flattenAgentMessages(event.messages).findLast(message => message.role === "user");
 		const assignment = this.#experienceTaskText ?? lastUser?.content ?? "";
 		void this.captureExperienceCheckpoint(event.messages, "main", assignment);
@@ -1295,7 +1294,9 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 				void this.maybeRetainOnAgentEnd(event.messages).catch(error => {
 					this.#logLifecycleFailure("turn-end retention", [this.#local().retain.bank], error);
 				});
-				this.#maybeCaptureExperienceOnAgentEnd(event);
+				// Experience capture stays on the terminal settle: a yielded pause keeps the run
+				// open, so its evidence can still move before `agent_end` arrives.
+				if (event.type === "agent_end") this.#maybeCaptureExperienceOnAgentEnd(event);
 			}
 		});
 	}

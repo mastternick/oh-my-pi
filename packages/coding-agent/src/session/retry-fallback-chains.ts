@@ -512,6 +512,11 @@ export function resolveRetryFallbackChainKey(
 	//    (kind chains may hold chat models too), so it must not adopt that
 	//    chain. They apply only through the explicit role hint above.
 	if (roleHint && Array.isArray(context.chains[roleHint])) {
+		// `default` is the session's own identity, not a role inferred from model
+		// equality: a session started on the default role stays on it after a
+		// model switch that records no role, so its chain applies without a
+		// configured `models.default` assignment.
+		if (roleHint === "default") return roleHint;
 		const configured = context.getModelRole(roleHint)?.trim();
 		if (configured) {
 			const rolePrimary = parseRetryFallbackSelector(configured, context.modelLookup);

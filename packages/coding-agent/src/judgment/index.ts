@@ -69,6 +69,7 @@ import type { Settings } from "../config/settings";
 import type { CostGateApi } from "../session/cost-gate";
 import type { JudgmentRecord, JudgmentRecordAnswer } from "../session/session-entries";
 import { isModelUsageLedger, type ModelUsageLedger } from "../session/model-usage-journal";
+import type { SessionManager } from "../session/session-manager";
 import { getTinyLocalModelSpec } from "../tiny/models";
 import localPromptTemplate from "../prompts/system/judgment-local.md" with { type: "text" };
 import { tinyModelClient } from "../tiny/title-client";

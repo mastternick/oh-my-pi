@@ -66,6 +66,7 @@ it("preserves the parent's recalled prompt prefix while adding custom experience
 		"mnemopi.noEmbeddings": true,
 		"mnemopi.llmMode": "none",
 		"mnemopi.autoRetain": false,
+		"mnemopi.recallRelevance": "off",
 	});
 	try {
 		const { session: parent } = await sdk.createAgentSession({

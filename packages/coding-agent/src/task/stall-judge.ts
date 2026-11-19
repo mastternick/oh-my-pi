@@ -7,7 +7,8 @@ import { type ChoiceQuestion, type Judge, judgeQuestions, type Model } from "@oh
 import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
-import { journalJudgmentUsage, type JudgmentUsageLedger, resolveJudge } from "../judgment";
+import { journalJudgmentUsage, resolveJudge } from "../judgment";
+import type { ModelUsageLedger } from "../session/model-usage-journal";
 import questionFile from "../prompts/judge/task-stall.json" with { type: "json" };
 import type { StallEvidence, StallVerdict } from "./stall-guard";
 
@@ -69,7 +70,7 @@ export function createRoleStallJudge(deps: {
 	settings: Settings;
 	registry: ModelRegistry;
 	sessionModel?: Model;
-	sessionManager?: Partial<JudgmentUsageLedger>;
+	sessionManager?: Partial<ModelUsageLedger>;
 }): StallJudge {
 	const judge = resolveJudge({
 		settings: deps.settings,

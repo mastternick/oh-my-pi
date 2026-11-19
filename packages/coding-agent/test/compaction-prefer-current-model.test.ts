@@ -178,6 +178,55 @@ describe("compaction prefers the current session model over modelRoles.default",
 		]);
 	});
 
+	it("keeps offline compaction on the active provider, ignoring the mapped model", async () => {
+		const baseModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const otherProvider = getBundledModel("openai", "gpt-5");
+		if (!baseModel || !otherProvider) throw new Error("Expected bundled test models");
+		const currentModel = buildModel({ ...baseModel, compat: baseModel.compatConfig });
+		const settings = Settings.isolated({
+			"models.offline": true,
+			"compaction.keepRecentTokens": 1,
+			"compaction.methodOrder": ["soft"],
+			"compaction.models": {
+				[`${currentModel.provider}/${currentModel.id}`]: `${otherProvider.provider}/${otherProvider.id}`,
+			},
+		});
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		authStorage.keys.setRuntime(currentModel.provider, "anthropic-token");
+		authStorage.keys.setRuntime(otherProvider.provider, "openai-token");
+		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: currentModel, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		session.subscribe(() => {});
+		for (const [userText, assistantText] of [
+			["first question", "first answer"],
+			["second question", "second answer"],
+		] as const) {
+			const user = userMsg(userText);
+			const assistant = assistantMsg(assistantText);
+			session.agent.appendMessage(user);
+			session.sessionManager.appendMessage(user);
+			session.agent.appendMessage(assistant);
+			session.sessionManager.appendMessage(assistant);
+		}
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => ({
+			summary: "offline summary",
+			shortSummary: "offline short summary",
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: 1,
+			details: { provider: model.provider },
+		}));
+
+		expect((await session.compact()).summary).toBe("offline summary");
+		expect(compactSpy.mock.calls.map(([, model]) => `${model.provider}/${model.id}`)).toEqual([
+			`${currentModel.provider}/${currentModel.id}`,
+		]);
+	});
+
 	it("uses the mapped compaction model only for the summary call and leaves the active model unchanged", async () => {
 		const baseCurrentModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const compactionModel = getBundledModel("openai", "gpt-5");

@@ -33,11 +33,26 @@ export interface MnemopiEmbeddingProvider {
 	available?(): boolean | Promise<boolean>;
 }
 
+/** A remote embedding request that produced no vectors; the embedding call returns null. */
+export interface EmbeddingRequestFailure {
+	baseUrl: string;
+	model: string;
+	/** HTTP status; undefined for network errors, timeouts, and malformed responses. */
+	status?: number;
+	/** Provider response text or error message. */
+	message: string;
+}
+
 export interface MnemopiEmbeddingRuntimeOptions {
 	disabled?: boolean;
 	model?: string;
 	/** Ordered fallback embedding models tried after `model`. Each chain model keeps its own vectors. */
 	fallbackModels?: readonly string[];
+	/** Whether the resolved remote embedding endpoint may be called. */
+	allowRemote?: (baseUrl: string) => boolean;
+	/** Whether local inference and loading an uncached local model are allowed. */
+	allowLocal?: () => boolean;
+	allowLocalLoad?: () => boolean;
 	apiUrl?: string;
 	apiKey?: ApiKey;
 	provider?: MnemopiEmbeddingProvider | ((texts: readonly string[]) => EmbeddingOutput | Promise<EmbeddingOutput>);
@@ -45,10 +60,26 @@ export interface MnemopiEmbeddingRuntimeOptions {
 	maxInputChars?: number;
 	/** Override `MNEMOPI_EMBEDDING_BATCH_SIZE`: max texts per embedding API request. */
 	batchSize?: number;
+	/**
+	 * Override `MNEMOPI_EMBEDDING_QUERY_PREFIX`: text prepended to recall queries before
+	 * embedding, for instruction-tuned embedders (Qwen3-Embedding `Instruct: …\nQuery: `,
+	 * E5 `query: `). Stored memories are embedded unchanged.
+	 */
+	queryPrefix?: string;
+	/**
+	 * Override `MNEMOPI_EMBEDDING_INPUT_TYPE`: send `input_type` with API requests, `query` for
+	 * recall queries and `passage` for stored memories. NVIDIA NIM asymmetric embedders reject
+	 * requests without it.
+	 */
+	inputType?: boolean;
+	/** Called for every failed embedding API request, so a host can surface it; exceptions are ignored. */
+	onRequestFailed?: (failure: EmbeddingRequestFailure) => void;
 }
 
 export interface MnemopiLlmRuntimeOptions {
 	enabled?: boolean;
+	/** Whether a configured remote endpoint may be called at request time. */
+	allowRemote?: () => boolean;
 	baseUrl?: string;
 	apiKey?: ApiKey;
 	model?: string | Model<Api>;
@@ -71,15 +102,22 @@ export interface ResolvedMnemopiEmbeddingRuntimeOptions {
 	disabled?: boolean;
 	model?: string;
 	fallbackModels?: readonly string[];
+	allowRemote?: (baseUrl: string) => boolean;
+	allowLocal?: () => boolean;
+	allowLocalLoad?: () => boolean;
 	apiUrl?: string;
 	apiKey?: ApiKey;
 	provider?: MnemopiEmbeddingProvider;
 	maxInputChars?: number;
 	batchSize?: number;
+	queryPrefix?: string;
+	inputType?: boolean;
+	onRequestFailed?: (failure: EmbeddingRequestFailure) => void;
 }
 
 export interface ResolvedMnemopiLlmRuntimeOptions {
 	enabled?: boolean;
+	allowRemote?: () => boolean;
 	baseUrl?: string;
 	apiKey?: ApiKey;
 	model?: string | Model<Api>;

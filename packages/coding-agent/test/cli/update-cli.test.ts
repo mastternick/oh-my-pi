@@ -126,6 +126,96 @@ describe("runUpdateCommand version source", () => {
 	);
 });
 
+describe("runUpdateCommand on the custom channel", () => {
+	const saved = {
+		realBin: process.env.OMP_REAL_BIN,
+		updater: process.env.OMP_DAILY_UPDATE_SH,
+		home: process.env.OMP_CUSTOM_HOME,
+	};
+	const dirs: string[] = [];
+
+	beforeEach(async () => {
+		dirs.push(await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-update-custom-"))));
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		for (const [key, value] of [
+			["OMP_REAL_BIN", saved.realBin],
+			["OMP_DAILY_UPDATE_SH", saved.updater],
+			["OMP_CUSTOM_HOME", saved.home],
+		] as const) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		await Promise.all(dirs.splice(0).map(dir => removeWithRetries(dir)));
+	});
+
+	/**
+	 * Pose as a custom install: `OMP_REAL_BIN` into a scratch root plus a deployed
+	 * updater that records its argv instead of installing anything.
+	 */
+	async function customInstall(exitCode = 0): Promise<{ ran: string }> {
+		const dir = dirs.at(-1) as string;
+		const updater = path.join(dir, "omp-daily-update.sh");
+		const ran = path.join(dir, "updater-argv");
+		await Bun.write(updater, `#!/bin/sh\nprintf '%s\\n' "$*" > '${ran}'\nexit ${exitCode}\n`);
+		await fs.chmod(updater, 0o755);
+		process.env.OMP_REAL_BIN = path.join(dir, "omp-custom", "current", "node_modules", "dist", "cli.js");
+		process.env.OMP_DAILY_UPDATE_SH = updater;
+		process.env.OMP_CUSTOM_HOME = path.join(dir, "omp-custom");
+		return { ran };
+	}
+
+	/** Record every fetch so a regression to npm or the build service is visible. */
+	function stubFetch(): string[] {
+		const requests: string[] = [];
+		vi.spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async (input: FetchInput) => {
+					requests.push(String(input));
+					return new Response(null, { status: 404 });
+				},
+				{ preconnect: globalThis.fetch.preconnect },
+			),
+		);
+		return requests;
+	}
+
+	it("runs the deployed updater instead of npm or a package manager", async () => {
+		const { ran } = await customInstall();
+		const requests = stubFetch();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+
+		const outcome = await runUpdateCommand({ force: false, check: false });
+
+		expect(await Bun.file(ran).text()).toBe("\n");
+		expect(requests).toEqual([]);
+		expect(outcome).toEqual({ kind: "current" });
+	});
+
+	it("forwards --check to the updater's check mode", async () => {
+		const { ran } = await customInstall();
+		const requests = stubFetch();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+
+		const outcome = await runUpdateCommand({ force: false, check: true });
+
+		expect((await Bun.file(ran).text()).trim()).toBe("--check");
+		expect(requests).toEqual([]);
+		expect(outcome).toEqual({ kind: "current" });
+	});
+
+	it("throws when the updater fails, so the caller can record it", async () => {
+		await customInstall(7);
+		const requests = stubFetch();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+
+		await expect(runUpdateCommand({ force: false, check: false })).rejects.toThrow("exited with status 7");
+		expect(requests).toEqual([]);
+	});
+});
+
 describe("getLatestRelease rename pointers", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();

@@ -58,6 +58,14 @@
 # Malformed, ambiguous, or tree-mismatched certificates fail before any push, CI, tag, or
 # release. A branch without OMP-AI-* trailers keeps the normal manual/clean path.
 #
+# A review is advisory: when the model review did not accept the resolution (or accepted it
+# beside an error finding) the controller escalates instead of failing, and records that as
+# one optional extra trailer, `OMP-AI-Review-Escalated: v1 <n> error finding(s); <path>[,<path>...]`
+# (<n> a non-negative error-finding count, 0 when it rejected without naming one; at least
+# one path; one line). It is validated and then treated exactly like a certificate, because
+# the candidate is still the reviewed tree and the CI gate, not the review, decides
+# publication; the controller's state/needs-attention file is what asks the operator to look.
+#
 # Requires: git, gh (authenticated), jq.
 # shellcheck disable=SC2016 # jq programs use $name for their own arguments on purpose
 set -euo pipefail
@@ -317,6 +325,12 @@ EOF
 # CERT_BASE and CERT_TREE (all empty when the branch has no certificate). These are globals,
 # not stdout: a call inside $(...) would turn fail() into an empty result.
 CERT_MODEL="opencode-go/deepseek-v4.1-flash"
+# The escalation trailer's shape, byte for byte what ai-conflict-controller.sh's
+# escalation_trailer_line() writes:
+#   OMP-AI-Review-Escalated: v1 <n> error finding(s); <path>[,<path>...]
+# with <n> a non-negative integer error-finding count (0 = rejected without naming an
+# error finding) and at least one comma-separated path on one line.
+CERT_ESCALATED_RE='^v1 ([0-9]+) error finding\(s\); [^,]+(,[^,]+)*$'
 CERT_COMMIT=""
 CERT_BASE=""
 CERT_TREE=""
@@ -361,7 +375,16 @@ review_certificate() { # ref
           rt="$value" ;;
         OMP-AI-Model)
           [[ "$value" == "$CERT_MODEL" ]] || fail "AI review on $c was produced by '$value', not $CERT_MODEL" ;;
-        *) fail "unsupported AI review trailer $key on $c" ;;
+        # Optional and purely informational: the controller already decided to publish this
+        # candidate and the gate decides it. Only its shape is checked, and that shape is the
+        # one ai-conflict-controller.sh writes (its escalation_trailer_line), on one line:
+        #   OMP-AI-Review-Escalated: v1 <n> error finding(s); <path>[,<path>...]
+        # with <n> a non-negative integer error-finding count (0 = rejected without naming
+        # an error finding) and at least one path.
+        OMP-AI-Review-Escalated)
+          [[ "$value" =~ $CERT_ESCALATED_RE ]] \
+            || fail "malformed escalated review trailer on $c: '$line'" ;;
+        *) fail "unsupported AI review trailer on $c: '$line'" ;;
       esac
     done <<<"$lines"
     for key in OMP-AI-Conflict-Review OMP-AI-Reviewed-Base OMP-AI-Reviewed-Tree OMP-AI-Model; do

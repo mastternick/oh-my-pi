@@ -1116,6 +1116,40 @@ expect_eq "cert schedule: tag points at the gated candidate" \
   "$(tag_commit "$origin" custom-v18.16.0-c1)" "$(custom_sha "$origin")"
 expect_eq "cert schedule: release recorded once" "$(count_releases "$d/state")" 1
 
+# --- 33b. an escalated review certificate binds exactly like an accepted one --------
+d="$tmp/cases/cert-escalated"; origin="$tmp/o-cert-escalated.git"
+new_origin "$origin" v18.15.0 sync
+gbase="$(custom_sha "$origin")"
+gtree="$(reviewed_tree "$origin")"
+tip="$(publish_cert_branch "$origin" \
+  "$(cert_block v1 "$gbase" "$gtree" "$cert_model")"$'\n'"OMP-AI-Review-Escalated: v1 1 error finding(s); shared.txt")"
+run_sync "$d" "$origin" v18.16.0
+expect_rc "cert escalated: exits 0 with no guard inputs" 0 "$RC"
+expect_eq "cert escalated: candidate carries the reviewed tree" \
+  "$(git --git-dir="$origin" rev-parse 'refs/heads/custom^{tree}')" "$gtree"
+expect_eq "cert escalated: sync branch advanced, not rewritten" \
+  "$(git --git-dir="$origin" merge-base --is-ancestor "$tip" refs/heads/sync/upstream-v18.16.0 && echo yes || echo no)" "yes"
+expect_eq "cert escalated: release recorded once" "$(count_releases "$d/state")" 1
+
+# --- 33c. an escalation with a zero error count is a valid certificate --------------
+# A re-review that rejected without naming an error finding cannot be retried, so the
+# controller records `0 error finding(s)`; the shape is the same certificate.
+d="$tmp/cases/cert-escalated-zero"; origin="$tmp/o-cert-escalated-zero.git"
+new_origin "$origin" v18.15.0 sync
+gbase="$(custom_sha "$origin")"
+gtree="$(reviewed_tree "$origin")"
+tip="$(publish_cert_branch "$origin" \
+  "$(cert_block v1 "$gbase" "$gtree" "$cert_model")"$'\n'"OMP-AI-Review-Escalated: v1 0 error finding(s); shared.txt")"
+run_sync "$d" "$origin" v18.16.0
+expect_rc "cert escalated zero: exits 0 with no guard inputs" 0 "$RC"
+expect_contains "cert escalated zero: reports the bound certificate" "$d/out.log" \
+  "AI review certificate on sync/upstream-v18.16.0"
+expect_eq "cert escalated zero: candidate carries the reviewed tree" \
+  "$(git --git-dir="$origin" rev-parse 'refs/heads/custom^{tree}')" "$gtree"
+expect_eq "cert escalated zero: sync branch advanced, not rewritten" \
+  "$(git --git-dir="$origin" merge-base --is-ancestor "$tip" refs/heads/sync/upstream-v18.16.0 && echo yes || echo no)" "yes"
+expect_eq "cert escalated zero: release recorded once" "$(count_releases "$d/state")" 1
+
 # --- 34. a certificate buried under a later commit is still enforced ---------------
 d="$tmp/cases/cert-buried"; origin="$tmp/o-cert-buried.git"
 new_origin "$origin" v18.15.0 sync
@@ -1168,6 +1202,9 @@ for variant in missing-model duplicate-base version-v2 wrong-model short-base un
     unknown-key)
       trailers="$(cert_block v1 "$gbase" "$gtree" "$cert_model")"$'\n'"OMP-AI-Job: sync-x"
       want="unsupported AI review trailer" ;;
+    escalated-malformed)
+      trailers="$(cert_block v1 "$gbase" "$gtree" "$cert_model")"$'\n'"OMP-AI-Review-Escalated: v1 no findings"
+      want="malformed escalated review trailer" ;;
     prose-trailer)
       trailers="$(cert_block v1 "$gbase" "$gtree" "$cert_model")"$'\n\n'"Reviewed by hand."
       want="outside its trailer block" ;;

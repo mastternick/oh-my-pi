@@ -20,15 +20,20 @@
 #      with the rejected region named in the request; a second copy stops the run. A review
 #      that rejects paths with error findings earns one fresh resolve retry per path, fed
 #      with those findings and the answers they rejected, then exactly those changed paths are
-#      reviewed again; a second rejection stops the run with the findings. A batch that
-#      rejects without naming an error finding cannot be retried and stops the run too.
+#      reviewed again. A batch that rejects without naming an error finding cannot be retried
+#      and stops the run. A review that still dislikes the resolution is advisory, not fatal:
+#      the candidate is published for the CI gate with an extra certificate trailer
+#      `OMP-AI-Review-Escalated: v1 <n> error finding(s); <path>[,<path>...]`, and
+#      state/needs-attention is written for the operator-facing daily job.
 #   4. Apply exactly the allowlisted results (writing content with the mode of the one
 #      regular stage, or removing the path from the index), run deterministic checks,
 #      commit the merge, and re-verify origin/<base> is unchanged before pushing
 #      the non-force branch sync/upstream-<tag>.
 #   5. Dispatch custom-sync with expected_base_sha/expected_tree_sha and wait for a
-#      terminal success. Any stale base, existing sync branch, race, adapter failure,
-#      rejected review, or failed run stops without publishing.
+#      terminal success. A stale base, a branch that appears while this run resolves, a
+#      race, adapter failure, unusable model output, or a failed run stops without
+#      publishing. A branch that already held this tag's candidate when the run started is
+#      deferred (exit 75), because that candidate is what the gate is already testing.
 #
 #   ai-conflict-controller.sh [vX.Y.Z]     (default: newest stable upstream tag)
 #
@@ -80,8 +85,9 @@
 #                                 token is exported for gh subprocesses only (never printed,
 #                                 never `gh auth switch`). Unset = ambient gh login.
 #
-# Exit codes: 0 no work or a successful hand-off; 75 deferred (lock busy or low space);
-# 1 any failure. Nothing is force-pushed and no secret is logged.
+# Exit codes: 0 no work or a successful hand-off; 75 deferred (lock busy, low space, or a
+# candidate already published and waiting on the CI gate); 1 any failure. Nothing is
+# force-pushed and no secret is logged.
 #
 # Requires: git, gh (authenticated for $OMP_CUSTOM_REPO), jq, bun, df, flock.
 # shellcheck disable=SC2016 # jq programs reference their own $variables on purpose
@@ -135,6 +141,9 @@ tree=""
 run_dir=""
 LOG=""
 work=""
+escalated=0
+escalation_trailer=""
+escalation_detail=""
 
 umask 077
 
@@ -167,6 +176,25 @@ fail() {
   log "error: $*"
   record_result failed "$*"
   exit 1
+}
+
+# The operator-facing daily job reads this one line to surface a run that needs a human:
+# the ISO timestamp, the tag, and a short reason. It is written when a review escalates and
+# removed the moment a review accepts, so it never describes a stale run.
+note_needs_attention() { # short reason
+  local reason="$1"
+  [[ -d "$STATE" ]] || return 0
+  reason="$(printf '%s' "$reason" | tr '\t\n' '  ')"
+  (( ${#reason} <= 200 )) || reason="${reason:0:199}..."
+  printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "${tag:-}" "$reason" \
+    >"$STATE/needs-attention.tmp" 2>/dev/null || return 0
+  chmod 600 "$STATE/needs-attention.tmp" 2>/dev/null || true
+  mv -f "$STATE/needs-attention.tmp" "$STATE/needs-attention" 2>/dev/null || true
+}
+
+clear_needs_attention() {
+  [[ -d "$STATE" ]] || return 0
+  rm -f -- "$STATE/needs-attention" "$STATE/needs-attention.tmp" 2>/dev/null || true
 }
 
 defer() {
@@ -285,20 +313,25 @@ merge_msg="chore(sync): merge upstream $tag"
 br_name="sync/upstream-$tag"
 
 # A pre-existing bot branch would be refresh-merged by sync-upstream.sh onto the current
-# base, producing a tree this model never reviewed. The check runs before any model call
-# and again immediately before the push (a run may create it while we resolve), and a
-# failed query fails closed instead of reading as "absent".
-assert_sync_branch_absent() {
+# base, producing a tree this model never reviewed. The query fails closed when origin
+# cannot be asked; the caller decides whether an existing branch is a stop or a defer.
+sync_branch_exists() { # 0 = the branch is on origin
   local remote_branches
   if ! remote_branches="$("${GIT[@]}" -C "$work" ls-remote --heads origin "$br_name")"; then
     fail "could not query origin for $br_name"
   fi
-  [[ -z "$remote_branches" ]] \
-    || fail "$br_name already exists on origin; refusing to overwrite an existing sync branch"
+  [[ -n "$remote_branches" ]]
+}
+
+assert_sync_branch_absent() {
+  if sync_branch_exists; then
+    fail "$br_name already exists on origin; refusing to overwrite an existing sync branch"
+  fi
 }
 
 if "${GIT[@]}" -C "$work" merge-base --is-ancestor "$up_commit" "$base_sha"; then
   log "$tag is already merged into origin/$BASE; the existing custom-sync run owns the release path"
+  clear_needs_attention
   record_result noop "upstream $tag already merged into $BASE"
   exit 0
 fi
@@ -315,6 +348,7 @@ merge_rc=0
 if [[ "$merge_rc" -eq 0 ]]; then
   "${GIT[@]}" -C "$work" merge --abort >/dev/null 2>&1 || true
   log "$tag merges cleanly into origin/$BASE; leaving it to the existing GitHub custom-sync run (no model call)"
+  clear_needs_attention
   record_result noop "clean merge for $tag; no model call"
   exit 0
 fi
@@ -329,7 +363,12 @@ if (( ${#unmerged[@]} == 0 )); then
   fail "git merge reported a conflict but the index has no unmerged entries"
 fi
 
-assert_sync_branch_absent
+# The branch holds the candidate an earlier window of this same day published; the CI gate
+# owns it now, so this is work already in flight, not a conflict to resolve or a failure.
+# Deferring (75, SuccessExitStatus) keeps the unit green and the model idle.
+if sync_branch_exists; then
+  defer "$br_name already exists on origin; a candidate is published and waiting on the CI gate"
+fi
 
 # --- collect and vet exactly the conflicted paths --------------------------------
 
@@ -708,7 +747,8 @@ check_review_result() { # response-file jobKey paths-json label
         and (.severity == "error" or .severity == "warning" or .severity == "info")
         and (.message | type == "string" and length > 0 and length <= 4000))
   and (if .verdict == "rejected" then (.findings | length) > 0 else true end)
-  and (if .verdict == "accepted" then ([.findings[] | select(.severity == "error")] | length) == 0 else true end)
+  # An "accepted" verdict beside an error finding is incoherent, but it is a well-formed
+  # answer about a well-formed resolution, so it is escalated rather than refused here.
   and .proof.provider == $provider and .proof.model == $model
   and .proof.toolCalls == 0 and .proof.toolsExposed == 0
   and (.proof.sessionName | type == "string")
@@ -1087,15 +1127,14 @@ run_review "$review_out" "review result"
 verdict="$(jq -r '.verdict' "$review_out")"
 
 # --- one bounded review-feedback retry --------------------------------------------
-# The review is the last gate before publication, so its rejection earns exactly one
-# further attempt per path it names with an error finding: a fresh resolve session that
-# carries the path's region plan, the answers the review rejected, and the findings. Only
-# the paths whose answers changed are reviewed again, in fresh batches grouped per path:
-# every other path's bytes are identical to what the first review accepted, so re-judging
-# them would add payload and review variance without covering a changed byte. A batch that
-# rejected without naming an error finding stopped the run before this point. A path that
-# already spent its one retry on a side copy is never retried twice, and a second rejection
-# fails the run with the findings, so no unreviewed variant can be published.
+# A rejection earns exactly one further attempt per path it names with an error finding: a
+# fresh resolve session that carries the path's region plan, the answers the review rejected,
+# and the findings. Only the paths whose answers changed are reviewed again, in fresh batches
+# grouped per path: every other path's bytes are identical to what the first review accepted,
+# so re-judging them would add payload and review variance without covering a changed byte. A
+# batch that rejected without naming an error finding stopped the run before this point. A path
+# that already spent its one retry on a side copy is never retried twice; it and a review that
+# survives its retry escalate instead of failing, because the resolution itself is well formed.
 review_retry_line=""
 if [[ "$verdict" != "accepted" ]]; then
   retry_error_paths=()
@@ -1105,12 +1144,20 @@ if [[ "$verdict" != "accepted" ]]; then
   findings="$(jq -r '.findings[] | "\(.severity) \(.path): \(.message)"' "$review_out" | tr '\n' ';')"
   (( ${#retry_error_paths[@]} > 0 )) \
     || fail "review rejected the resolution without an error finding naming a path, so no retry can target it: $findings"
-  log "review rejected the resolution; re-resolving ${#retry_error_paths[@]} path(s) once in fresh sessions (-rev1): $(printf '%s ' "${retry_error_paths[@]}")"
+  retry_targets=()
+  for rp in "${retry_error_paths[@]}"; do
+    if [[ -n "${retry_used[$rp]:-}" ]]; then
+      log "warning: '$rp' already spent its one retry on a side copy; escalating it instead of retrying again: $findings"
+      continue
+    fi
+    retry_targets+=("$rp")
+  done
+  if (( ${#retry_targets[@]} > 0 )); then
+    log "review rejected the resolution; re-resolving ${#retry_targets[@]} path(s) once in fresh sessions (-rev1): $(printf '%s ' "${retry_targets[@]}")"
+  fi
   rk=0
   retry_cert=()
-  for rp in "${retry_error_paths[@]}"; do
-    [[ -z "${retry_used[$rp]:-}" ]] \
-      || fail "review rejected '$rp' after its one retry (a side-copy retry already ran); refusing a second retry: $findings"
+  for rp in "${retry_targets[@]}"; do
     rk=$((rk + 1))
     rjob="${jobKey}-rev1-$rk"
     rreq="$req/rev1.$rk"
@@ -1167,7 +1214,7 @@ if [[ "$verdict" != "accepted" ]]; then
   rbn=0
   rci=0
   rco=0
-  for rp in "${retry_error_paths[@]}"; do
+  for rp in "${retry_targets[@]}"; do
     p_in="$(tokens_of "${est_in[$rp]}")"
     p_out="$(tokens_of "${est_out[$rp]}")"
     if (( rbn == 0 )) || (( rci + p_in > BATCH_IN )) || (( rco + p_out > BATCH_OUT )) \
@@ -1223,39 +1270,74 @@ if [[ "$verdict" != "accepted" ]]; then
   (( total_text + rres_total <= 16000000 )) \
     || fail "conflicted text plus proposed resolution exceeds the adapter input budget"
 
-  jq -s --arg job "$jobKey" '
-    {ok: true, mode: "review", jobKey: $job,
-     model: .[0].model, session: .[0].session, proof: .[0].proof,
-     verdict: (if all(.[]; .verdict == "accepted") then "accepted" else "rejected" end),
-     findings: [.[].findings[]]}' "${retry_review_outs[@]}" >"$req/review2.retry.json" \
-    || fail "could not merge the re-reviews of the retried paths"
+  if (( rbn > 0 )); then
+    jq -s --arg job "$jobKey" '
+      {ok: true, mode: "review", jobKey: $job,
+       model: .[0].model, session: .[0].session, proof: .[0].proof,
+       verdict: (if all(.[]; .verdict == "accepted") then "accepted" else "rejected" end),
+       findings: [.[].findings[]]}' "${retry_review_outs[@]}" >"$req/review2.retry.json" \
+      || fail "could not merge the re-reviews of the retried paths"
 
-  # The first review keeps binding exactly the paths it judged and that did not change; the
-  # re-review supersedes its findings for the retried paths.
-  retried_json="$(jq -c -n --args '$ARGS.positional' "${retry_error_paths[@]}")"
-  review_out="$req/review2.out.json"
-  jq -n --arg job "$jobKey" --slurpfile first "$req/review.out.json" \
-    --slurpfile again "$req/review2.retry.json" --argjson retried "$retried_json" '
-    {ok: true, mode: "review", jobKey: $job,
-     model: $first[0].model, session: $again[0].session, proof: $again[0].proof,
-     verdict: $again[0].verdict,
-     findings: ([$first[0].findings[] | select(.path as $p | ($retried | index($p)) == null)] + $again[0].findings)}' \
-    >"$review_out" || fail "could not merge the first review with the re-review"
-  check_review_result "$review_out" "$jobKey" "$conflict_paths_json" "review result after a retry"
-  verdict="$(jq -r '.verdict' "$review_out")"
-  retry_cert_join="$(IFS=';'; printf '%s' "${retry_cert[*]}")"
-  if [[ "$verdict" != "accepted" ]]; then
-    findings="$(jq -r '.findings[] | "\(.severity) \(.path): \(.message)"' "$review_out" | tr '\n' ';')"
-    fail "review rejected the resolution again after one retry (-rev1: $retry_cert_join): $findings"
+    # The first review keeps binding exactly the paths it judged and that did not change; the
+    # re-review supersedes its findings for the retried paths.
+    retried_json="$(jq -c -n --args '$ARGS.positional' "${retry_targets[@]}")"
+    review_out="$req/review2.out.json"
+    jq -n --arg job "$jobKey" --slurpfile first "$req/review.out.json" \
+      --slurpfile again "$req/review2.retry.json" --argjson retried "$retried_json" '
+      {ok: true, mode: "review", jobKey: $job,
+       model: $first[0].model, session: $again[0].session, proof: $again[0].proof,
+       verdict: $again[0].verdict,
+       findings: ([$first[0].findings[] | select(.path as $p | ($retried | index($p)) == null)] + $again[0].findings)}' \
+      >"$review_out" || fail "could not merge the first review with the re-review"
+    check_review_result "$review_out" "$jobKey" "$conflict_paths_json" "review result after a retry"
+    verdict="$(jq -r '.verdict' "$review_out")"
+    if [[ "$verdict" == "accepted" ]]; then
+      retry_cert_join="$(IFS=';'; printf '%s' "${retry_cert[*]}")"
+      review_retry_line="Review-Retry: v1 re-resolved after a rejected review ($retry_cert_join; the re-review of the retried paths accepted)"
+    fi
   fi
-  review_retry_line="Review-Retry: v1 re-resolved after a rejected review ($retry_cert_join; the re-review of the retried paths accepted)"
 fi
 
-[[ "$(jq -r '.verdict' "$review_out")" == "accepted" ]] \
-  || fail "review did not accept the resolution"
-[[ "$(jq '[.findings[] | select(.severity == "error")] | length' "$review_out")" == "0" ]] \
-  || fail "review accepted the resolution while reporting an error finding"
-log "review accepted the resolution for ${#paths[@]} path(s) (${#deleted[@]} deletion(s))"
+# --- review outcome: accepted, or escalated to the CI gate and the operator ---------
+# A review that dislikes an otherwise well-formed resolution is advisory. The candidate is
+# still published and gated by custom-ci exactly as on an accepted review; the doubt travels
+# with it as an extra certificate trailer and one operator-facing needs-attention line, instead
+# of the work being discarded. Anything that would leave no trustworthy candidate (malformed or
+# absent model output, a refused side copy, region-answer validation, an apply-phase invariant,
+# a moved base, a failed push or run) has already stopped the run above.
+escalated=0
+escalation_trailer=""
+escalation_detail=""
+# One shape, stated once and validated verbatim by sync-upstream.sh's review_certificate():
+#   OMP-AI-Review-Escalated: v1 <n> error finding(s); <path>[,<path>...]
+# <n> is a non-negative integer error-finding count and the comma-separated list names at
+# least one path, all on one line. Zero means the review rejected without naming an error
+# finding (a warning-only review), which still names the paths it doubted. Keep the comment
+# in sync-upstream.sh identical when editing this.
+escalation_trailer_line() { # error-count paths
+  printf 'OMP-AI-Review-Escalated: v1 %s error finding(s); %s' "$1" "$2"
+}
+review_error_count="$(jq '[.findings[] | select(.severity == "error")] | length' "$review_out")" \
+  || fail "could not read the review findings"
+if [[ "$verdict" != "accepted" ]] || (( review_error_count > 0 )); then
+  escalated=1
+  escalation_paths="$(jq -r '[.findings[] | select(.severity == "error") | .path] | unique | join(",")' "$review_out")" \
+    || fail "could not read the review findings"
+  [[ -n "$escalation_paths" ]] \
+    || escalation_paths="$(jq -r '[.findings[].path] | unique | join(",")' "$review_out")"
+  [[ -n "$escalation_paths" ]] \
+    || fail "review escalated without naming a path; the trailer would be unreadable"
+  escalation_findings="$(jq -r '.findings[] | "\(.severity) \(.path): \(.message)"' "$review_out" \
+    | tr '\n' ';')"
+  escalation_trailer="$(escalation_trailer_line "$review_error_count" "$escalation_paths")"
+  escalation_detail="$(printf 'review %s with %s error finding(s) on %s: %s' \
+    "$verdict" "$review_error_count" "$escalation_paths" "$escalation_findings" | tr '\t\n' '  ')"
+  log "warning: review did not accept the resolution ($verdict); escalating the candidate instead of failing (rejected paths: $escalation_paths; $review_error_count error finding(s)): $escalation_findings"
+  note_needs_attention "review $verdict: $escalation_findings"
+else
+  clear_needs_attention
+  log "review accepted the resolution for ${#paths[@]} path(s) (${#deleted[@]} deletion(s))"
+fi
 
 # --- apply exactly the allowlisted results ---------------------------------------
 
@@ -1391,7 +1473,9 @@ done
 # to bind a later scheduled run to this exact review. A review retry is recorded beside them
 # as its own metadata paragraph: sync-upstream.sh refuses any trailer key it does not know,
 # so a retry marker must not become an OMP-AI-* trailer, and the certificate's four trailer
-# lines stay exactly what that parser validates.
+# lines stay exactly what that parser validates. An escalated review is different: it is part
+# of the certificate, so it rides in the same trailer block and its paths are what the operator
+# has to look at, while base/tree/model keep meaning exactly what they meant on acceptance.
 reviewed_tree="$("${GIT[@]}" -C "$work" write-tree)" || fail "could not write the reviewed tree"
 merge_msg_file="$req/merge-message"
 {
@@ -1403,6 +1487,9 @@ merge_msg_file="$req/merge-message"
   printf 'OMP-AI-Reviewed-Base: %s\n' "$base_sha"
   printf 'OMP-AI-Reviewed-Tree: %s\n' "$reviewed_tree"
   printf 'OMP-AI-Model: %s/%s\n' "$MODEL_PROVIDER" "$MODEL_ID"
+  if [[ -n "$escalation_trailer" ]]; then
+    printf '%s\n' "$escalation_trailer"
+  fi
 } >"$merge_msg_file"
 "${GIT[@]}" -C "$work" commit --quiet --no-verify -F "$merge_msg_file" \
   || fail "could not commit the resolved merge"
@@ -1494,7 +1581,11 @@ while :; do
     if [[ "$r_status" == "completed" ]]; then
       [[ "$r_conclusion" == "success" ]] || fail "$SYNC_WF run $run_id concluded '$r_conclusion'"
       log "done: $SYNC_WF run $run_id succeeded for $tag -> $candidate (tree $tree)"
-      record_result success "$SYNC_WF run $run_id succeeded; candidate $candidate on $br_name"
+      if (( escalated )); then
+        record_result escalated "$SYNC_WF run $run_id succeeded for an escalated review; candidate $candidate on $br_name; $escalation_detail"
+      else
+        record_result success "$SYNC_WF run $run_id succeeded; candidate $candidate on $br_name"
+      fi
       exit 0
     fi
   fi

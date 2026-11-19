@@ -131,7 +131,7 @@ pre="$ROOT/state/launcher-config.pre-custom"
 # Rewrite only the keys the custom channel owns; keep the rest of the config untouched.
 tmp_cfg="$cfg.new.$$"
 {
-  grep -Ev '^(OMP_REAL_BIN|OMP_REAL_RUNNER|OMP_REAL_VERSION|OMP_PFB_GUARD_SKIP|OMP_LAUNCHER_PFB_ENSURE)=' "$cfg" || true
+  grep -Ev '^(export )?(OMP_REAL_BIN|OMP_REAL_RUNNER|OMP_REAL_VERSION|OMP_PFB_GUARD_SKIP|OMP_LAUNCHER_PFB_ENSURE)=' "$cfg" || true
   printf '# omp-custom channel (managed by scripts/custom/install.sh)\n'
   printf 'OMP_REAL_BIN=%q\n' "$ROOT/current/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js"
   printf 'OMP_REAL_RUNNER=%q\n' "$runner"

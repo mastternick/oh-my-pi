@@ -12,7 +12,11 @@ Environment="PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 # Account and repository settings only (for example OMP_AI_CONFLICTS_GH_USER). Tokens
 # come from the existing gh login; this file must never hold one.
 EnvironmentFile=-%h/.config/omp-custom/ai-conflicts.env
-# 75 is deferred (install lock busy, or not enough free space on the RAM work root), not a failure.
+# OMP_AI_CONFLICTS_STATE_DIR is read here and by omp-daily-update.service, which looks for
+# needs-attention in that same directory. systemd does not share environment between units:
+# if you set it for this unit, set the identical value for omp-daily-update.service too.
+# 75 is deferred (install lock busy, too little free space on the RAM work root, or a
+# sync/upstream-<tag> candidate already published and waiting on the gate), not a failure.
 SuccessExitStatus=75
 # Two 900 s adapter calls plus the 7200 s CI wait, with headroom: under 3 h.
 TimeoutStartSec=9600

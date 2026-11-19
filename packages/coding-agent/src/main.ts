@@ -42,6 +42,7 @@ import { buildInitialMessage } from "./cli/initial-message";
 import { formatKeyHint, KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import type { SessionPickerOptions } from "@oh-my-pi/pi-tui/apps/session-picker";
 import { fetchBuild } from "./cli/build-service";
+import { isCustomChannelInstall } from "./cli/custom-channel";
 import { applyStartupCwd } from "./cli/startup-cwd";
 import { runAutoUpdate } from "./cli/auto-update";
 import { getLatestRelease, isSourceCheckout, managedInstallName, resolveOmpPath } from "./cli/update-cli";
@@ -273,10 +274,16 @@ function writeStartupWarning(warning: string): void {
 	process.stderr.write(`${chalk.yellow(`Warning: ${warning}`)}\n`);
 }
 
-async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
+/** Ask where the running build's channel publishes its newest version; undefined when there is nothing to say. */
+export async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
 	if (!cfgStartupCheckUpdate.get(settings) && !cfgUpdateAuto.get(settings)) {
 		return;
 	}
+	// The custom channel publishes `custom-v*` releases installed by
+	// scripts/custom/install.sh. npm only has upstream omp, so any version it
+	// names here would be wrong advice — and `omp update` would replace the
+	// custom build. Its systemd timer owns that channel's updates.
+	if (isCustomChannelInstall({ ompPath: resolveOmpPath() })) return;
 	try {
 		// Checkouts update through git and a manager (Tern) updates its omp itself:
 		// "run omp update" would be wrong advice for both.

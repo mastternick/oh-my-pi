@@ -3,15 +3,16 @@ Description=Run the omp-custom daily release installer
 Documentation=https://github.com/mastternick/oh-my-pi/blob/custom/docs/UPDATING.md
 
 [Timer]
-# Daily at 05:40 local time, plus up to two hours of jitter. The sync publishes at
-# 06:17 UTC, so whether a release is installed on the same local day depends on the
-# machine's UTC offset; a release this window misses is installed by the next daily
-# cycle, and Persistent=true also fires a run missed while the machine was off.
-# RandomizedDelaySec spreads the load across a two-hour window so a resume-from-suspend
-# burst does not hit GitHub at once. Persistent=true catches up after downtime, and the
+# Two local windows, both after the sync pipeline can finish. custom-sync publishes at
+# 06:17 UTC; on a UTC+2 machine 10:20 local is 08:20 UTC, so the release exists before
+# this run starts. The 18:20 local (16:20 UTC) window is the retry: it installs a release
+# that published late, whose first install failed, or that this machine missed while off.
+# RandomizedDelaySec spreads each window so a resume-from-suspend burst does not hit
+# GitHub at once. Persistent=true catches up a window missed during downtime, and the
 # updater is idempotent, so a run without a new release only checks for one.
-OnCalendar=*-*-* 05:40:00
-RandomizedDelaySec=2h
+OnCalendar=*-*-* 10:20:00
+OnCalendar=*-*-* 18:20:00
+RandomizedDelaySec=40min
 Persistent=true
 AccuracySec=10min
 

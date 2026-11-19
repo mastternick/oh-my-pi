@@ -22,8 +22,10 @@ export function isOfficialCodexApiUrl(baseUrl: string | undefined): boolean {
 }
 
 /**
- * Pinned OpenAI Codex client version (corresponds to @openai/codex package version).
- * Updated from npm by `bun run check-spoofed-versions --update`.
+ * Pinned OpenAI Codex client version (corresponds to @openai/codex package version):
+ * the floor and offline fallback for `getCodexClientVersion()` in `./codex-version`,
+ * which tracks the latest npm release at runtime. Read the version through that
+ * function, not this constant. Updated from npm by `bun run check-spoofed-versions --update`.
  *
  * The backend version-gates discovery against this value on `/models?client_version=` (and accepts it on
  * `/responses`), independently of a model's declared `minimal_client_version`: GPT-6.1 Sol declares 0.153.0

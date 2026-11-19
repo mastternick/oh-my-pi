@@ -25,7 +25,9 @@ import {
 	cfgMnemopiEmbeddingApiKey,
 	cfgMnemopiEmbeddingApiUrl,
 	cfgMnemopiEmbeddingFallbackModels,
+	cfgMnemopiEmbeddingInputType,
 	cfgMnemopiEmbeddingModel,
+	cfgMnemopiEmbeddingQueryPrefix,
 	cfgMnemopiEmbeddingVariant,
 	cfgMnemopiEnhancedRecall,
 	cfgMnemopiExperienceEnabled,
@@ -51,6 +53,7 @@ export type MnemopiScoping = "global" | "per-project" | "per-project-tagged";
 export type MnemopiProviderOptions = Pick<
 	MnemopiOptions,
 	| "noEmbeddings"
+	| "embeddings"
 	| "embeddingModel"
 	| "embeddingFallbackModels"
 	| "embeddingApiUrl"
@@ -96,8 +99,9 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 	const configuredDbPath = cfgMnemopiDbPath.get(settings);
 	const cwd = settings.getCwd();
 	const scoping = cfgMnemopiScoping.get(settings);
+	// Separators only: `path.normalize` would also collapse `..`, which names another directory after a symlink.
 	const dbPath = configuredDbPath?.trim()
-		? expandTilde(configuredDbPath.trim())
+		? expandTilde(configuredDbPath.trim()).replaceAll("/", path.sep)
 		: path.join(getMemoriesDir(agentDir), "mnemopi", "mnemopi.db");
 	const projectIdentity = resolveProjectIdentity(cwd);
 	const repoRoot = resolveProjectRepoRoot(cwd);
@@ -145,6 +149,11 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 			embeddingFallbackModels: cfgMnemopiEmbeddingFallbackModels.get(settings),
 			embeddingApiUrl: cfgMnemopiEmbeddingApiUrl.get(settings),
 			embeddingApiKey: cfgMnemopiEmbeddingApiKey.get(settings),
+			embeddings: {
+				// A blank prefix is unset; a set one keeps its whitespace (`query: `).
+				queryPrefix: cfgMnemopiEmbeddingQueryPrefix.get(settings) || undefined,
+				inputType: cfgMnemopiEmbeddingInputType.get(settings),
+			},
 			llm:
 				llmMode === "remote"
 					? {

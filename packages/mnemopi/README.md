@@ -91,7 +91,11 @@ Common environment fallbacks:
 - `MNEMOPI_EMBEDDING_FALLBACK_MODELS`: comma-separated embedding models tried in order after `MNEMOPI_EMBEDDING_MODEL` when it fails (e.g. `nvidia/nemotron-3-embed-1b:free,perplexity/pplx-embed-v1-0.6b`). Each memory is stored once per chain model; query vectors are compared only against rows of the model that produced them. Models outside the chain are dropped on store open.
 - `MNEMOPI_EMBEDDING_API_URL` and `MNEMOPI_EMBEDDING_API_KEY`: OpenAI-compatible embedding endpoint.
 - `MNEMOPI_EMBEDDING_BATCH_SIZE`: texts per embedding API request, default `64`. Larger inputs are split into several requests. Set it lower for a provider with a smaller per-request limit, for example `10` for DashScope.
+- `MNEMOPI_EMBEDDING_QUERY_PREFIX`: text prepended to recall queries before embedding, for instruction-tuned embedders such as Qwen3-Embedding (`Instruct: …\nQuery: `) or E5 (`query: `). Stored memories are embedded unchanged. Runtime option: `embeddings.queryPrefix`.
+- `MNEMOPI_EMBEDDING_INPUT_TYPE=1`: send `input_type` (`query` for recall queries, `passage` for stored memories) with embedding API requests, as NVIDIA NIM asymmetric embedders require. Runtime option: `embeddings.inputType`.
 - `MNEMOPI_LLM_ENABLED=1`, `MNEMOPI_LLM_BASE_URL`, `MNEMOPI_LLM_API_KEY`, `MNEMOPI_LLM_MODEL`: OpenAI-compatible LLM endpoint.
+
+`embeddings.onRequestFailed` receives every failed embedding API request (`baseUrl`, `model`, `status`, provider `message`); the embedding call itself still returns null and recall falls back to keywords.
 
 Local embeddings use the `fastembed` npm package. Its default `BGESmallENV15` model is 384-dimensional and uses the package's CLS pooling plus vector normalization path. Local GGUF LLMs are not available in this package.
 

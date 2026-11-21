@@ -29,7 +29,6 @@ import {
 	type RecalledMemory,
 	persistRecall,
 } from "../memory-backend/recall-entry";
-import { memoryToolRefs } from "../memory-backend/tool-names";
 import type { MemoryPromptPreparation } from "../memory-backend/types";
 import { redactMemorySecrets, redactRememberWrite } from "../memory-backend/redact";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
@@ -809,9 +808,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 	 * that ends in "…" when it cut one.
 	 */
 	budgetRecallBlock(block: string): string {
-		const instructions = prompt.render(mnemopiInstructions, {
-			toolRefs: memoryToolRefs(this.session.getXdevToolEntries()),
-		});
+		const instructions = prompt.render(mnemopiInstructions);
 		return truncateApproxTokens(
 			[instructions, block].join("\n\n").trim(),
 			cfgMnemopiInjectionTokenLimit.get(this.session.settings),

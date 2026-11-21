@@ -93,7 +93,7 @@ function startProcess(
 			resolver: () => async () => undefined,
 		},
 		messages: [],
-		getXdevToolEntries: () => [],
+		getToolCommandEntries: () => [],
 		emitNotice: vi.fn(),
 		getHindsightSessionState: () => undefined,
 		subscribe: () => () => {},

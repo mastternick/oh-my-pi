@@ -1,5 +1,4 @@
 import { prompt } from "@oh-my-pi/pi-utils";
-import { settings } from "../../config/settings";
 import xReadPrompt from "../../prompts/system/x-read.md" with { type: "text" };
 import { ToolAbortError } from "../../tools/tool-errors";
 import { SEARCH_HARD_TIMEOUT_MS } from "../search/providers/utils";
@@ -12,7 +11,7 @@ import {
 } from "../search/providers/xai";
 import { parseXUrl, type XProfileTab, type XTarget } from "../x";
 import type { RenderResult, SpecialHandler } from "./types";
-import { buildResult } from "./types";
+import { buildResult, handlerSettings } from "./types";
 
 /** Search operators narrowing `from:<handle>` to what each profile tab shows. */
 const PROFILE_TAB_FILTERS: Record<XProfileTab, string> = {
@@ -57,7 +56,7 @@ function unavailable(url: string, fetchedAt: string, reason: string): RenderResu
  * scraping. Needs `xai-oauth` or `xai` credentials; tries the models of
  * {@link xaiModelChain} in order until one answers.
  */
-export const handleTwitter: SpecialHandler = async (url, timeout, signal, _storage, modelRegistry) => {
+export const handleTwitter: SpecialHandler = async (url, timeout, signal, _storage, modelRegistry, sessionSettings) => {
 	const target = parseXUrl(url);
 	if (!target) return null;
 	const fetchedAt = new Date().toISOString();
@@ -71,9 +70,10 @@ export const handleTwitter: SpecialHandler = async (url, timeout, signal, _stora
 	const credentialHint =
 		"X blocks automated access. Reading X goes through Grok's X tools, which need xAI credentials: log in to `xai-oauth` or set `XAI_API_KEY`.";
 	if (!modelRegistry) return unavailable(url, fetchedAt, credentialHint);
-	const models = xaiModelChain(modelRegistry, settings);
+	const effectiveSettings = handlerSettings(sessionSettings);
+	const models = xaiModelChain(modelRegistry, effectiveSettings);
 	if (models.length === 0) {
-		const configured = settings.getModelRole("web");
+		const configured = effectiveSettings.getModelRole("web");
 		// A configured `web` role is authoritative (no hidden xAI fallback), so its
 		// failure is a capability gap, not the unconfigured credential hint.
 		return unavailable(

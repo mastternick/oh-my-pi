@@ -74,38 +74,10 @@ describe("print-mode suggestions for a provider-qualified miss", () => {
 		const home = path.join(os.tmpdir(), `pi-cli-qualified-hint-${Snowflake.next()}`);
 		fs.mkdirSync(home, { recursive: true });
 		try {
-			const proc = Bun.spawn(
-				[
-					process.execPath,
-					path.resolve(import.meta.dir, "../src/cli.ts"),
-					"--no-title",
-					"--no-lsp",
-					"--no-extensions",
-					"--no-tools",
-					"--no-session",
-					"-p",
-					"--provider",
-					"anthropic",
-					"--model",
-					"gpt-4o",
-					"hi",
-				],
-				{
-					cwd: home,
-					env: {
-						PATH: process.env.PATH,
-						HOME: home,
-						USERPROFILE: home,
-						TMPDIR: process.env.TMPDIR,
-						NO_COLOR: "1",
-						ANTHROPIC_API_KEY: "test-key",
-						OPENAI_API_KEY: "test-key",
-					},
-					stdin: "ignore",
-					stdout: "pipe",
-					stderr: "pipe",
-				},
-			);
+			const proc = spawnPrintCli(home, ["--provider", "anthropic", "--model", "gpt-4o", "hi"], {
+				ANTHROPIC_API_KEY: "test-key",
+				OPENAI_API_KEY: "test-key",
+			});
 			const [exitCode, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
 			expect(exitCode).toBe(1);
 			expect(stderr).toContain('Model "anthropic/gpt-4o" not found');
@@ -126,35 +98,14 @@ describe("print mode with a stale configured default", () => {
 			"modelRoles:\n  default: anthropic/claude-sonnet-9-9\nretry:\n  enabled: false\n",
 		);
 		try {
-			const proc = Bun.spawn(
-				[
-					process.execPath,
-					path.resolve(import.meta.dir, "../src/cli.ts"),
-					"--no-title",
-					"--no-lsp",
-					"--no-extensions",
-					"--no-tools",
-					"--no-session",
-					"-p",
-					"hi",
-				],
-				{
-					cwd: home,
-					env: {
-						PATH: process.env.PATH,
-						HOME: home,
-						USERPROFILE: home,
-						TMPDIR: process.env.TMPDIR,
-						NO_COLOR: "1",
-						ANTHROPIC_API_KEY: "test-key",
-						ANTHROPIC_BASE_URL: "http://127.0.0.1:9",
-					},
-					stdin: "ignore",
-					stdout: "pipe",
-					stderr: "pipe",
-				},
-			);
-			const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+			const proc = spawnPrintCli(home, ["hi"], {
+				ANTHROPIC_API_KEY: "test-key",
+				ANTHROPIC_BASE_URL: "http://127.0.0.1:9",
+			});
+			const [stderr, exitCode] = await Promise.all([
+				readUntil(proc.stderr, "Default model anthropic/claude-sonnet-9-9 not found"),
+				proc.exited,
+			]);
 			expect(stderr).toContain("Default model anthropic/claude-sonnet-9-9 not found");
 			expect(stderr).not.toContain("Using anthropic/");
 			expect(exitCode).not.toBe(0);
@@ -163,3 +114,61 @@ describe("print mode with a stale configured default", () => {
 		}
 	}, 60_000);
 });
+
+/** Closed local port: every request through it is refused at once. */
+const DEAD_PROXY = "http://127.0.0.1:9";
+
+/**
+ * `omp -p` in an isolated `home`. A missed selector or stale default awaits one
+ * online discovery pass over every provider catalog before it reports; routing
+ * all requests through a dead proxy fails that pass at once, so resolution runs
+ * against the bundled catalog instead of waiting on the network.
+ */
+function spawnPrintCli(home: string, args: string[], env: Record<string, string>) {
+	return Bun.spawn(
+		[
+			process.execPath,
+			path.resolve(import.meta.dir, "../src/cli.ts"),
+			"--no-title",
+			"--no-lsp",
+			"--no-extensions",
+			"--no-tools",
+			"--no-session",
+			"-p",
+			...args,
+		],
+		{
+			cwd: home,
+			env: {
+				PATH: process.env.PATH,
+				HOME: home,
+				USERPROFILE: home,
+				TMPDIR: process.env.TMPDIR,
+				NO_COLOR: "1",
+				HTTP_PROXY: DEAD_PROXY,
+				HTTPS_PROXY: DEAD_PROXY,
+				...env,
+			},
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+		},
+	);
+}
+
+/** Stderr read until it contains `needle`, or all of it once the stream ends without it. */
+async function readUntil(stream: ReadableStream<Uint8Array>, needle: string): Promise<string> {
+	const reader = stream.getReader();
+	const decoder = new TextDecoder();
+	let text = "";
+	try {
+		while (!text.includes(needle)) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			text += decoder.decode(value, { stream: true });
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	return text;
+}

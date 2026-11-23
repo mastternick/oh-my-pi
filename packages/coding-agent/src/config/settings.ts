@@ -4098,7 +4098,7 @@ export class Settings {
 
 		// BM25 tool discovery removal: tools.discoveryMode / tools.essentialOverride /
 		// mcp.discoveryMode / mcp.discoveryDefaultServers are gone with no
-		// replacement (`tools.xdev` stays at its own default). Dead keys are
+		// replacement (`tools.commands` stays at its own default). Dead keys are
 		// deleted so they stop lingering in config.yml.
 		const toolsObj = raw.tools as Record<string, unknown> | undefined;
 		if (toolsObj) {
@@ -4169,11 +4169,7 @@ export class Settings {
 				const selector = bundledSelector(provider, model => model.webSearchModel);
 				return selector ? [selector] : [];
 			};
-			const geminiSelectors = (model: string): string[] => [
-				`google-gemini-cli/${model}`,
-				`google-antigravity/${model}`,
-				`google/${model}`,
-			];
+			const geminiSelectors = (model: string): string[] => [`google-antigravity/${model}`, `google/${model}`];
 			const webSelectors = (provider: string, geminiModel: string): string[] => {
 				switch (provider) {
 					case "gemini":
@@ -4414,6 +4410,21 @@ export class Settings {
 			}
 		}
 		delete raw["computer.backend"];
+
+		// computer.backgroundFallback became computer.takeover, which added the
+		// opt-in `foreground` and `always` modes. `refuse` carries over; the old
+		// `takeover` is the default `fallback`, so it is dropped.
+		const computerSettings = isRecord(raw.computer) ? raw.computer : undefined;
+		const fallback = computerSettings?.backgroundFallback ?? raw["computer.backgroundFallback"];
+		if (fallback === "refuse" && computerSettings?.takeover === undefined && raw["computer.takeover"] === undefined) {
+			if (computerSettings) computerSettings.takeover = "refuse";
+			else raw.computer = { takeover: "refuse" };
+		}
+		if (computerSettings) {
+			delete computerSettings.backgroundFallback;
+			if (Object.keys(computerSettings).length === 0) delete raw.computer;
+		}
+		delete raw["computer.backgroundFallback"];
 
 		delete raw["hindsight.mentalModelRefreshIntervalMs"];
 

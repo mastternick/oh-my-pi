@@ -43,6 +43,177 @@
 - Session-preset snapshot write failures during startup are latched and reported through RPC persistence notices instead of aborting session creation.
 - Archive reads no longer return members of the previous contents when an archive is rewritten within the same filesystem timestamp tick: archives changed in the last 2 seconds are re-read instead of cached.
 
+## [19.1.1] - 2026-11-23
+
+### Breaking Changes
+
+- The native shell Rust API now stores indexed variables as `IndexedArray` instead of `Vec`; construct `VarValue::Indexed` values with `items.into()`.
+
+### Added
+
+- Added the opt-in `tree` status segment, which shows a session’s position in the session tree after a rewind or on a branch; in Tern, the segment opens `/tree` when clicked.
+- Providers routed through an auth gateway (`transport: pi-native`) now list the gateway's models, so models the gateway discovered at runtime (such as new Codex models) can be selected without declaring them in `models.yml`, and models the gateway cannot route are hidden.
+- Added `computer.takeover` as the replacement for `computer.backgroundFallback`, with `fallback`, `foreground`, and `always` modes for controlling when the computer tool takes over the foreground window. Existing fallback behavior is preserved by default.
+- Added a portable `column` shell builtin with util-linux-compatible options, including table formatting, named columns, alignment, hiding, ordering, JSON output, tree display, and width controls.
+- Added extension todo backends through `pi.registerTodoBackend()` and the `todo.backend` setting. Registered backends can mirror the session’s complete todo list to an external store and can be selected and configured from `/settings` → Tools → Todos.
+- `/wt` now runs the new worktree’s `post-checkout` hook, displays progress in the TUI, and loads skills and commands created by the hook. Failed hooks leave the worktree intact and display a warning.
+
+### Changed
+
+- Empty-stop recovery now records each retry with the selected model, provider, and stop metadata, making repeated empty model responses visible in the session log.
+- The quick model picker refreshes stale provider catalogs in the background, so long-running sessions can discover newly available models.
+- On Linux, language-server file watching now adapts to the inotify watch limit so large workspaces are less likely to interfere with other file watchers and system services.
+- The `eval` tool now documents its default 30-second cell deadline in its prompt and timeout parameter.
+
+### Fixed
+
+- Improved Magic Edit so it can search and read the current draft, retry failed replacements without losing successful edits, validate syntax before writing, and support models that emit tool calls as text.
+- Fixed shell tool command handling when `bash` is replaced by an extension, including support for tool-only command lines with remote or sandboxed shells.
+- Fixed browser scrolling validation and documentation so invalid object forms explain the correct pixel-delta signature and equivalent call.
+- Fixed `ask` handling of fieldsets whose radio buttons use different names, preventing a preselected option from being submitted alongside the user’s choice.
+- Fixed title generation to stop when a model explicitly declines with `<title/>` or `none`, while continuing to the next candidate for errors or unusable replies.
+- Fixed automatic and speculative compaction so oversized or non-retriable handoff requests move on to the next available compaction method instead of being repeatedly sent to a provider.
+- `wait()` in eval cells now accepts displayed subagent IDs, including the `agent://id` form, while still rejecting handles belonging to other sessions.
+- Fixed startup and session model configuration so thinking levels, model-provider ordering, enabled-model allowlists, routed selections, and pinned upstream routes remain consistent across model switches, cycling, restore, plan mode, and metadata refreshes.
+- Fixed queued follow-up messages being lost when interrupted responses are discarded, and fixed TTSR interruptions that could leave a session unable to continue.
+- Fixed OpenAI Responses sessions rewriting previously sent tool results, which could cause later reasoning items to be rejected.
+- Fixed format-on-write and symlink-related file editing issues, including incorrect write failures, missing snapshots, duplicated `local://` paths, and incorrect symlinked filenames in previews and journals.
+- Fixed Windows browser downloads occasionally retaining temporary GUID filenames when the downloaded file was briefly locked.
+- Fixed RPC shutdown leaving MCP subprocesses running after the session ended.
+- Fixed advisor and Spotlight output so truncated or repeated tool results are represented accurately without losing the original content.
+- Fixed first-run startup warnings that persisted after a default model had been selected.
+- Fixed context rollover handling so concurrent bookkeeping no longer silently drops an explicit rollover, and skipped rollovers produce a warning.
+- `/omfg` now closes its panel after successfully saving a rule and shows the saved path; errors keep the panel open.
+- Fixed shell handling of leading `cd` commands that use glob, brace, or named-user home expansion.
+- Claude-format plugin agents now correctly map Claude tool names such as `WebFetch`, `WebSearch`, `TodoWrite`, `AskUserQuestion`, `MultiEdit`, and `Agent` to their OMP equivalents.
+- Startup extension notifications now remain visible instead of being overwritten by later notices or MCP startup status.
+- Fixed CLI parsing so `--plan` no longer consumes a following CLI flag as its value during startup, restart, fork, or subcommand routing.
+- Fixed `/usage` when the usage database is temporarily locked; stored history remains visible and is marked unsynced if it cannot be refreshed.
+- Model discovery now classifies speech-only and transcription-only models as TTS and STT models rather than chat models.
+- Subagents stopped by their parent now record that they were stopped by the parent agent.
+- Fixed SDK and extension imports, examples, and session-specific extension discovery for RPC and ACP sessions.
+- Fixed X and YouTube URL reads to honor SDK session settings even when global settings have not been initialized.
+- Restored sessions now correctly report background jobs whose outcome is unknown, and `omp --restore` no longer replays completed turns after idle compaction or interruption.
+- Selective commits now preserve the drafted contents and Git clean-filter results for binary, non-text, oversized, and Git LFS files, and avoid overwriting files changed since the draft was created.
+- Fixed `read` hanging on images and other non-text files when speculative execution and `beforeToolCall` hooks are enabled.
+- Provider error logs now include the request ID needed for troubleshooting Anthropic refusals.
+- Sessions started from collaboration prompts now receive automatic titles.
+- Fixed `/tan` forks ending an idle wait prematurely when their assignment remains blocked.
+
+## [19.1.0] - 2026-11-21
+
+### Breaking Changes
+
+- Replaced `xd://` tool devices with tool commands: rarely-used tools now run as bash commands (`<tool> --help`, `<tool> <args>`) while `bash` is active and are ordinary tools otherwise
+- Renamed the `tools.xdev`, `tools.xdevDocs`, `tools.xdevInlineDevices` and `tools.xdevNotices` settings to `tools.commands`, `tools.commandDocs`, `tools.commandInline` and `tools.commandNotices`
+- Staged previews, plan submission and Auto-QA reports now use the `resolve`, `reject`, `propose` and `report_issue` commands, and tool doc topics moved from `xd://<tool>/<topic>` to `help://<tool>/<topic>`
+- Removed the `tui.completeScrollback` setting; transcript rows covered by the HUD, dialogs, or draft now always move to scrollback, and the input returns to the bottom row when overlays close.
+- Replaced the standalone MCP transport and tool-cache SDK exports and removed `DeferredMCPTool` plus MCP cache and reconnect-policy manager options. MCP servers are now accessed through the MCP host APIs.
+- Browser relay hosting now runs through the omp extension's native host while Chrome is open. Removed the on-demand `omp browser-relay` server command and its `--port`, `--token`, and `--no-group` options; `browser.relayUrl` remains available for relays forwarded from another machine. Reload the omp extension once after upgrading, or restart Chrome.
+- Changed `archive.search(query)` to search session titles, idle recaps, and user/assistant content across all history and return matching session records; use `archive.prompts({ query })` for prompt-only searches. Searches match query terms at the beginning of words.
+- RPC hosts must handle the `ask` tool as one complete HTML-form `form` request and respond with submitted data or cancellation; field-by-field prompts are no longer emitted.
+
+### Added
+
+- Extensions can take over a built-in provider through `registerProvider`: `stream` replaces its request adapter, `generateImage` its image generation, and `webSearch` its grounded search request, and `discoverModels` its model discovery request. `rules` sets KDL rule directives (such as `prompt-perturbation`) for its models.
+- Added the `magic` edit mode, which accepts Markdown bulleted change descriptions grouped under `# path` headings and uses a configurable fast model or role to generate and apply patches. It supports concise block replacement, deletion, movement, and identifier-renaming descriptions, and presents the resulting diffs.
+- Added remote session model controls through RPC, including the model picker, thinking-level and role selection, `auto` thinking, and commands to resume, abort while delivering queued messages, or continue the host agent. Collab guests can now continue, interrupt, and queue follow-up prompts for the host.
+- Added support for Unicode set mode (`v`) in slash-delimited `secrets.yml` regular expressions.
+- Moved MCP servers into the omp daemon, with optional process sharing across sessions, lazy startup, idle shutdown, shared discovery caching, and `/mcp list` status including process and session information. Configure sharing with `mcp.shared` and idle shutdown with `mcp.idleStopMinutes`.
+- Added MCP protocol revision 2026-07-28 support, including server discovery, per-request metadata, root input rounds, subscriptions, and cache controls, while retaining compatibility with servers that require the initialize handshake.
+- Added native browser-relay integration for the Chrome extension, including side-panel sessions, extension installation and synchronization, automatic profile registration, and in-tab action overlays. Side-panel sessions remain separate from terminal resume, recent-session, `--continue`, and ACP session lists unless explicitly resumed.
+- Added a coloured extension-status variant to `omp gallery --segment status`.
+- Added notifications and waiting status when a program running in a bash `pty` is waiting for keyboard input, such as a password or confirmation prompt; disable notifications with `pty.notify`.
+- Eval `completion()` now records raw provider frames for `/debug` inspection and saves frames from failed calls as log files in the session artifacts directory.
+- Added `parentToolCallId` to extension `tool_call` and `tool_result` events so nested tool calls can be associated with the eval cell or kernel-defined tool that dispatched them.
+- Added full-text transcript search indexing for `archive.search`, covering user and assistant messages across session history.
+- Session files now record approval requests and their outcomes, allowing dashboards and sidebars to show when a session is waiting for tool approval.
+- Added live visibility into output redirected to files by background bash jobs, including job streams, the jobs sheet, job widgets, and command cards; selecting a command shows the output for its relevant pipeline or redirected stream.
+- Added Binary Ninja as a disassembler backend for read analysis views and the `dsm` namespace. Select it with `disassembler.backend = binja` and configure its installation with `binja.installDir` or `$BN_INSTALL_DIR`.
+- Clicking the usage-limit segment in native terminal hosts such as Tern now opens `/usage`. Changing Tern's Agents tray setting immediately switches between tray cards and the running-agent and job counters without restarting omp.
+
+### Changed
+
+- Images a command prints as kitty or sixel graphics are saved to a temp file and linked in the bash output, in addition to being attached
+- `generate_image` returns its images as attachments
+- Spotlight tool calls use `Label: detail`; activity shows only the label, while output ranking uses the full intent.
+- Improved regex performance for TTSR and secret-redaction scans, including SIMD acceleration and faster candidate matching, without changing matching semantics.
+- Improved performance when listing sessions across all projects, especially with thousands of project directories.
+- Interactive `wait` now waits up to four minutes on its first call for background jobs instead of returning after five seconds.
+- Updated the MCP OAuth client name to `Codex`.
+- Made automatic retries less disruptive: failed attempts stay out of the transcript, retry status explains the reason, and successful recovery leaves only a brief indication.
+- Selective commits now attribute edit-tool and shell-built-in changes more accurately, distinguish external program changes for review, and use a substantially smaller change journal. Long-line commit previews now highlight only the changed words while preserving the original patch.
+- TTSR rules that cannot interrupt streaming are evaluated at the end of the relevant response, reasoning, or tool call, reducing unnecessary work while preserving matches and reminders.
+- Eval `completion()` now accepts user-tagged model agents, such as models pinned with `^model`, and uses their tagged effort level.
+- `read` recognizes SQLite-backed `.i64` and `.idb` files as IDA databases and reports disassembler-backend mismatches clearly.
+
+### Fixed
+
+- A tool card left unfinished by a stream that never completed no longer keeps the rest of the transcript out of scrollback and squeezed to one-line rows; it is closed when the next reply starts
+- Spotlight keeps short relevant passages from multiple large function bodies together with their signatures, even when a code outline is cut again.
+- A usage-limit reset inside `retry.maxDelayMs` is now waited out even without a `Retry-After` header.
+- Logging in while an auth broker is configured no longer reports success for a provider the broker stores but does not serve (such as one an older broker pauses); the login is kept in this machine's `agent.db` instead, survives restarts, and login/logout now name where credentials were saved.
+- Spotlight keeps more high-relevance lines with their neighbours in long results and large code outlines, while preserving visible intent matches within the window budget.
+- Fixed Tern tray cards and subagent live previews showing stale calls, models, or thinking states while an agent was running or after a model switch; completed cards now retain the model and thinking level used.
+- Fixed extension side-panel sessions launching omp's own browser instead of driving only the user's Chrome window.
+- Preserved answer footers and Copy controls in Tern after resuming, compacting, or rebuilding a transcript.
+- Prevented `--continue` and `autoResume` from attaching to a session currently being written by another omp process.
+- Added visible progress reporting while `/handoff` writes its summary.
+- Fixed access to cloud-only files on macOS iCloud Drive, Desktop & Documents, Google Drive, and Dropbox locations.
+- Prevented pathological TTSR condition and secret-redaction regular expressions from freezing sessions or requests.
+- Fixed prompt-cache handling for IRC-woken subagents and sessions whose context hooks provide an initial message.
+- Improved shell `rg` and `fd` path output and option handling to match their native tools, including paths beginning with `-`, null-separated output, and explicit current-directory prefixes.
+- Fixed sloppy-edit validation and block matching for incomplete actions, numeric `||` expressions, nested or partial block endings, JSDoc comments, and hashline headers with trailing whitespace.
+- Fixed OpenCode v2 MCP configuration discovery from `mcp.servers` while preserving support for legacy flat `mcp` entries.
+- Fixed `ovnfs` commands when `ovnfs.path` contains Windows backslashes, spaces, or `$` characters.
+- Stopped failed browser launches from logging URL credentials, query strings, OAuth device codes, or fragments.
+- Fixed `web_search` to honor the search order and exclusions configured for the current session.
+- Fixed MCP OAuth refresh for Microsoft Entra servers where the client is also the resource; previously saved credentials may require one `/mcp reauth`.
+- Fixed model resolution for OpenRouter route variants used by per-call subagents and roles.
+- Fixed secret redaction in shared sessions so provider-encrypted reasoning is not retained unexpectedly.
+- Fixed bash approval handling for compound commands with environment assignments and flags, including wildcard allow rules.
+- Fixed selective commits when HEAD changes during a commit hook and when edits from multiple writers are reordered or overlap; ambiguous changes are now sent to review instead of being duplicated or silently misapplied.
+- Fixed archive records to include all documented keys with `null` for missing values.
+- Fixed unnecessary empty session log files for inline bash/eval output and request-timeout recovery.
+- Improved `read` suggestions for line, range, and column selectors and preserved source line metadata for in-memory and converted text reads.
+- Fixed agent lifecycle races involving duplicate IDs, pending messages, shutdown, and revival.
+- Fixed browser tab handling on CDP engines that use separate connections per page, including recovery after timeouts or worker exits.
+- Fixed browser interaction reporting for overlay-only clicks, hidden frames containing inline SVG or MathML, and search fields that update on key events.
+- Fixed browser computer-use inspection of minimized macOS windows and fully covered Windows Chrome, Edge, and Electron windows.
+- Fixed `/goal` on Anthropic from unnecessarily rewriting the cached system prompt and transcript.
+- Fixed isolated task subagents in bare Git repositories by refusing early and identifying available work trees instead of starting without a usable work tree.
+- Fixed Nix browser-relay builds to fetch all dependencies without falling back to the npm registry.
+- Fixed extension, plugin, custom-tool, hook, command, and share-script loading for paths containing `?`, with a useful error identifying the path and remedy.
+
+## [19.0.1] - 2026-11-19
+
+### Added
+
+- `/session` shows the path of the session's `local://` directory, and `/copy local` copies it, creating the directory first so it can be entered before anything was written there ([#19778](https://github.com/can1357/oh-my-pi/pull/19778) by [@farnoy](https://github.com/farnoy))
+- `snapcompactShape` on `models.yml` models, `modelOverrides` and extension `registerProvider` models sets that model's snapcompact frame shape ([#19591](https://github.com/can1357/oh-my-pi/pull/19591) by [@ryanskidmore](https://github.com/ryanskidmore))
+
+### Fixed
+
+- Fixed PTY command transcripts sometimes gaining a blank line where a `\r\n` line ending was split across two terminal reads.
+- Fixed the shell's `dirname` builtin on Windows ignoring `\` separators and drive prefixes (`dirname 'C:\a\b'` printed `.`), which broke scripts like VS Code's `code` launcher (`./Code.exe: No such file or directory`)
+- Fixed bash output minimizing being skipped on Windows when a command is named by a `\` path or with `.exe` (`"C:\Program Files\Git\cmd\git.exe" status`, `git.exe log`)
+- Fixed the bundled `omp://tools` docs still describing the removed `ida` tool; `tools/dsm.md` now documents eval's `dsm` namespace and `disassembler.*` settings, and `tools/read.md` documents metadata-only executable reads ([#19608](https://github.com/can1357/oh-my-pi/issues/19608))
+- Fixed native terminal hosts such as Tern placing extension aboveEditor widgets and a blank row between the status row and the tray; the widgets now sit above the status row ([#19767](https://github.com/can1357/oh-my-pi/issues/19767))
+- Fixed `^model` mentions in queued messages (`->`/`=>` while the agent is busy, later items of a numbered list, RPC `steer`/`follow_up`, ACP steering) reaching the model as literal `^provider/model` text instead of registering their `m<N>` agent ([#19683](https://github.com/can1357/oh-my-pi/pull/19683) by [@a-glapinski](https://github.com/a-glapinski))
+- Fixed `^model` mentions in extension messages sent with `sendUserMessage({ deliverAs: "steer" | "followUp" | "aside" })` while the agent is busy reaching the model as literal text ([#19799](https://github.com/can1357/oh-my-pi/pull/19799) by [@H4vC](https://github.com/H4vC))
+- Fixed every message queued behind an undelivered `^model` mention repeating the "`m<N>` now available" notice to the model ([#19799](https://github.com/can1357/oh-my-pi/pull/19799) by [@H4vC](https://github.com/H4vC))
+- A plugin manifest with a non-string `extensions` entry (e.g. an object) no longer crashes extension loading with `ERR_INVALID_ARG_TYPE`; the entry is reported as not found and valid entries still load ([#19674](https://github.com/can1357/oh-my-pi/pull/19674) by [@koeria](https://github.com/koeria))
+- Fixed embedded `bash script.sh` resolving `BASH_SOURCE[0]` to `bash` instead of the script path, which broke scripts loading files beside themselves ([#19792](https://github.com/can1357/oh-my-pi/issues/19792))
+- Fixed proxy model discovery ignoring a gateway's advertised input modalities and output-token cap ([#19754](https://github.com/can1357/oh-my-pi/pull/19754) by [@zhyc9de](https://github.com/zhyc9de)).
+- Fixed a provider routed through an auth gateway (`transport: pi-native` in `models.yml`) still listing models from the provider's own endpoint, sending the gateway key there; such providers now skip the provider's model discovery and keep their bundled and cached models ([#19646](https://github.com/can1357/oh-my-pi/pull/19646) by [@ray8828](https://github.com/ray8828))
+- Fixed a spurious "cache miss" marker on the first turn after a compaction: compaction rewrites the prompt prefix, so that miss is expected and no longer flagged ([#19679](https://github.com/can1357/oh-my-pi/pull/19679) by [@Petyok](https://github.com/Petyok))
+- Fixed `omp --resume <id>` under `--mode rpc`, `--mode rpc-ui` and `--mode acp` failing at start when the session's directory no longer exists; the session now opens where it is stored, with the launch directory as its working directory, without asking whether to move it ([#19651](https://github.com/can1357/oh-my-pi/pull/19651) by [@sjawhar](https://github.com/sjawhar))
+- Fixed the browser relay extension dying silently in a browser whose loaded permission set predates the `downloads` permission: it now keeps working without download pairing, and the relay reports a download tracking gap instead of a generic not-found ([#19659](https://github.com/can1357/oh-my-pi/pull/19659) by [@pavel-kalmykov](https://github.com/pavel-kalmykov))
+- Sharing a session whose subagents report progress faster than the uplink drains no longer ends with "collab send backlog exceeded its limit" while a guest joins
+- Fixed `/loop` iterations and `/goal` continuations firing ~800ms after a turn yields to wait on background subagents or jobs; they now wait until the run finishes ([#19781](https://github.com/can1357/oh-my-pi/issues/19781))
+- Fixed Codex and OpenAI API web search ignoring the `web` role's thinking level (`openai-codex/gpt-6-luna:xhigh`); the level now reaches the request as `reasoning.effort` ([#19793](https://github.com/can1357/oh-my-pi/issues/19793))
+- Fixed plan review measuring "Approve and keep context" against the pre-plan model instead of the tier chosen in the "continue with" slider, so switching to a larger-context tier now enables it ([#19660](https://github.com/can1357/oh-my-pi/issues/19660))
+
 ## [19.0.0] - 2026-11-18
 
 ### Breaking Changes

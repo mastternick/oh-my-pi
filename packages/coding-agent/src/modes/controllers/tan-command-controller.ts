@@ -145,7 +145,7 @@ export class TanCommandController {
 		const parentMnemopiSessionState = session.getMnemopiSessionState?.();
 		const toolNames = session.getEnabledToolNames();
 		const activeToolNames = session.getActiveToolNames();
-		const mountedToolNames = session.getMountedXdevToolNames();
+		const mountedToolNames = session.getMountedToolCommandNames();
 		const modelRegistry = session.modelRegistry;
 		// Snapshot the parent's rebindable extensions and root policy at dispatch.
 		// The child rebinds these (skipping discovery) so it re-registers the
@@ -253,6 +253,7 @@ export class TanCommandController {
 								agentId: cloneId,
 								agentDisplayName: "tan",
 								parentTaskPrefix: cloneId,
+								tanFork: true,
 								asyncJobManager: manager,
 								parentAgentId: ownerId,
 								agentRegistry,
@@ -278,7 +279,7 @@ export class TanCommandController {
 							systemPrompt: clone.systemPrompt ?? systemPrompt,
 							task: trimmedWork,
 							tools: clone.getEnabledToolNames(),
-							mountedTools: clone.getMountedXdevToolNames(),
+							mountedTools: clone.getMountedToolCommandNames(),
 						});
 						const abortClone = () => {
 							void clone?.abort();
@@ -290,9 +291,13 @@ export class TanCommandController {
 						clone.setTodoPhases([]);
 						cloneManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases: [] });
 						const injectContextSwitch = () => {
-							clone?.agent.appendMessage({
+							const fork = clone;
+							if (!fork) return;
+							fork.agent.appendMessage({
 								role: "developer",
-								content: tanContextSwitchPrompt,
+								content: prompt.render(tanContextSwitchPrompt, {
+									waitTool: fork.getEnabledToolNames().includes("wait"),
+								}),
 								attribution: "agent",
 								timestamp: Date.now(),
 							});

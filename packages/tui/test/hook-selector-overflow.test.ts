@@ -1,7 +1,9 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { HookSelectorComponent } from "@oh-my-pi/pi-tui/overlays/hook-selector";
 import { getThemeByName, setThemeInstance, theme } from "@oh-my-pi/pi-tui/theme";
-import { visibleWidth } from "@oh-my-pi/pi-tui";
+import { TUI, visibleWidth } from "@oh-my-pi/pi-tui";
+import { VirtualRenderScheduler } from "./virtual-render-scheduler";
+import { VirtualTerminal } from "./virtual-terminal";
 
 beforeAll(async () => {
 	const theme = await getThemeByName("dark");
@@ -590,5 +592,62 @@ describe("HookSelectorComponent", () => {
 		component.handleInput("\x12");
 		component.dispose();
 		expect(removed).toEqual(["Preset 1"]);
+	});
+
+	it("claims ctrl+r ahead of TUI input listeners such as app.history.search", () => {
+		const tui = new TUI(new VirtualTerminal(80, 24), undefined, {
+			renderScheduler: new VirtualRenderScheduler(),
+		});
+		const removed: string[] = [];
+		let listenerSawCtrlR = false;
+		const component = new HookSelectorComponent(
+			"Switch to model preset",
+			Array.from({ length: 20 }, (_, i) => `Preset ${i + 1}`),
+			() => {},
+			() => {},
+			{ maxVisible: 5, onRemove: name => removed.push(name) },
+		);
+		tui.addChild(component);
+		tui.setFocus(component);
+		// Stand-in for the app-level history-search listener that consumes ctrl+r.
+		tui.addInputListener(data => {
+			if (data !== "\x12") return undefined;
+			listenerSawCtrlR = true;
+			return { consume: true };
+		});
+
+		tui.injectDebugInput("\x12");
+
+		expect(listenerSawCtrlR).toBe(false);
+		expect(removed).toEqual(["Preset 1"]);
+		tui.stop();
+		component.dispose();
+	});
+
+	it("leaves ctrl+r to app listeners when no onRemove is set", () => {
+		const tui = new TUI(new VirtualTerminal(80, 24), undefined, {
+			renderScheduler: new VirtualRenderScheduler(),
+		});
+		let listenerSawCtrlR = false;
+		const component = new HookSelectorComponent(
+			"Pick one",
+			["Preset 1", "Preset 2"],
+			() => {},
+			() => {},
+		);
+		tui.addChild(component);
+		tui.setFocus(component);
+		tui.addInputListener(data => {
+			if (data !== "\x12") return undefined;
+			listenerSawCtrlR = true;
+			return { consume: true };
+		});
+
+		expect(component.capturesInput("\x12")).toBe(false);
+		tui.injectDebugInput("\x12");
+
+		expect(listenerSawCtrlR).toBe(true);
+		tui.stop();
+		component.dispose();
 	});
 });

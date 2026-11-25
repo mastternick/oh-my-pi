@@ -183,6 +183,8 @@ function plainInline(source: string, mdTheme: MarkdownTheme): string {
 }
 
 const ENTER_KEYS: readonly KeyName[] = ["enter"];
+/** Always-true removal chord: `r` alone is searchable text on overflowing lists. */
+const REMOVE_KEYS: readonly KeyName[] = ["ctrl+r"];
 
 interface HookSelectorNativeMemo {
 	items: readonly FilteredOption[];
@@ -327,7 +329,7 @@ export class HookSelectorComponent extends OverlayPanel {
 		const controlsHint =
 			(opts?.helpText ??
 				`${editorKeys("tui.select.up", "tui.select.down")} navigate  ${formatKeyHint("enter")} select  ${editorKey("tui.select.cancel")} cancel`) +
-			(this.#onRemoveCallback ? `  ${formatKeyHint("r")} remove` : "");
+			(this.#onRemoveCallback ? `  ${formatKeyHint("ctrl+r")} remove` : "");
 		this.addChild(new Text(theme.fg("dim", controlsHint), 0, 0));
 		this.addChild(new Spacer(1));
 
@@ -639,6 +641,16 @@ export class HookSelectorComponent extends OverlayPanel {
 		return true;
 	}
 
+	/**
+	 * Claim `ctrl+r` before TUI-wide input listeners (`app.history.search` opens
+	 * prompt-history search on it) can consume the key for the focused selector.
+	 */
+	capturesInput(data: string): boolean {
+		if (!this.#onRemoveCallback || !matchesKey(data, "ctrl+r")) return false;
+		const selected = this.#menu.selectedItem;
+		return selected !== undefined && !this.#menu.isDisabled(selected);
+	}
+
 	handleInput(keyData: string): void {
 		if (this.#countdown) {
 			this.#countdown.reset();
@@ -742,7 +754,11 @@ export class HookSelectorComponent extends OverlayPanel {
 			...(checkbox ? { current: [...this.#checkedIndices].map(String) } : {}),
 			total: this.#options.length,
 			empty: "No matching options",
-			actions: [pickerAction("confirm", "Select", "enter", { primary: true }), CLOSE_ACTION],
+			actions: [
+				pickerAction("confirm", "Select", "enter", { primary: true }),
+				...(this.#onRemoveCallback ? [pickerAction("remove", "Remove", "ctrl+r")] : []),
+				CLOSE_ACTION,
+			],
 		});
 		this.#pickerMemo = { items, selected, query, cursor, node: result };
 		return result;
@@ -826,6 +842,9 @@ export class HookSelectorComponent extends OverlayPanel {
 			} else if (ev.act === "confirm") {
 				const selected = this.#menu.selectedItem;
 				if (selected && !this.#menu.isDisabled(selected)) this.#onSelectCallback(selected.option.label);
+			} else if (ev.act === "remove") {
+				const selected = this.#menu.selectedItem;
+				if (selected && !this.#menu.isDisabled(selected)) this.#onRemoveCallback?.(selected.option.label);
 			}
 			return;
 		}
@@ -880,6 +899,7 @@ export class HookSelectorComponent extends OverlayPanel {
 						actionHint(["tui.select.up", "tui.select.down"], "navigate"),
 						{ keys: ENTER_KEYS, label: "select" },
 						actionHint("tui.select.cancel", "cancel"),
+						...(this.#onRemoveCallback ? [{ keys: REMOVE_KEYS, label: "remove" }] : []),
 					]);
 		this.#nativeStatic = { title: plainInline(this.#baseTitle, mdTheme), detail, hints };
 		return this.#nativeStatic;

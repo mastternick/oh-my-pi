@@ -829,7 +829,8 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			let args = command.args;
 			if (!args.trim()) {
 				// The picker stays open across deletions: `r` on a preset deletes it and reopens the list.
-				const removal = { requested: false, name: "" };
+				const removal = { requested: false, name: "", index: 0 };
+				let reopenIndex = 0;
 				for (;;) {
 					const names = getModelPresetNames(ctx.settings);
 					if (names.length === 0) {
@@ -838,9 +839,11 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 					}
 					removal.requested = false;
 					const picked = await ctx.showHookSelector("Switch to model preset", names, {
+						initialIndex: reopenIndex,
 						onRemove: name => {
 							removal.requested = true;
 							removal.name = name;
+							removal.index = names.indexOf(name);
 						},
 					});
 					if (removal.requested) {
@@ -854,6 +857,9 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 						} else {
 							ctx.showWarning(`Preset not found: ${name}`);
 						}
+						// Reopen on the row the deleted preset occupied, clamped to the shrunken list.
+						const remaining = getModelPresetNames(ctx.settings).length;
+						reopenIndex = Math.max(0, Math.min(removal.index, remaining - 1));
 						ctx.ui.requestRender();
 						continue;
 					}

@@ -78,6 +78,10 @@ export interface HookSelectorOptions {
 	onLeft?: () => void;
 	onRight?: () => void;
 	onExternalEditor?: () => void;
+	/** Invoked with the highlighted option's label when the user presses
+	 *  `ctrl+r`, or `r` while type-to-search is inactive. The caller decides how
+	 *  to close the dialog and what to do with the removal. */
+	onRemove?: (selected: string) => void;
 	helpText?: string;
 	slider?: HookSelectorSlider;
 	/** Indices into the original options that cannot be selected: they render
@@ -179,6 +183,8 @@ function plainInline(source: string, mdTheme: MarkdownTheme): string {
 }
 
 const ENTER_KEYS: readonly KeyName[] = ["enter"];
+/** Always-true removal chord: `r` alone is searchable text on overflowing lists. */
+const REMOVE_KEYS: readonly KeyName[] = ["ctrl+r"];
 
 interface HookSelectorNativeMemo {
 	items: readonly FilteredOption[];
@@ -208,6 +214,7 @@ export class HookSelectorComponent extends OverlayPanel {
 	#onLeftCallback: (() => void) | undefined;
 	#onRightCallback: (() => void) | undefined;
 	#onExternalEditorCallback: (() => void) | undefined;
+	#onRemoveCallback: ((selected: string) => void) | undefined;
 	#onTimeoutResetCallback: (() => void) | undefined;
 	#slider: HookSelectorSlider | undefined;
 	#sliderIndex: number = 0;
@@ -273,6 +280,7 @@ export class HookSelectorComponent extends OverlayPanel {
 		this.#onLeftCallback = opts?.onLeft;
 		this.#onRightCallback = opts?.onRight;
 		this.#onExternalEditorCallback = opts?.onExternalEditor;
+		this.#onRemoveCallback = opts?.onRemove;
 		this.#onTimeoutResetCallback = opts?.onTimeoutReset;
 		if (opts?.slider && opts.slider.segments.length > 0) {
 			this.#slider = opts.slider;
@@ -319,8 +327,9 @@ export class HookSelectorComponent extends OverlayPanel {
 		}
 		this.addChild(new Spacer(1));
 		const controlsHint =
-			opts?.helpText ??
-			`${editorKeys("tui.select.up", "tui.select.down")} navigate  ${formatKeyHint("enter")} select  ${editorKey("tui.select.cancel")} cancel`;
+			(opts?.helpText ??
+				`${editorKeys("tui.select.up", "tui.select.down")} navigate  ${formatKeyHint("enter")} select  ${editorKey("tui.select.cancel")} cancel`) +
+			(this.#onRemoveCallback ? `  ${formatKeyHint("ctrl+r")} remove` : "");
 		this.addChild(new Text(theme.fg("dim", controlsHint), 0, 0));
 		this.addChild(new Spacer(1));
 
@@ -632,6 +641,16 @@ export class HookSelectorComponent extends OverlayPanel {
 		return true;
 	}
 
+	/**
+	 * Claim `ctrl+r` before TUI-wide input listeners (`app.history.search` opens
+	 * prompt-history search on it) can consume the key for the focused selector.
+	 */
+	capturesInput(data: string): boolean {
+		if (!this.#onRemoveCallback || !matchesKey(data, "ctrl+r")) return false;
+		const selected = this.#menu.selectedItem;
+		return selected !== undefined && !this.#menu.isDisabled(selected);
+	}
+
 	handleInput(keyData: string): void {
 		if (this.#countdown) {
 			this.#countdown.reset();
@@ -641,6 +660,16 @@ export class HookSelectorComponent extends OverlayPanel {
 		if (matchesSelectCancel(keyData)) {
 			this.#onCancelCallback();
 			return;
+		}
+
+		if (this.#onRemoveCallback) {
+			// `r` only removes when it cannot be typed into search; `ctrl+r` always does.
+			const removeKey = matchesKey(keyData, "ctrl+r") || (!this.#isSearchEnabled() && matchesKey(keyData, "r"));
+			if (removeKey) {
+				const selected = this.#menu.selectedItem;
+				if (selected && !this.#menu.isDisabled(selected)) this.#onRemoveCallback(selected.option.label);
+				return;
+			}
 		}
 
 		if (this.#handleQuickSelect(keyData)) {
@@ -725,7 +754,11 @@ export class HookSelectorComponent extends OverlayPanel {
 			...(checkbox ? { current: [...this.#checkedIndices].map(String) } : {}),
 			total: this.#options.length,
 			empty: "No matching options",
-			actions: [pickerAction("confirm", "Select", "enter", { primary: true }), CLOSE_ACTION],
+			actions: [
+				pickerAction("confirm", "Select", "enter", { primary: true }),
+				...(this.#onRemoveCallback ? [pickerAction("remove", "Remove", "ctrl+r")] : []),
+				CLOSE_ACTION,
+			],
 		});
 		this.#pickerMemo = { items, selected, query, cursor, node: result };
 		return result;
@@ -809,6 +842,9 @@ export class HookSelectorComponent extends OverlayPanel {
 			} else if (ev.act === "confirm") {
 				const selected = this.#menu.selectedItem;
 				if (selected && !this.#menu.isDisabled(selected)) this.#onSelectCallback(selected.option.label);
+			} else if (ev.act === "remove") {
+				const selected = this.#menu.selectedItem;
+				if (selected && !this.#menu.isDisabled(selected)) this.#onRemoveCallback?.(selected.option.label);
 			}
 			return;
 		}
@@ -863,6 +899,7 @@ export class HookSelectorComponent extends OverlayPanel {
 						actionHint(["tui.select.up", "tui.select.down"], "navigate"),
 						{ keys: ENTER_KEYS, label: "select" },
 						actionHint("tui.select.cancel", "cancel"),
+						...(this.#onRemoveCallback ? [{ keys: REMOVE_KEYS, label: "remove" }] : []),
 					]);
 		this.#nativeStatic = { title: plainInline(this.#baseTitle, mdTheme), detail, hints };
 		return this.#nativeStatic;

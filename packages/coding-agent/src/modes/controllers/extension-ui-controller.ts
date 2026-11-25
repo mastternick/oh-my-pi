@@ -1481,6 +1481,12 @@ export class ExtensionUiController {
 							}
 						: undefined,
 					onExternalEditor: dialogOptions?.onExternalEditor,
+					onRemove: dialogOptions?.onRemove
+						? selected => {
+								dialogOptions.onRemove?.(selected);
+								settle(undefined);
+							}
+						: undefined,
 					helpText: dialogOptions?.helpText,
 					initialIndex: dialogOptions?.initialIndex,
 					timeout: dialogOptions?.timeout,

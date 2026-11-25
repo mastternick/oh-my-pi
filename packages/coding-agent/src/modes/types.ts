@@ -124,7 +124,7 @@ export interface InteractiveModeInitOptions {
 }
 
 export type InteractiveSelectorDialogOptions = ExtensionUIDialogOptions &
-	Pick<HookSelectorOptions, "disabledIndices" | "inline">;
+	Pick<HookSelectorOptions, "disabledIndices" | "inline" | "onRemove">;
 
 /** How {@link InteractiveModeContext.handleResumeSession} picks the file it opens. */
 export interface ResumeSessionOptions {

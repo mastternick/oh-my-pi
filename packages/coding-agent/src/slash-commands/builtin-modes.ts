@@ -828,14 +828,39 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			const { ctx } = runtime;
 			let args = command.args;
 			if (!args.trim()) {
-				const names = getModelPresetNames(ctx.settings);
-				if (names.length === 0) {
-					ctx.showStatus(NO_PRESETS_MESSAGE);
-					return;
+				// The picker stays open across deletions: `r` on a preset deletes it and reopens the list.
+				const removal = { requested: false, name: "" };
+				for (;;) {
+					const names = getModelPresetNames(ctx.settings);
+					if (names.length === 0) {
+						ctx.showStatus(NO_PRESETS_MESSAGE);
+						return;
+					}
+					removal.requested = false;
+					const picked = await ctx.showHookSelector("Switch to model preset", names, {
+						onRemove: name => {
+							removal.requested = true;
+							removal.name = name;
+						},
+					});
+					if (removal.requested) {
+						const name = removal.name;
+						const result = deleteModelPreset(ctx.settings, name);
+						if (result === "deleted") {
+							ctx.showStatus(`Deleted model preset "${name}"`);
+							await ctx.refreshSlashCommandState();
+						} else if (result === "project") {
+							ctx.showWarning(`Preset "${name}" is defined by a project or --config file; remove it there`);
+						} else {
+							ctx.showWarning(`Preset not found: ${name}`);
+						}
+						ctx.ui.requestRender();
+						continue;
+					}
+					if (picked === undefined) return;
+					args = `switch ${picked}`;
+					break;
 				}
-				const picked = await ctx.showHookSelector("Switch to model preset", names);
-				if (picked === undefined) return;
-				args = `switch ${picked}`;
 			}
 			const outcome = await runPresetsCommand(args, ctx.session);
 			if (outcome.switched) {

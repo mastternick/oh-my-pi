@@ -547,4 +547,48 @@ describe("HookSelectorComponent", () => {
 		expect(appleRow).not.toContain(openBg);
 		expect(cherryRow).not.toContain(openBg);
 	});
+
+	it("invokes onRemove with the highlighted label and hints the key", () => {
+		const removed: string[] = [];
+		const component = new HookSelectorComponent(
+			"Switch to model preset",
+			["fast", "deep"],
+			() => {},
+			() => {},
+			{ onRemove: name => removed.push(name) },
+		);
+
+		component.handleInput("\x1b[B");
+		component.handleInput("r");
+		const footer = Bun.stripANSI(component.render(80).join("\n"));
+		component.dispose();
+
+		expect(removed).toEqual(["deep"]);
+		expect(footer).toContain("remove");
+	});
+
+	it("keeps r as search text while onRemove is set and the list overflows", () => {
+		const removed: string[] = [];
+		const options = Array.from({ length: 20 }, (_, i) => `Preset ${i + 1}`);
+		const component = new HookSelectorComponent(
+			"Pick one",
+			options,
+			() => {},
+			() => {},
+			{
+				maxVisible: 5,
+				onRemove: name => removed.push(name),
+			},
+		);
+
+		component.handleInput("r");
+		const searching = Bun.stripANSI(component.render(80).join("\n"));
+		expect(removed).toEqual([]);
+		expect(searching).toContain("Search: r");
+
+		// ctrl+r still removes once type-to-search owns printable keys.
+		component.handleInput("\x12");
+		component.dispose();
+		expect(removed).toEqual(["Preset 1"]);
+	});
 });

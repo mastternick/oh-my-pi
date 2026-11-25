@@ -78,6 +78,10 @@ export interface HookSelectorOptions {
 	onLeft?: () => void;
 	onRight?: () => void;
 	onExternalEditor?: () => void;
+	/** Invoked with the highlighted option's label when the user presses
+	 *  `ctrl+r`, or `r` while type-to-search is inactive. The caller decides how
+	 *  to close the dialog and what to do with the removal. */
+	onRemove?: (selected: string) => void;
 	helpText?: string;
 	slider?: HookSelectorSlider;
 	/** Indices into the original options that cannot be selected: they render
@@ -208,6 +212,7 @@ export class HookSelectorComponent extends OverlayPanel {
 	#onLeftCallback: (() => void) | undefined;
 	#onRightCallback: (() => void) | undefined;
 	#onExternalEditorCallback: (() => void) | undefined;
+	#onRemoveCallback: ((selected: string) => void) | undefined;
 	#onTimeoutResetCallback: (() => void) | undefined;
 	#slider: HookSelectorSlider | undefined;
 	#sliderIndex: number = 0;
@@ -273,6 +278,7 @@ export class HookSelectorComponent extends OverlayPanel {
 		this.#onLeftCallback = opts?.onLeft;
 		this.#onRightCallback = opts?.onRight;
 		this.#onExternalEditorCallback = opts?.onExternalEditor;
+		this.#onRemoveCallback = opts?.onRemove;
 		this.#onTimeoutResetCallback = opts?.onTimeoutReset;
 		if (opts?.slider && opts.slider.segments.length > 0) {
 			this.#slider = opts.slider;
@@ -319,8 +325,9 @@ export class HookSelectorComponent extends OverlayPanel {
 		}
 		this.addChild(new Spacer(1));
 		const controlsHint =
-			opts?.helpText ??
-			`${editorKeys("tui.select.up", "tui.select.down")} navigate  ${formatKeyHint("enter")} select  ${editorKey("tui.select.cancel")} cancel`;
+			(opts?.helpText ??
+				`${editorKeys("tui.select.up", "tui.select.down")} navigate  ${formatKeyHint("enter")} select  ${editorKey("tui.select.cancel")} cancel`) +
+			(this.#onRemoveCallback ? `  ${formatKeyHint("r")} remove` : "");
 		this.addChild(new Text(theme.fg("dim", controlsHint), 0, 0));
 		this.addChild(new Spacer(1));
 
@@ -641,6 +648,16 @@ export class HookSelectorComponent extends OverlayPanel {
 		if (matchesSelectCancel(keyData)) {
 			this.#onCancelCallback();
 			return;
+		}
+
+		if (this.#onRemoveCallback) {
+			// `r` only removes when it cannot be typed into search; `ctrl+r` always does.
+			const removeKey = matchesKey(keyData, "ctrl+r") || (!this.#isSearchEnabled() && matchesKey(keyData, "r"));
+			if (removeKey) {
+				const selected = this.#menu.selectedItem;
+				if (selected && !this.#menu.isDisabled(selected)) this.#onRemoveCallback(selected.option.label);
+				return;
+			}
 		}
 
 		if (this.#handleQuickSelect(keyData)) {

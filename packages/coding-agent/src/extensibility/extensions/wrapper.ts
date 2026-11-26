@@ -85,6 +85,12 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 	constructor(
 		private registeredTool: RegisteredTool,
 		private runner: ExtensionRunner,
+		/**
+		 * Who the extension sees as the caller. Defaults to the runner's own
+		 * identity (the session's agent); an advisor's copy passes the advisor so
+		 * `ctx.agent` inside `execute` matches the `tool_call`/`tool_result` hooks.
+		 */
+		private agent?: ExtensionAgentIdentity,
 	) {
 		applyToolProxy(registeredTool.definition, this);
 		this.loadMode = defaultLoadModeForToolName(registeredTool.definition.name, registeredTool.definition.loadMode);
@@ -130,12 +136,16 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 			params,
 			signal,
 			onUpdate,
-			this.runner.createContext(undefined, {
-				toolName: this.registeredTool.definition.name,
-				context,
-				signal,
-				onUpdate,
-			}),
+			this.runner.createContext(
+				undefined,
+				{
+					toolName: this.registeredTool.definition.name,
+					context,
+					signal,
+					onUpdate,
+				},
+				this.agent,
+			),
 		);
 	}
 }
@@ -143,15 +153,24 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 /**
  * Backward-compatible factory function wrapper.
  */
-export function wrapRegisteredTool(registeredTool: RegisteredTool, runner: ExtensionRunner): AgentTool {
-	return new RegisteredToolAdapter(registeredTool, runner);
+export function wrapRegisteredTool(
+	registeredTool: RegisteredTool,
+	runner: ExtensionRunner,
+	agent?: ExtensionAgentIdentity,
+): AgentTool {
+	return new RegisteredToolAdapter(registeredTool, runner, agent);
 }
 
 /**
- * Wrap all registered tools into AgentTools.
+ * Wrap all registered tools into AgentTools. `agent` attributes the copy to a
+ * caller other than the session's own agent (an advisor's slate).
  */
-export function wrapRegisteredTools(registeredTools: RegisteredTool[], runner: ExtensionRunner): AgentTool[] {
-	return registeredTools.map(rt => wrapRegisteredTool(rt, runner));
+export function wrapRegisteredTools(
+	registeredTools: RegisteredTool[],
+	runner: ExtensionRunner,
+	agent?: ExtensionAgentIdentity,
+): AgentTool[] {
+	return registeredTools.map(rt => wrapRegisteredTool(rt, runner, agent));
 }
 
 const LOOP_DISPATCH_CONTEXT = Symbol("omp.loop-dispatch");

@@ -122,6 +122,7 @@ import { formatSessionHistoryMarkdown } from "./session-history-format";
 import type { SessionManager } from "./session-manager";
 import { buildSessionMetadata } from "./session-metadata";
 import type { YieldQueue } from "./yield-queue";
+import { BUILTIN_TOOL_NAMES } from "../tools/builtin-names";
 
 import {
 	cfgAdvisorContinueSeverity,
@@ -137,6 +138,9 @@ import { resolveModelCompactionSettings } from "./model-compaction-threshold";
 import { cfgProvidersOpenaiCodexDaybreak, cfgRetry, cfgTierAdvisor } from "./settings";
 
 const ADVISOR_CODEX_SSE_MAX_ATTEMPTS = 1;
+
+/** Built-in tool names: a grant of one of these never depends on an extension. */
+const BUILTIN_TOOL_NAME_SET: ReadonlySet<string> = new Set(BUILTIN_TOOL_NAMES);
 
 /**
  * Buffer added to a sibling credential's unblock deadline before the advisor
@@ -603,6 +607,8 @@ export class SessionAdvisors {
 	#createTransformProviderContext: (() => (context: Context, model: Model) => Context | Promise<Context>) | undefined;
 	#advisors: ActiveAdvisor[] = [];
 	#advisorConfigs: AdvisorConfig[] | undefined;
+	/** Advisor+tool keys already reported as unresolvable, so a notice fires once. */
+	#reportedUnresolvedGrants = new Set<string>();
 	#advisorConfigWarnings: string[];
 	#advisorStatuses = new Map<string, { name: string; status: AdvisorRuntimeStatus }>();
 	#advisorProviderSessionIds = new Map<string, string>();
@@ -2910,6 +2916,60 @@ export class SessionAdvisors {
 		this.#advisorSharedMaxNotesPerUpdate = sharedMaxNotesPerUpdate;
 		this.#rebuildAdvisorRuntime();
 		return this.#advisors.length;
+	}
+
+	/**
+	 * Rebuild the live advisors after the session's extension tool set changed: an
+	 * extension registered its tools (`names`), or a suspension toggle added or
+	 * removed a whole extension's set (no `names`).
+	 *
+	 * Slates capture the registered definition at build time, so without this a
+	 * plugin tool registered after the session was constructed (Magic Context is
+	 * deferred) never reaches a roster that grants it, and a suspended or replaced
+	 * extension's copy keeps running. Only rosters that grant a name no built-in
+	 * provides are rebuilt — those are the grants an extension can satisfy — and
+	 * `names`, when given, narrows the trigger to the names that just changed.
+	 * Built-in-only rosters and other names never churn.
+	 *
+	 * @returns true when a rebuild happened.
+	 */
+	refreshAdvisorExtensionTools(names?: Iterable<string>): boolean {
+		if (!this.#advisorEnabled || this.#advisors.length === 0) return false;
+		const changed = names === undefined ? undefined : new Set(names);
+		const configs = this.#advisorConfigs ?? [];
+		const affected = configs.some(config =>
+			(config.tools ?? []).some(
+				name => !BUILTIN_TOOL_NAME_SET.has(name) && (changed === undefined || changed.has(name)),
+			),
+		);
+		if (!affected) return false;
+		return this.#rebuildAdvisorRuntime(false);
+	}
+
+	/**
+	 * Tell the user about grants no tool in this session can satisfy — a typo, or a
+	 * plugin that is installed but disabled. Called once the extension set is
+	 * startup-final (after the deferred loader has registered everything), so a
+	 * startup-safe plugin's tool is not reported as missing while it is still
+	 * loading. A transient notice, not a persistent config warning: a later
+	 * `/reload-plugins` may well supply the tool. Deduped per advisor and name.
+	 */
+	reportUnresolvedAdvisorGrants(): void {
+		if (!this.#advisorEnabled) return;
+		const available = new Set(this.#advisorTools?.names() ?? []);
+		for (const config of this.#advisorConfigs ?? []) {
+			for (const name of config.tools ?? []) {
+				if (BUILTIN_TOOL_NAME_SET.has(name) || available.has(name)) continue;
+				const key = `${config.name}:${name}`;
+				if (this.#reportedUnresolvedGrants.has(key)) continue;
+				this.#reportedUnresolvedGrants.add(key);
+				this.#host.emitNotice(
+					"warning",
+					`Advisor "${config.name}" grants "${name}", which no tool here provides; the grant is skipped.`,
+					"advisor",
+				);
+			}
+		}
 	}
 
 	/**

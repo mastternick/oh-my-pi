@@ -16873,6 +16873,27 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
+	 * Rebuild the live advisors after the extension tool set changed (a
+	 * startup-safe/deferred plugin registered tools, or a suspension toggle).
+	 * No-op unless a live advisor grants a non-built-in name among `names`
+	 * (every grant when omitted), so plain built-in rosters never churn.
+	 *
+	 * @returns true when a rebuild happened.
+	 */
+	refreshAdvisorExtensionTools(names?: Iterable<string>): boolean {
+		return this.#advisors.refreshAdvisorExtensionTools(names);
+	}
+
+	/**
+	 * Emit a one-time notice per advisor grant no tool in this session can satisfy
+	 * (typo, or a plugin installed but disabled). Call it once the extension set is
+	 * startup-final; a later plugin registration is not reported again.
+	 */
+	reportUnresolvedAdvisorGrants(): void {
+		this.#advisors.reportUnresolvedAdvisorGrants();
+	}
+
+	/**
 	 * The live advisor `Agent`, or `undefined` when no advisor runtime is
 	 * attached. Surfaced for diagnostics (`/dump advisor` already serializes
 	 * its transcript via {@link formatAdvisorHistoryAsText}) and so callers can

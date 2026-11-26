@@ -4,7 +4,7 @@ import { type } from "@oh-my-pi/omptype";
 import { isEnoent, logger, slugify } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { expandAtImports } from "../discovery/at-imports";
-import { normalizeToolNames } from "../tools/builtin-names";
+import { HIDDEN_TOOL_NAMES, normalizeToolNames } from "../tools/builtin-names";
 import { collectConfigCandidates } from "./watchdog";
 
 import {
@@ -167,18 +167,23 @@ export function getOrCreateAdvisorProviderSessionId(
 	return next;
 }
 
+/** Hidden tools are session-internal (loop control, thinking) and never grantable. */
+const HIDDEN_TOOL_NAME_SET: ReadonlySet<string> = new Set(HIDDEN_TOOL_NAMES);
+
 /**
  * Normalize an advisor's `tools` list: legacy aliases (search→grep, find→glob)
  * are canonicalized and duplicates dropped. Names this build does not know as
  * built-ins are kept verbatim — they may be extension tools (`ctx_memory`) that
  * only the live session's extension runner can resolve, so the runtime decides
- * (and warns once) instead of the parser. `undefined` means "use the default
- * subset" (read/grep/glob); only an explicit raw empty list means "no tools".
+ * (and warns once) instead of the parser. Hidden tools (`yield`/`goal`/`think`)
+ * are not grantable and stay dropped here rather than surfacing as unknown
+ * extension grants. `undefined` means "use the default subset" (read/grep/glob);
+ * only an explicit raw empty list means "no tools".
  */
 function filterAdvisorTools(tools: string[] | undefined): string[] | undefined {
 	if (tools === undefined) return undefined;
 	if (tools.length === 0) return [];
-	const filtered = normalizeToolNames(tools);
+	const filtered = normalizeToolNames(tools).filter(name => !HIDDEN_TOOL_NAME_SET.has(name));
 	return filtered.length > 0 ? filtered : undefined;
 }
 

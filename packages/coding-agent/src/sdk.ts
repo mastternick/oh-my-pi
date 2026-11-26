@@ -5390,7 +5390,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const buildAdvisorExtensionTool = (name: string): Tool | null => {
 			const registered = extensionRunner.getRegisteredTool(name);
 			if (!registered) return null;
-			const [adapted] = wrapRegisteredTools([registered], extensionRunner);
+			const [adapted] = wrapRegisteredTools([registered], extensionRunner, advisorAgent);
 			if (!adapted) return null;
 			return new ExtensionToolWrapper(wrapToolWithMetaNotice(adapted), extensionRunner, advisorAgent);
 		};
@@ -5402,12 +5402,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					advisorAvailableToolNames = advisorBuiltinNames.filter(name => buildAdvisorTool(name, probeSession));
 				}
 				// Read extension tools live: a plugin may register after this factory
-				// is built, and `/advisor configure` should list what exists now.
+				// is built (a deferred/startup-safe extension does), and `/advisor
+				// configure` should list what exists now. A built-in's name is not
+				// offered as an extension grant: built-ins always win in `create`.
 				const seen = new Set(advisorAvailableToolNames);
 				const names = [...advisorAvailableToolNames];
 				for (const registered of extensionRunner.getAllRegisteredTools()) {
 					const name = registered.definition.name;
-					if (seen.has(name)) continue;
+					if (seen.has(name) || advisorBuiltinNameSet.has(name)) continue;
 					seen.add(name);
 					names.push(name);
 				}
@@ -5844,6 +5846,31 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		if (!restrictToolNames) {
 			const unsubscribeToolRegistrations = extensionRunner.onToolRegistered(scheduleToolRegistration);
 			disposeCallbacks.add(unsubscribeToolRegistrations);
+
+			// Advisor slates capture the registered definition when they build, and a
+			// startup-safe (`deferrable`) extension registers its tools only after the
+			// session exists — Magic Context included. Rebuild a live advisor that
+			// grants such a name; built-in-only rosters are untouched.
+			const unsubscribeAdvisorToolRegistrations = extensionRunner.onToolRegistered(registered =>
+				session.refreshAdvisorExtensionTools([registered.definition.name]),
+			);
+			disposeCallbacks.add(unsubscribeAdvisorToolRegistrations);
+			// A suspension toggle (live `disabledExtensions` edit, project-scope `/move`)
+			// appears and withdraws a whole extension's tools at once; no names are
+			// reported, so let the roster's own grants decide.
+			const unsubscribeAdvisorSuspensions = extensionRunner.onSuspensionChange(() => {
+				session.refreshAdvisorExtensionTools();
+			});
+			disposeCallbacks.add(unsubscribeAdvisorSuspensions);
+			// Close the same construction race for the advisors: a tool registered
+			// between the pre-session snapshot and this listener was not in the slate
+			// its advisor built. Only those late names can need the rebuild, so an
+			// eagerly loaded plugin never costs a second advisor build at startup.
+			const lateAdvisorToolNames = extensionRunner
+				.getAllRegisteredTools()
+				.filter(registered => !initialRegisteredTools.has(registered))
+				.map(registered => registered.definition.name);
+			if (lateAdvisorToolNames.length > 0) session.refreshAdvisorExtensionTools(lateAdvisorToolNames);
 
 			// Close the construction race: a background registration can land after
 			// the initial snapshot but before the live listener above is attached.
@@ -6528,7 +6555,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				for (const prepared of deferredPrepared) forwardablePreparedExtensions.set(prepared.resolvedPath, prepared);
 				forwardableExtensionPaths.push(...deferredPaths);
 				await extensionRunner.addExtensions(loaded.extensions);
+				// The extension set is final now: report grants nothing supplied.
+				session.reportUnresolvedAdvisorGrants();
 			});
+		} else {
+			// Nothing can register later in this startup, so report now.
+			session.reportUnresolvedAdvisorGrants();
 		}
 		startDeferredMCPDiscovery?.(session);
 

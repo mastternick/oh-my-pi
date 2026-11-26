@@ -5851,9 +5851,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// startup-safe (`deferrable`) extension registers its tools only after the
 			// session exists — Magic Context included. Rebuild a live advisor that
 			// grants such a name; built-in-only rosters are untouched.
-			const unsubscribeAdvisorToolRegistrations = extensionRunner.onToolRegistered(registered =>
-				session.refreshAdvisorExtensionTools([registered.definition.name]),
-			);
+			const unsubscribeAdvisorToolRegistrations = extensionRunner.onToolRegistered(registered => {
+				session.refreshAdvisorExtensionTools([registered.definition.name]);
+			});
 			disposeCallbacks.add(unsubscribeAdvisorToolRegistrations);
 			// A suspension toggle (live `disabledExtensions` edit, project-scope `/move`)
 			// appears and withdraws a whole extension's tools at once; no names are

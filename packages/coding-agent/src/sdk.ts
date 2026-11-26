@@ -5379,6 +5379,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (tool instanceof Promise) throw new Error(`Advisor tool "${name}" must build synchronously`);
 			return tool;
 		};
+		const advisorBuiltinNameSet = new Set<string>(advisorBuiltinNames);
+		// `create` runs once per advisor conversation, so a name granted by several
+		// advisors — or re-granted on every review — warns once per advisor+name.
+		const unregisteredAdvisorTools = new Set<string>();
+		// A granted name outside the built-in set may be an extension/plugin tool
+		// (`ctx_memory`). Resolve it against the live runner and wrap it exactly like
+		// the primary registry wraps extension tools, so the approval gate still
+		// applies and `ctx.agent` reports the advisor.
+		const buildAdvisorExtensionTool = (name: string): Tool | null => {
+			const registered = extensionRunner.getRegisteredTool(name);
+			if (!registered) return null;
+			const [adapted] = wrapRegisteredTools([registered], extensionRunner);
+			if (!adapted) return null;
+			return new ExtensionToolWrapper(wrapToolWithMetaNotice(adapted), extensionRunner, advisorAgent);
+		};
 		let advisorAvailableToolNames: string[] | undefined;
 		const advisorTools: AdvisorToolFactory = {
 			names: () => {
@@ -5386,9 +5401,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					const probeSession = createAdvisorToolSession();
 					advisorAvailableToolNames = advisorBuiltinNames.filter(name => buildAdvisorTool(name, probeSession));
 				}
-				return advisorAvailableToolNames;
+				// Read extension tools live: a plugin may register after this factory
+				// is built, and `/advisor configure` should list what exists now.
+				const seen = new Set(advisorAvailableToolNames);
+				const names = [...advisorAvailableToolNames];
+				for (const registered of extensionRunner.getAllRegisteredTools()) {
+					const name = registered.definition.name;
+					if (seen.has(name)) continue;
+					seen.add(name);
+					names.push(name);
+				}
+				return names;
 			},
-			create: granted => {
+			create: (granted, options) => {
 				const advisorSession = createAdvisorToolSession();
 				// Descriptions, schemas, and execute-time gates read this live. A name
 				// is active only once its factory returns a tool, so a grant for an
@@ -5412,6 +5437,23 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					// `bash`/`write` the user configured as `ask` or `deny`. Meta-notice
 					// first, matching the registry's wrap order.
 					tools.push(new ExtensionToolWrapper(wrapToolWithMetaNotice(tool), extensionRunner, advisorAgent));
+				}
+				for (const name of granted) {
+					if (advisorBuiltinNameSet.has(name)) continue;
+					const tool = buildAdvisorExtensionTool(name);
+					if (tool) {
+						tools.push(tool);
+						continue;
+					}
+					// Not a built-in and no extension registered it: the grant is stale
+					// (plugin uninstalled, memory backend off). Skip it, once per advisor.
+					const warningKey = `${options?.advisor ?? ""}:${name}`;
+					if (unregisteredAdvisorTools.has(warningKey)) continue;
+					unregisteredAdvisorTools.add(warningKey);
+					logger.warn("Advisor grants an unknown tool; skipping it", {
+						advisor: options?.advisor,
+						tool: name,
+					});
 				}
 				return {
 					tools,

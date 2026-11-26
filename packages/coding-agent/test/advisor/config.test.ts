@@ -59,30 +59,38 @@ describe("discoverAdvisorConfigs", () => {
 		expect(sec.model).toBeUndefined();
 		expect(sec.reviewMode).toBeUndefined();
 		expect(sec.reviewInterval).toBeUndefined();
-		// The unknown/non-read-only tool is dropped; only `read` survives.
-		expect(sec.tools).toEqual(["read"]);
+		// A name that is not a built-in is kept: it may be an extension tool
+		// (`ctx_memory`) that only the live session can resolve.
+		expect(sec.tools).toEqual(["read", "definitely-not-a-tool"]);
 		expect(sharedInstructions).toBe("Shared baseline for all advisors.");
 	});
 
-	it("distinguishes omitted tools, explicit no-tools, and invalid-only lists", async () => {
+	it("distinguishes omitted tools, explicit no-tools, and unknown-only lists", async () => {
 		const yaml = [
 			"advisors:",
 			"  - name: No Tools",
 			"    tools: []",
 			"  - name: Default Tools",
-			"  - name: Invalid Only",
+			"  - name: Unknown Only",
 			"    tools: [reed]",
+			"  - name: Deduped",
+			"    tools: [read, search, grep, ctx_memory, ctx_memory]",
 		].join("\n");
 		await Bun.write(path.join(tmp, "WATCHDOG.yml"), yaml);
 
-		const { advisors } = await discoverAdvisorConfigs(tmp, agentDir);
+		const { advisors, warnings } = await discoverAdvisorConfigs(tmp, agentDir);
 		const noTools = advisors.find(a => a.name === "No Tools");
 		const defaultTools = advisors.find(a => a.name === "Default Tools");
-		const invalidOnly = advisors.find(a => a.name === "Invalid Only");
+		const unknownOnly = advisors.find(a => a.name === "Unknown Only");
+		const deduped = advisors.find(a => a.name === "Deduped");
 
 		expect(noTools?.tools).toEqual([]);
 		expect(defaultTools?.tools).toBeUndefined();
-		expect(invalidOnly?.tools).toBeUndefined();
+		expect(unknownOnly?.tools).toEqual(["reed"]);
+		// Legacy aliases canonicalize (search→grep) and duplicates collapse.
+		expect(deduped?.tools).toEqual(["read", "grep", "ctx_memory"]);
+		// Unknown names are the runtime's problem: parsing stays silent.
+		expect(warnings.filter(message => message.includes("reed"))).toEqual([]);
 	});
 
 	it("ignores a malformed YAML file without throwing", async () => {

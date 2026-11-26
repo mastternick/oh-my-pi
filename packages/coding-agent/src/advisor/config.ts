@@ -4,7 +4,7 @@ import { type } from "@oh-my-pi/omptype";
 import { isEnoent, logger, slugify } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { expandAtImports } from "../discovery/at-imports";
-import { BUILTIN_TOOL_NAMES, normalizeToolNames } from "../tools/builtin-names";
+import { HIDDEN_TOOL_NAMES, normalizeToolNames } from "../tools/builtin-names";
 import { collectConfigCandidates } from "./watchdog";
 
 import {
@@ -167,25 +167,23 @@ export function getOrCreateAdvisorProviderSessionId(
 	return next;
 }
 
-/** Built tool names, for validating an advisor's `tools` list. */
-const KNOWN_TOOL_NAMES = new Set<string>(BUILTIN_TOOL_NAMES);
+/** Hidden tools are session-internal (loop control, thinking) and never grantable. */
+const HIDDEN_TOOL_NAME_SET: ReadonlySet<string> = new Set(HIDDEN_TOOL_NAMES);
 
 /**
- * Keep only valid tool names from an advisor's `tools` list, dropping unknowns
- * with a warning. The advisor is a full agent, so any built tool may be granted;
- * the runtime further filters to what's actually available this session.
- * `undefined` means "use the default subset" (read/grep/glob); only an explicit
- * raw empty list means "no tools".
+ * Normalize an advisor's `tools` list: legacy aliases (`search`→`grep`) are
+ * canonicalized and duplicates dropped. Names this build does not know as
+ * built-ins are kept verbatim — they may be extension tools (`ctx_memory`) that
+ * only the live session's extension runner can resolve, so the runtime decides
+ * (and warns once) instead of the parser. Hidden tools (`yield`/`goal`/`think`)
+ * are not grantable and stay dropped here rather than surfacing as unknown
+ * extension grants. `undefined` means "use the default subset" (read/grep/glob);
+ * only an explicit raw empty list means "no tools".
  */
-function filterAdvisorTools(tools: string[] | undefined, sourcePath: string): string[] | undefined {
+function filterAdvisorTools(tools: string[] | undefined): string[] | undefined {
 	if (tools === undefined) return undefined;
 	if (tools.length === 0) return [];
-	// Normalize legacy aliases (search→grep, find→glob) and dedupe before validating.
-	const filtered = normalizeToolNames(tools).filter(name => {
-		if (KNOWN_TOOL_NAMES.has(name)) return true;
-		logger.warn("Advisor config: dropping unknown tool", { path: sourcePath, tool: name });
-		return false;
-	});
+	const filtered = normalizeToolNames(tools).filter(name => !HIDDEN_TOOL_NAME_SET.has(name));
 	return filtered.length > 0 ? filtered : undefined;
 }
 
@@ -243,7 +241,7 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
 			advisors.set(slug, {
 				name: entry.name,
 				model: entry.model?.trim() || undefined,
-				tools: filterAdvisorTools(entry.tools, item.path),
+				tools: filterAdvisorTools(entry.tools),
 				reviewMode: entry.reviewMode,
 				reviewInterval: entry.reviewInterval,
 				syncBacklog: entry.syncBacklog === undefined ? undefined : normalizeSyncBacklog(entry.syncBacklog),

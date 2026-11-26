@@ -122,6 +122,7 @@ import { formatSessionHistoryMarkdown } from "./session-history-format";
 import type { SessionManager } from "./session-manager";
 import { buildSessionMetadata } from "./session-metadata";
 import type { YieldQueue } from "./yield-queue";
+import { BUILTIN_TOOL_NAMES } from "../tools/builtin-names";
 
 import {
 	cfgAdvisorContinueSeverity,
@@ -137,6 +138,9 @@ import { resolveModelCompactionSettings } from "./model-compaction-threshold";
 import { cfgProvidersOpenaiCodexDaybreak, cfgRetry, cfgTierAdvisor } from "./settings";
 
 const ADVISOR_CODEX_SSE_MAX_ATTEMPTS = 1;
+
+/** Built-in tool names: a grant of one of these never depends on an extension. */
+const BUILTIN_TOOL_NAME_SET: ReadonlySet<string> = new Set(BUILTIN_TOOL_NAMES);
 
 /**
  * Buffer added to a sibling credential's unblock deadline before the advisor
@@ -460,7 +464,13 @@ export interface AdvisorToolFactory {
 	/** Every tool name a slate can hold. */
 	names(): readonly string[];
 	/** Build the granted `names` against a new tool session. */
-	create(names: ReadonlySet<string>): AdvisorToolSlate;
+	create(names: ReadonlySet<string>, options?: AdvisorToolSlateOptions): AdvisorToolSlate;
+}
+
+/** Per-slate context for the tool factory; `advisor` only labels diagnostics. */
+export interface AdvisorToolSlateOptions {
+	/** The advisor this slate belongs to, for one-warning-per-advisor notices. */
+	advisor?: string;
 }
 
 /** Inputs that configure the advisor roster owned by a session. */
@@ -526,6 +536,12 @@ export interface SessionAdvisorsHost {
 	clientBridge(): ClientBridge | undefined;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
+	/**
+	 * Append a user-visible config warning to the session's header rows (and the
+	 * `config_warnings_changed` event that re-renders them). Optional so test and
+	 * SDK hosts without a header can omit it; the notice still fires.
+	 */
+	addConfigWarning?(message: string): void;
 	sendCustomMessage(message: CustomMessagePayload, options?: AdvisorMessageDeliveryOptions): Promise<boolean>;
 	extractQueuedAdvisorCards(): CustomMessage[];
 	dropPendingAdvisorCards(): void;
@@ -597,6 +613,8 @@ export class SessionAdvisors {
 	#createTransformProviderContext: (() => (context: Context, model: Model) => Context | Promise<Context>) | undefined;
 	#advisors: ActiveAdvisor[] = [];
 	#advisorConfigs: AdvisorConfig[] | undefined;
+	/** Advisor+tool keys already reported as unresolvable, so a notice fires once. */
+	#reportedUnresolvedGrants = new Set<string>();
 	#advisorConfigWarnings: string[];
 	#advisorStatuses = new Map<string, { name: string; status: AdvisorRuntimeStatus }>();
 	#advisorProviderSessionIds = new Map<string, string>();
@@ -1394,7 +1412,7 @@ export class SessionAdvisors {
 				config.tools === undefined ? new Set([...ADVISOR_DEFAULT_TOOL_NAMES, "recall"]) : new Set(config.tools);
 			// A fresh slate per advisor: tool state such as repeat-read counts must
 			// reflect this advisor's own reads, not its siblings' (#18834).
-			const slate = this.#advisorTools?.create(names);
+			const slate = this.#advisorTools?.create(names, { advisor: advisorName });
 			const tools = (slate?.tools ?? []).filter(t => names.has(t.name));
 			const advisorLoopTools: AgentTool<any>[] = [adviseTool, ...tools];
 			const advisorToolMap = new Map<string, AgentTool<any>>();
@@ -2904,6 +2922,62 @@ export class SessionAdvisors {
 		this.#advisorSharedMaxNotesPerUpdate = sharedMaxNotesPerUpdate;
 		this.#rebuildAdvisorRuntime();
 		return this.#advisors.length;
+	}
+
+	/**
+	 * Rebuild the live advisors after the session's extension tool set changed: an
+	 * extension registered its tools (`names`), or a suspension toggle added or
+	 * removed a whole extension's set (no `names`).
+	 *
+	 * Slates capture the registered definition at build time, so without this a
+	 * plugin tool registered after the session was constructed (Magic Context is
+	 * deferred) never reaches a roster that grants it, and a suspended or replaced
+	 * extension's copy keeps running. Only rosters that grant a name no built-in
+	 * provides are rebuilt — those are the grants an extension can satisfy — and
+	 * `names`, when given, narrows the trigger to the names that just changed.
+	 * Built-in-only rosters and other names never churn.
+	 *
+	 * @returns true when a rebuild happened.
+	 */
+	refreshAdvisorExtensionTools(names?: Iterable<string>): boolean {
+		if (!this.#advisorEnabled || this.#advisors.length === 0) return false;
+		const changed = names === undefined ? undefined : new Set(names);
+		const configs = this.#advisorConfigs ?? [];
+		const affected = configs.some(config =>
+			(config.tools ?? []).some(
+				name => !BUILTIN_TOOL_NAME_SET.has(name) && (changed === undefined || changed.has(name)),
+			),
+		);
+		if (!affected) return false;
+		return this.#rebuildAdvisorRuntime(false);
+	}
+
+	/**
+	 * Tell the user about grants no tool in this session can satisfy — a typo, or a
+	 * plugin that is installed but disabled. Called once the extension set is
+	 * startup-final (after the deferred loader has registered everything), so a
+	 * startup-safe plugin's tool is not reported as missing while it is still
+	 * loading.
+	 *
+	 * The message becomes a session config warning — the header rows the interactive
+	 * mode renders once it subscribes, so a construction-time report on a resumed or
+	 * non-interactive-eager startup is not lost — and is also emitted as a notice so
+	 * RPC/headless clients see it. Deduped per advisor and name.
+	 */
+	reportUnresolvedAdvisorGrants(): void {
+		if (!this.#advisorEnabled) return;
+		const available = new Set(this.#advisorTools?.names() ?? []);
+		for (const config of this.#advisorConfigs ?? []) {
+			for (const name of config.tools ?? []) {
+				if (BUILTIN_TOOL_NAME_SET.has(name) || available.has(name)) continue;
+				const key = `${config.name}:${name}`;
+				if (this.#reportedUnresolvedGrants.has(key)) continue;
+				this.#reportedUnresolvedGrants.add(key);
+				const message = `Advisor "${config.name}" grants "${name}", which no tool here provides; the grant is skipped.`;
+				this.#host.addConfigWarning?.(message);
+				this.#host.emitNotice("warning", message, "advisor");
+			}
+		}
 	}
 
 	/**

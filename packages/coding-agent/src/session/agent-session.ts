@@ -3013,6 +3013,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			clientBridge: () => this.#clientBridge,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
+			addConfigWarning: message => {
+				// The header rows the UI renders after it subscribes; the event re-renders them.
+				if (this.configWarnings.includes(message)) return;
+				this.configWarnings.push(message);
+				this.#emit({ type: "config_warnings_changed" });
+			},
 			sendCustomMessage: (message, options) => this.sendCustomMessage(message, options),
 			extractQueuedAdvisorCards: () => this.#extractQueuedAdvisorCards(),
 			dropPendingAdvisorCards: () => {

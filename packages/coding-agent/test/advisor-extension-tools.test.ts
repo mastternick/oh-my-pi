@@ -152,6 +152,17 @@ describe("advisor extension tool grants", () => {
 		expect(advisorToolNames()).toContain("ctx_memory");
 	});
 
+	it("lists a grant nothing provides in the session config warnings on the eager path", async () => {
+		const cwd = tempDir.path();
+		// No deferred loader on this startup (a resumed or non-interactive launch):
+		// `ctx_memory` has no plugin at all, so the report happens immediately and
+		// must reach the channel the UI reads after it subscribes.
+		await writeRoster(cwd, ["read", "ctx_memory"]);
+
+		session = await createAdvisedSession(cwd);
+		expect(session.configWarnings.filter(warning => warning.includes('"ctx_memory"'))).toHaveLength(1);
+	});
+
 	it("notices a grant nothing provides once the deferred plugins have loaded", async () => {
 		const cwd = tempDir.path();
 		// `ctx_notee` is a stale grant (a typo): nothing ever registers it.

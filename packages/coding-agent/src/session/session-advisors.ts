@@ -536,6 +536,12 @@ export interface SessionAdvisorsHost {
 	clientBridge(): ClientBridge | undefined;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
+	/**
+	 * Append a user-visible config warning to the session's header rows (and the
+	 * `config_warnings_changed` event that re-renders them). Optional so test and
+	 * SDK hosts without a header can omit it; the notice still fires.
+	 */
+	addConfigWarning?(message: string): void;
 	sendCustomMessage(message: CustomMessagePayload, options?: AdvisorMessageDeliveryOptions): Promise<boolean>;
 	extractQueuedAdvisorCards(): CustomMessage[];
 	dropPendingAdvisorCards(): void;
@@ -2951,8 +2957,12 @@ export class SessionAdvisors {
 	 * plugin that is installed but disabled. Called once the extension set is
 	 * startup-final (after the deferred loader has registered everything), so a
 	 * startup-safe plugin's tool is not reported as missing while it is still
-	 * loading. A transient notice, not a persistent config warning: a later
-	 * `/reload-plugins` may well supply the tool. Deduped per advisor and name.
+	 * loading.
+	 *
+	 * The message becomes a session config warning — the header rows the interactive
+	 * mode renders once it subscribes, so a construction-time report on a resumed or
+	 * non-interactive-eager startup is not lost — and is also emitted as a notice so
+	 * RPC/headless clients see it. Deduped per advisor and name.
 	 */
 	reportUnresolvedAdvisorGrants(): void {
 		if (!this.#advisorEnabled) return;
@@ -2963,11 +2973,9 @@ export class SessionAdvisors {
 				const key = `${config.name}:${name}`;
 				if (this.#reportedUnresolvedGrants.has(key)) continue;
 				this.#reportedUnresolvedGrants.add(key);
-				this.#host.emitNotice(
-					"warning",
-					`Advisor "${config.name}" grants "${name}", which no tool here provides; the grant is skipped.`,
-					"advisor",
-				);
+				const message = `Advisor "${config.name}" grants "${name}", which no tool here provides; the grant is skipped.`;
+				this.#host.addConfigWarning?.(message);
+				this.#host.emitNotice("warning", message, "advisor");
 			}
 		}
 	}

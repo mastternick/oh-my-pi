@@ -171,8 +171,8 @@ export function getOrCreateAdvisorProviderSessionId(
 const HIDDEN_TOOL_NAME_SET: ReadonlySet<string> = new Set(HIDDEN_TOOL_NAMES);
 
 /**
- * Normalize an advisor's `tools` list: legacy aliases (search→grep, find→glob)
- * are canonicalized and duplicates dropped. Names this build does not know as
+ * Normalize an advisor's `tools` list: legacy aliases (`search`→`grep`) are
+ * canonicalized and duplicates dropped. Names this build does not know as
  * built-ins are kept verbatim — they may be extension tools (`ctx_memory`) that
  * only the live session's extension runner can resolve, so the runtime decides
  * (and warns once) instead of the parser. Hidden tools (`yield`/`goal`/`think`)

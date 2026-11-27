@@ -86,7 +86,7 @@ function createSource(setup: Setup): ModelHubSource {
 		}),
 		defaultRoleChain: () => [],
 		resolveRoleValue: value => ({
-			model: unresolved.has(value) ? undefined : parentModel,
+			model: value !== undefined && unresolved.has(value) ? undefined : parentModel,
 			explicitThinkingLevel: false,
 		}),
 	};
@@ -130,7 +130,7 @@ function createHub(setup: Setup): HubHarness {
 		},
 		onCompactionPointChange: () => {
 			compactionCalls.push("point");
-			return true;
+			return undefined;
 		},
 	};
 	const scoped: ScopedModelItem[] = [{ model: parentModel }, { model: otherModel }];

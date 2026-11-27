@@ -49,11 +49,12 @@ import {
 } from "@oh-my-pi/pi-tui/thinking";
 import { isAuthenticated, kNoAuth, type ModelRegistry } from "./model-registry";
 import {
+	DEFAULT_MODEL_ROLE,
 	DEFAULT_MODEL_ROLE_ALIAS,
 	formatModelRoleAlias,
 	LEGACY_MODEL_ROLE_ALIAS_PREFIX,
-	MODEL_ROLE_ALIAS_PREFIX,
 	MODEL_ROLE_IDS,
+	modelRoleAliasPrefixLength,
 	type ModelRole,
 } from "./model-roles";
 import type { Settings } from "./settings";
@@ -1094,23 +1095,8 @@ export function parseModelPattern(
 	);
 }
 
-const DEFAULT_MODEL_ROLE = "default";
-const MODEL_ROLE_ALIAS_PREFIXES = [MODEL_ROLE_ALIAS_PREFIX, LEGACY_MODEL_ROLE_ALIAS_PREFIX];
-
 function isModelRole(role: string): role is ModelRole {
 	return (MODEL_ROLE_IDS as string[]).includes(role);
-}
-
-/**
- * Minimum colon index for splitting a `:<level>` suffix off a role alias, or
- * `undefined` when `value` is not role-alias shaped. Doubles as the slice
- * offset of the role name for prefixed aliases (`@role`, `pi/role`); the bare
- * `*` default alias returns 0 because its colon sits immediately after the
- * one-character token (`*:xhigh`).
- */
-function modelRoleAliasPrefixLength(value: string): number | undefined {
-	if (value === DEFAULT_MODEL_ROLE_ALIAS || value.startsWith(`${DEFAULT_MODEL_ROLE_ALIAS}:`)) return 0;
-	return MODEL_ROLE_ALIAS_PREFIXES.find(prefix => value.startsWith(prefix))?.length;
 }
 
 function getModelRoleAlias(value: string, settings?: ModelRoleLookup): string | undefined {

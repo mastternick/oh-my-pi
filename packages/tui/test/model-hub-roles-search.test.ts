@@ -17,6 +17,7 @@ import { initTheme } from "../src/theme";
 import type { TUI } from "../src/index";
 
 const tuiStub = { requestRender: () => {}, terminal: { rows: 30 } } as unknown as TUI;
+const PANEL_TEXT = "Panel description for the default role.";
 
 const pickerCx: DescribeContext = {
 	cols: 120,
@@ -55,7 +56,7 @@ const source: ModelHubSource = {
 	mruOrder: [],
 	modelPerf: new Map(),
 	getModelRole: () => undefined,
-	getRoleInfo: role => ({ name: role, section: "chat", accepts: () => true }),
+	getRoleInfo: role => ({ name: role, section: "chat", description: PANEL_TEXT, accepts: () => true }),
 	defaultRoleChain: () => [],
 	resolveRoleValue: () => ({ model: undefined, explicitThinkingLevel: false }),
 };
@@ -72,11 +73,11 @@ const registryStub: ModelHubRegistry = {
 	refreshProvider: async () => {},
 };
 
-function createHub(): ModelHubComponent {
+function createHub(onCancel: () => void = () => {}): ModelHubComponent {
 	const callbacks: ModelHubCallbacks = {
 		onAssign: () => true,
 		onUnassign: () => {},
-		onCancel: () => {},
+		onCancel,
 		onSavePreset: () => {},
 	};
 	return new ModelHubComponent(tuiStub, source, registryStub, [{ model: sonnet }], callbacks);
@@ -116,4 +117,51 @@ test("a live query keeps taking printable keys on the Roles rows", () => {
 	expect(props.strip).toBeNull();
 	expect(props.query).toBe("sonne");
 	expect(props.scope).toBe("all");
+});
+
+test("the native info key toggles the role info panel on the role row", () => {
+	const hub = createHub();
+	hub.handleNativeEvent(CLICK_ROLES);
+	expect(JSON.stringify(hub.describe(pickerCx))).not.toContain(PANEL_TEXT);
+
+	hub.handleInput("i");
+	expect(JSON.stringify(hub.describe(pickerCx))).toContain(PANEL_TEXT);
+
+	hub.handleInput("i");
+	expect(JSON.stringify(hub.describe(pickerCx))).not.toContain(PANEL_TEXT);
+});
+
+test("the native close action closes the role info panel and the hub stays open", () => {
+	let cancelled = 0;
+	const hub = createHub(() => cancelled++);
+	hub.handleNativeEvent(CLICK_ROLES);
+	hub.handleInput("i");
+
+	hub.handleNativeEvent({ type: "action", key: "", act: "close", mods: [] });
+	expect(cancelled).toBe(0);
+	expect(JSON.stringify(hub.describe(pickerCx))).not.toContain(PANEL_TEXT);
+
+	hub.handleNativeEvent({ type: "action", key: "", act: "close", mods: [] });
+	expect(cancelled).toBe(1);
+});
+
+test("with a live query, i edits the query and does not open the panel", () => {
+	const hub = createHub();
+	for (const ch of "son") hub.handleInput(ch);
+	hub.handleNativeEvent(CLICK_ROLES);
+
+	hub.handleInput("i");
+	expect(pickerProps(hub).query).toBe("soni");
+	expect(JSON.stringify(hub.describe(pickerCx))).not.toContain(PANEL_TEXT);
+});
+
+test("leaving the Roles entry and coming back closes the role info panel", () => {
+	const hub = createHub();
+	hub.handleNativeEvent(CLICK_ROLES);
+	hub.handleInput("i");
+	expect(JSON.stringify(hub.describe(pickerCx))).toContain(PANEL_TEXT);
+
+	hub.handleNativeEvent({ type: "select", key: "scopes", item: "all" });
+	hub.handleNativeEvent(CLICK_ROLES);
+	expect(JSON.stringify(hub.describe(pickerCx))).not.toContain(PANEL_TEXT);
 });

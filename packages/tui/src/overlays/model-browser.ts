@@ -121,12 +121,24 @@ export interface ModelBrowserRoleInfo {
 	name: string;
 	color?: ThemeColor;
 	hidden?: boolean;
+	/** Short role summary shown in the model hub's role info panel. */
+	description?: string;
+	/** Where `description` came from, labelled in the role info panel. */
+	descriptionSource?: "built-in" | "modelTags";
 	/** Lists this role beneath the named parent role when the parent is visible. */
 	parent?: string;
 	/** `false` omits this role's compaction sub-row in the model hub. */
 	compactionRow?: false;
 	section: "chat" | "kind";
 	accepts(model: Model): boolean;
+}
+
+/** An agent that references a role in its `model` list, as shown in the role info panel. */
+export interface ModelBrowserRoleAgentUsage {
+	agent: string;
+	description: string;
+	/** `primary` or `fallback N`. */
+	position: string;
 }
 
 /** Role lookup used for scoped model resolution. */
@@ -173,6 +185,8 @@ export interface ModelBrowserSource extends ModelRoleLookup {
 	 */
 	serviceTierFor?(model: Model): string | undefined;
 	getRoleInfo(role: string): ModelBrowserRoleInfo;
+	/** Agents whose `model` list references `role`. Absent or `undefined` means unknown; an empty list means none. */
+	getRoleAgentUsage?(role: string): readonly ModelBrowserRoleAgentUsage[] | undefined;
 	defaultRoleChain(role: string): string[];
 	resolveRoleValue(value: string | undefined, models: Model[], roleLookup?: ModelRoleLookup): ResolvedModelRoleValue;
 	/** Auto-compaction point for `model`; absent hosts show no compaction row in the preview. */

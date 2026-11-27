@@ -36,7 +36,7 @@ import {
 } from "../../config/model-presets";
 import { resolveAdvisorRoleSelection, resolveModelRoleValue } from "../../config/model-resolver";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
-import { getRoleInfo } from "../../config/model-roles";
+import { getRoleAgentUsage, getRoleInfo } from "../../config/model-roles";
 import { settings } from "../../config/settings";
 import { createSettingsHost } from "../../config/settings-ui";
 import { createPluginSettingsHost } from "../../extensibility/plugins/settings-host";
@@ -146,6 +146,8 @@ import {
 	cfgTreeFilterMode,
 } from "../settings";
 import { cfgTaskAgentModelOverrides } from "../../task/settings";
+import { discoverAgents } from "../../task/discovery";
+import type { AgentDefinition } from "../../task/types";
 
 /** First-use boundary for provider auth catalog and dialog components. */
 async function loadProviderAuthUi() {
@@ -924,9 +926,24 @@ export class SelectorController {
 			this.focusActiveEditorArea();
 			this.ctx.ui.requestRender();
 		};
+		// Agent discovery is async and the hub reads usage synchronously: usage stays unknown (undefined) until
+		// discovery lands, then the hub re-renders. A failed discovery leaves it unknown.
+		let discoveredAgents: AgentDefinition[] | undefined;
+		void discoverAgents(getProjectDir(), undefined, this.ctx.session.effectiveExtensionRoots)
+			.then(({ agents }) => {
+				discoveredAgents = agents;
+				if (closed) return;
+				hub.invalidate();
+				this.ctx.ui.requestRender();
+			})
+			.catch(error => logger.warn("Agent discovery for model hub failed", { error: String(error) }));
 		const hub = new ModelHubComponent(
 			this.ctx.ui,
-			createModelBrowserSource(this.ctx.settings, model => this.ctx.session.effectiveServiceTier(model)),
+			createModelBrowserSource(
+				this.ctx.settings,
+				model => this.ctx.session.effectiveServiceTier(model),
+				role => getRoleAgentUsage(role, discoveredAgents),
+			),
 			this.ctx.session.modelRegistry,
 			this.ctx.session.scopedModels,
 			{

@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { getRoleInfo } from "@oh-my-pi/pi-coding-agent/config/model-roles";
+import { getRoleAgentUsage, getRoleInfo } from "@oh-my-pi/pi-coding-agent/config/model-roles";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 
 function makeModel(id: string, metadata: Partial<Pick<Model, "api" | "kind" | "webSearch">> = {}): Model {
 	return buildModel({
@@ -77,5 +78,55 @@ describe("getRoleInfo", () => {
 		const info = getRoleInfo("image", settings);
 		expect(info).toMatchObject({ name: "Pictures", color: "warning", section: "kind" });
 		expect(fixtures.filter(info.accepts)).toEqual([image]);
+	});
+});
+
+describe("role descriptions and agent usage", () => {
+	test("modelTags description overrides the built-in description", () => {
+		const settings = Settings.isolated({ modelTags: { smol: { description: "Our smol model." } } });
+		expect(getRoleInfo("smol", settings).description).toBe("Our smol model.");
+	});
+
+	test("a modelTags entry with only name keeps the built-in description", () => {
+		const info = getRoleInfo("smol", Settings.isolated({ modelTags: { smol: { name: "My Smol" } } }));
+		expect(info.name).toBe("My Smol");
+		expect(info.description).toContain("A fast, low-cost model for lightweight work.");
+	});
+
+	test("getRoleAgentUsage reports primary and fallback positions", () => {
+		const agents = [
+			{ name: "scout", description: "Fast scout", systemPrompt: "", model: ["@smol", "@plan"] },
+			{ name: "planner", description: "Planner", systemPrompt: "", model: ["@plan", "@smol"] },
+			{ name: "reviewer", description: "Reviewer", systemPrompt: "", model: ["@plan"] },
+		] as AgentDefinition[];
+		expect(getRoleAgentUsage("smol", agents)).toEqual([
+			{ agent: "scout", description: "Fast scout", position: "primary" },
+			{ agent: "planner", description: "Planner", position: "fallback 1" },
+		]);
+	});
+
+	test("getRoleAgentUsage counts thinking-suffixed, pi/ and * references and ignores other roles", () => {
+		const agents = [
+			{ name: "suffixed", description: "", systemPrompt: "", model: ["@task:high"] },
+			{ name: "legacy", description: "", systemPrompt: "", model: ["pi/task"] },
+			{ name: "fallback", description: "", systemPrompt: "", model: ["@plan", "pi/task:low"] },
+			{ name: "other", description: "", systemPrompt: "", model: ["@other", "@task-helper"] },
+			{ name: "empty", description: "", systemPrompt: "", model: [] },
+			{ name: "bare", description: "", systemPrompt: "" },
+			{ name: "defaulted", description: "", systemPrompt: "", model: ["*:xhigh"] },
+		] as AgentDefinition[];
+		expect(getRoleAgentUsage("task", agents)).toEqual([
+			{ agent: "suffixed", description: "", position: "primary" },
+			{ agent: "legacy", description: "", position: "primary" },
+			{ agent: "fallback", description: "", position: "fallback 1" },
+		]);
+		expect(getRoleAgentUsage("default", agents)).toEqual([
+			{ agent: "defaulted", description: "", position: "primary" },
+		]);
+	});
+
+	test("getRoleAgentUsage returns undefined while agents are unknown and an empty list when none reference the role", () => {
+		expect(getRoleAgentUsage("smol", undefined)).toBeUndefined();
+		expect(getRoleAgentUsage("smol", [])).toEqual([]);
 	});
 });

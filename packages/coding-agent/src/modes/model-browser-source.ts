@@ -1,5 +1,6 @@
 import { type Model, resolveModelServiceTier, type ServiceTier, shouldSendServiceTier } from "@oh-my-pi/pi-ai";
 import type { ModelHubSource } from "@oh-my-pi/pi-tui/overlays/model-hub";
+import type { ModelBrowserRoleAgentUsage } from "@oh-my-pi/pi-tui/overlays/model-browser";
 import { findActiveModelPreset, getModelPresetNames } from "../config/model-presets";
 import { resolveModelRoleValue, rolePriorityDefaults } from "../config/model-resolver";
 import { getKnownRoleIds, getRoleInfo } from "../config/model-roles";
@@ -28,10 +29,13 @@ import {
  * @param sessionServiceTier - The live session's effective tier for a model
  *   (`/fast`, `/fast ultra`, `/slow`, resumed tiers). Omit only where no session
  *   exists; the configured `tier.*` settings stand in then.
+ * @param roleAgentUsage - Agents that reference each role; the role info panel shows them.
+ *   Omit where no agents are loaded.
  */
 export function createModelBrowserSource(
 	settings: Settings,
 	sessionServiceTier?: (model: Model) => ServiceTier | undefined,
+	roleAgentUsage?: (role: string) => readonly ModelBrowserRoleAgentUsage[] | undefined,
 ): ModelHubSource {
 	return {
 		get revision() {
@@ -87,6 +91,7 @@ export function createModelBrowserSource(
 		getGlobalModelRole: role => settings.getGlobalModelRole(role),
 		getModelRoleSource: role => settings.getModelRoleSource(role),
 		getRoleInfo: role => getRoleInfo(role, settings),
+		getRoleAgentUsage: roleAgentUsage,
 		defaultRoleChain: role => rolePriorityDefaults(role),
 		resolveRoleValue: (value, models, roleLookup) => resolveModelRoleValue(value, models, { settings, roleLookup }),
 		getModelPresets: () => ({ names: getModelPresetNames(settings), active: findActiveModelPreset(settings) }),

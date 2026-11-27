@@ -55,6 +55,8 @@ interface Setup {
 	sections?: Record<string, "chat" | "kind">;
 	/** Roles whose value (configured or auto-selected as `pi/<role>`) resolves to no model. */
 	unresolvedRoles?: string[];
+	/** Roles set only in the merged view: a project `modelPresetDefault` masks them from the global layer. */
+	maskedRoles?: Record<string, string>;
 }
 
 function createSource(setup: Setup): ModelHubSource {
@@ -75,7 +77,7 @@ function createSource(setup: Setup): ModelHubSource {
 		knownRoleIds: setup.knownRoleIds,
 		mruOrder: [],
 		modelPerf: new Map(),
-		getModelRole: role => setup.roles[role],
+		getModelRole: role => setup.roles[role] ?? setup.maskedRoles?.[role],
 		getRoleInfo: role => ({
 			name: role,
 			section: setup.sections?.[role] ?? "chat",
@@ -260,6 +262,18 @@ describe("mcp roles nest under mcp", () => {
 		expect(lifeos?.label).toBe("mcp-lifeos");
 		expect(lifeos?.detail).toBe("(itself)");
 		expect(trello?.detail).toBe("openai/gpt-mini");
+	});
+
+	test("a child under a project default shows the merged selector, not (itself)", () => {
+		const hub = createHub({
+			roles: { mcp: "anthropic/claude-sonnet", "mcp-lifeos": "@mcp" },
+			maskedRoles: { "mcp-trello": "openai-codex/gpt-6-luna:auto" },
+			knownRoleIds: ["mcp", "mcp-lifeos", "mcp-trello"],
+		});
+		openRoles(hub.key);
+		expect(hub.body()).toContain("trello: openai-codex/gpt-6-luna:auto");
+		const trello = (hub.describe().items ?? []).find(item => item.id === "childRole:mcp-trello");
+		expect(trello?.detail).toBe("openai-codex/gpt-6-luna:auto");
 	});
 
 	test("activating a browser model lists mcp-lifeos in the model browser's role strip", () => {

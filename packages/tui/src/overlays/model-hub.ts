@@ -1443,12 +1443,9 @@ export class ModelHubComponent implements Component {
 		return this.#settings.getRoleInfo(row.role).compactionRow === false;
 	}
 
-	/** Raw role value a child row shows; `(itself)` when it inherits its parent. */
+	/** Effective role value a child row shows, merged across layers; `(itself)` when unset or inheriting its parent. */
 	#childRoleValue(role: string, parent: string): string {
-		const raw =
-			this.#settings.modelRoleStorage === "project"
-				? (this.#settings.getProjectModelRole(role) ?? this.#settings.getGlobalModelRole(role))
-				: this.#settings.getGlobalModelRole(role);
+		const raw = this.#settings.getModelRole(role);
 		return !raw || raw === `@${parent}` ? "(itself)" : raw;
 	}
 

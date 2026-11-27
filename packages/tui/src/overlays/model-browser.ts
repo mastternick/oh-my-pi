@@ -121,6 +121,10 @@ export interface ModelBrowserRoleInfo {
 	name: string;
 	color?: ThemeColor;
 	hidden?: boolean;
+	/** Lists this role beneath the named parent role when the parent is visible. */
+	parent?: string;
+	/** `false` omits this role's compaction sub-row in the model hub. */
+	compactionRow?: false;
 	section: "chat" | "kind";
 	accepts(model: Model): boolean;
 }

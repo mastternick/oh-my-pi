@@ -91,6 +91,7 @@ type RolesRow =
 	| { kind: "separator" }
 	| { kind: "newFallback" }
 	| { kind: "compaction"; parent: string; model: string; compactor: string | undefined }
+	| { kind: "childRole"; role: string; parent: string }
 	| { kind: "newRole" };
 
 /**
@@ -374,6 +375,11 @@ const MODEL_KIND_TABS: ReadonlyArray<"all" | ModelKind> = ["all", ...MODEL_KINDS
 const ROLE_TABS = ["all", "chat", "kind"] as const;
 type RoleTab = (typeof ROLE_TABS)[number];
 
+/** Name a child role shows beneath its parent: `mcp-lifeos` under `mcp` reads `lifeos`. */
+function childRoleName(row: { role: string; parent: string }): string {
+	return row.role.slice(row.parent.length + 1);
+}
+
 /** Stable native list-item key of a Roles-view row. */
 function rolesRowKey(row: RolesRow, index: number): string {
 	switch (row.kind) {
@@ -383,6 +389,8 @@ function rolesRowKey(row: RolesRow, index: number): string {
 			return `chain:${row.role}`;
 		case "fallback":
 			return `fallback:${row.role}:${row.chainIndex}`;
+		case "childRole":
+			return `childRole:${row.role}`;
 		case "compaction":
 			return `compaction:${row.parent}:${row.model}`;
 		case "separator":
@@ -610,7 +618,34 @@ export class ModelHubComponent implements Component {
 	// ═══════════════════════════════════════════════════════════════════════
 
 	#visibleRoleIds(): string[] {
-		return this.#settings.knownRoleIds.filter(role => !this.#settings.getRoleInfo(role).hidden);
+		const visible = this.#settings.knownRoleIds.filter(role => !this.#settings.getRoleInfo(role).hidden);
+		// A role nested under a visible parent is listed beneath that parent, not at the top level.
+		return visible.filter(role => {
+			const parent = this.#settings.getRoleInfo(role).parent;
+			return !parent || !visible.includes(parent);
+		});
+	}
+
+	/** Every visible role in display order: each top-level role followed by its visible children. */
+	#allVisibleRoleIds(): string[] {
+		return this.#visibleRoleIds().flatMap(role => [role, ...this.#childRoleIds(role)]);
+	}
+
+	/** Roles in a Chat/Kinds section, counting each top-level role with its children: they list under the parent's section. */
+	#sectionRoleCount(section: RoleTab): number {
+		return this.#visibleRoleIds()
+			.filter(role => this.#settings.getRoleInfo(role).section === section)
+			.reduce((count, role) => count + 1 + this.#childRoleIds(role).length, 0);
+	}
+
+	/** Roles nested under `parent`, sorted; they are listed only while `parent` itself is visible. */
+	#childRoleIds(parent: string): string[] {
+		return this.#settings.knownRoleIds
+			.filter(role => {
+				const info = this.#settings.getRoleInfo(role);
+				return info.parent === parent && !info.hidden;
+			})
+			.sort();
 	}
 
 	/** Resolve every known role: configured values first, auto-selection for the rest. */
@@ -741,7 +776,7 @@ export class ModelHubComponent implements Component {
 			catalogCount: catalogCounts.get(providerId) ?? 0,
 		});
 
-		const visibleRoles = this.#visibleRoleIds();
+		const visibleRoles = this.#allVisibleRoleIds();
 		let assignedCount = 0;
 		for (const role of visibleRoles) {
 			const assignment = this.#roles[role];
@@ -970,6 +1005,7 @@ export class ModelHubComponent implements Component {
 		const appendRoles = (roles: ReadonlyArray<string>): void => {
 			for (const role of roles) {
 				addRow({ kind: "role", role });
+				for (const child of this.#childRoleIds(role)) rows.push({ kind: "childRole", role: child, parent: role });
 				const chain = chains[role] ?? [];
 				for (let i = 0; i < chain.length; i++) {
 					addRow({ kind: "fallback", role, chainIndex: i, selector: chain[i] });
@@ -1009,10 +1045,11 @@ export class ModelHubComponent implements Component {
 	#allRolesRowCount(): number {
 		const chains = this.#fallbackChains();
 		const rowCount = (row: RolesRow): number => (this.#compactionSubject(row) ? 2 : 1);
-		// "New role…" and "New fallback chain…", then each role and model chain with its fallback entries (plus compaction sub-rows).
+		// Two "new" rows, then each role with its children, fallback entries and compaction sub-rows.
 		let count = 2;
 		for (const role of this.#visibleRoleIds()) {
 			count += rowCount({ kind: "role", role });
+			count += this.#childRoleIds(role).length;
 			for (const [chainIndex, selector] of (chains[role] ?? []).entries()) {
 				count += rowCount({ kind: "fallback", role, chainIndex, selector });
 			}
@@ -1389,6 +1426,33 @@ export class ModelHubComponent implements Component {
 		this.#refreshAfterMutation();
 	}
 
+	/** Roles flagged `compactionRow: false` (mcp and its children) have no compaction sub-row or model. */
+	#hasNoCompactionRow(row: RolesRow | undefined): boolean {
+		if (row?.kind !== "role" && row?.kind !== "fallback") return false;
+		return this.#settings.getRoleInfo(row.role).compactionRow === false;
+	}
+
+	/** Raw role value a child row shows; `(itself)` when it inherits its parent. */
+	#childRoleValue(role: string, parent: string): string {
+		const raw =
+			this.#settings.modelRoleStorage === "project"
+				? (this.#settings.getProjectModelRole(role) ?? this.#settings.getGlobalModelRole(role))
+				: this.#settings.getGlobalModelRole(role);
+		return !raw || raw === `@${parent}` ? "(itself)" : raw;
+	}
+
+	/** `x` on a child row: persist `@<parent>` so the child inherits its parent's model (no-op without one). */
+	#inheritParentRole(role: string, parent: string): void {
+		const model = this.#roles[parent]?.model;
+		if (!model) return;
+		const source =
+			this.#settings.modelRoleStorage === "project" ? this.#settings.getModelRoleSource(role) : "default";
+		const scope = source === "default" ? undefined : source;
+		// Inherit: no per-child thinking override; the child follows its parent's selector.
+		const result = this.#callbacks.onAssign(model, role, ThinkingLevel.Inherit, `@${parent}`, scope);
+		this.#finishAssignment(result, () => this.#refreshAfterMutation());
+	}
+
 	/**
 	 * Thinking levels a role assignment can actually apply. A model that does
 	 * not reason gets none: no request path sends reasoning for it, and
@@ -1428,7 +1492,7 @@ export class ModelHubComponent implements Component {
 		const chips: StripChip[] = [];
 		const scopedStorage = this.#settings.modelRoleStorage === "project";
 		const scopes: readonly ModelRoleSelectionScope[] = scopedStorage ? ["project", "global"] : ["global"];
-		for (const role of this.#visibleRoleIds()) {
+		for (const role of this.#allVisibleRoleIds()) {
 			const info = this.#settings.getRoleInfo(role);
 			if (!info.accepts(item.model)) continue;
 			const assignment = this.#roles[role];
@@ -1812,6 +1876,7 @@ export class ModelHubComponent implements Component {
 	/** `provider/id` of the model a Roles row runs; a compaction row is keyed by its own model. */
 	#compactionSubject(row: RolesRow | undefined): string | undefined {
 		if (row?.kind === "compaction") return row.model;
+		if (this.#hasNoCompactionRow(row)) return undefined;
 		let model: Model | undefined;
 		if (row?.kind === "role") model = this.#roles[row.role]?.model;
 		else if (row?.kind === "fallback") model = this.#resolveFallbackEntry(row.role, row.chainIndex)?.item.model;
@@ -2095,6 +2160,7 @@ export class ModelHubComponent implements Component {
 	/** The model a Roles row resolves to (assigned role or resolvable fallback), whose compaction point `k` edits. */
 	#roleRowModel(): Model | undefined {
 		const row = this.#rolesRows[this.#roleIndex];
+		if (this.#hasNoCompactionRow(row)) return undefined;
 		if (row?.kind === "role") return this.#roles[row.role]?.model;
 		if (row?.kind === "fallback") return this.#resolveFallbackEntry(row.role, row.chainIndex)?.item.model;
 		return undefined;
@@ -2145,7 +2211,7 @@ export class ModelHubComponent implements Component {
 		if (strip?.kind !== "name" || strip.purpose !== "role") return;
 		const name = strip.input.getValue().trim();
 		if (!/^[a-zA-Z][\w-]*$/.test(name)) return;
-		if (this.#visibleRoleIds().includes(name)) return;
+		if (this.#allVisibleRoleIds().includes(name)) return;
 		this.#strip = null;
 		this.#frame.chipRanges = [];
 		this.#startAssign(name);
@@ -2433,6 +2499,7 @@ export class ModelHubComponent implements Component {
 	#activateRolesRow(row: RolesRow): void {
 		switch (row.kind) {
 			case "role":
+			case "childRole":
 				this.#startAssign(row.role);
 				return;
 			case "chainKey":
@@ -2545,11 +2612,12 @@ export class ModelHubComponent implements Component {
 				if (role) this.#unassignRole(role);
 				else if (row?.kind === "fallback") this.#removeFallback(row);
 				else if (row?.kind === "chainKey") this.#setFallbackChain(row.role, []);
+				else if (row?.kind === "childRole") this.#inheritParentRole(row.role, row.parent);
 				else if (row?.kind === "compaction" && row.compactor) this.#setCompactionModel(row.model, undefined);
 				return;
 			case "fallback":
 				if (row?.kind === "newFallback") this.#startAssignFallbackKey();
-				else if (row && row.kind !== "newRole" && row.kind !== "separator" && row.kind !== "compaction") {
+				else if (row?.kind === "role" || row?.kind === "chainKey" || row?.kind === "fallback") {
 					this.#startAssignFallback(row.role, null);
 				}
 				return;
@@ -2964,6 +3032,16 @@ export class ModelHubComponent implements Component {
 				continue;
 			}
 
+			if (rowDef.kind === "childRole") {
+				const branch = theme.fg("dim", `${"".padEnd(tagWidth + 3)}↳`);
+				const value = this.#childRoleValue(rowDef.role, rowDef.parent);
+				const label = theme.fg("dim", `${childRoleName(rowDef)}: ${value}`);
+				let line = ` ${cursor} ${branch} ${label}`;
+				line = this.#finishRolesRow(line, width, hovered);
+				lines.push(line);
+				continue;
+			}
+
 			const role = rowDef.role;
 			const info = this.#settings.getRoleInfo(role);
 			const assignment = this.#roles[role];
@@ -3136,6 +3214,10 @@ export class ModelHubComponent implements Component {
 					? ` · ${formatKeyHint("k")} compaction limit`
 					: "";
 			const compactor = this.#compactionSubject(row) ? ` · ${formatKeyHint("m")} compactor` : "";
+			if (row?.kind === "childRole") {
+				const inherit = this.#roles[row.parent]?.model ? ` · ${formatKeyHint("x")} use ${row.parent}` : "";
+				return `${upDown} rows · ${enter} assign${inherit} · ${left} providers`;
+			}
 			if (row?.kind === "compaction") {
 				return `${upDown} rows · ${enter} pick compactor · ${formatKeyHint("x")} use itself · ${left} providers`;
 			}
@@ -3513,6 +3595,19 @@ export class ModelHubComponent implements Component {
 					undefined,
 					key,
 				);
+			case "childRole":
+				return node(
+					"item",
+					{
+						label: [
+							span("  ↳ ", "dim"),
+							span(`${childRoleName(rowDef)}: `, "dim"),
+							span(this.#childRoleValue(rowDef.role, rowDef.parent), "dim"),
+						],
+					},
+					undefined,
+					key,
+				);
 			case "role":
 				break;
 		}
@@ -3660,9 +3755,7 @@ export class ModelHubComponent implements Component {
 					tabs: ROLE_TABS.map(tab => ({
 						id: tab,
 						label: tab === "all" ? "All" : tab === "chat" ? "Chat" : "Kinds",
-						count: this.#visibleRoleIds().filter(
-							role => tab === "all" || this.#settings.getRoleInfo(role).section === tab,
-						).length,
+						count: tab === "all" ? this.#allVisibleRoleIds().length : this.#sectionRoleCount(tab),
 					})),
 					tab: this.#roleTab,
 					columns: ROLE_PICKER_COLUMNS,
@@ -3770,7 +3863,7 @@ export class ModelHubComponent implements Component {
 				case "separator":
 					break;
 				case "roles":
-					scopes.push({ id: entry.id, label: "Roles", icon: "sparkles", count: this.#visibleRoleIds().length });
+					scopes.push({ id: entry.id, label: "Roles", icon: "sparkles", count: this.#allVisibleRoleIds().length });
 					break;
 				case "all":
 					scopes.push({
@@ -3955,6 +4048,10 @@ export class ModelHubComponent implements Component {
 						roleAction("clear", "Use itself", "x"),
 					);
 					break;
+				case "childRole":
+					actions.push(roleAction("pick", "Assign", "enter", true));
+					if (this.#roles[row.parent]?.model) actions.push(roleAction("clear", `Inherit ${row.parent}`, "x"));
+					break;
 				case "chainKey":
 					actions.push(roleAction("pick", "Add fallback", "enter", true), roleAction("clear", "Clear chain", "x"));
 					break;
@@ -4076,6 +4173,15 @@ export class ModelHubComponent implements Component {
 				case "compaction":
 					items.push({ id, label: row.compactor ?? "(itself)", mono: true, depth: 1, detail: "compaction" });
 					return;
+				case "childRole":
+					items.push({
+						id,
+						label: row.role,
+						mono: true,
+						depth: 1,
+						detail: this.#childRoleValue(row.role, row.parent),
+					});
+					return;
 				case "role":
 					break;
 			}
@@ -4134,7 +4240,7 @@ export class ModelHubComponent implements Component {
 			}
 			order.push(rolesRowKey(row, index));
 			// Heads count roles and chains, not their fallback entries or the "new" rows.
-			if (head && (row.kind === "role" || row.kind === "chainKey")) head.count++;
+			if (head && (row.kind === "role" || row.kind === "childRole" || row.kind === "chainKey")) head.count++;
 		});
 		return order;
 	}

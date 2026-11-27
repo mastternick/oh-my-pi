@@ -20,6 +20,7 @@ import {
 import { getThemeByName, setThemeInstance, theme } from "@oh-my-pi/pi-tui/theme";
 import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 import type { TUI } from "@oh-my-pi/pi-tui";
+import type { ModelBrowserRoleAgentUsage } from "@oh-my-pi/pi-tui/overlays/model-browser";
 
 import { cfgCycleOrder, cfgModelPresets } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { cfgCompactionModels } from "@oh-my-pi/pi-coding-agent/session/context-settings";
@@ -121,6 +122,7 @@ function createHub(options: {
 	hub?: ModelHubOptions;
 	callbacks?: Partial<ModelHubCallbacks>;
 	terminalRows?: number;
+	roleAgentUsage?: (role: string) => readonly ModelBrowserRoleAgentUsage[];
 }): HubHarness {
 	installTestTheme();
 	const modelsFn = typeof options.models === "function" ? options.models : () => options.models as Model[];
@@ -148,7 +150,7 @@ function createHub(options: {
 	});
 	const hub = new ModelHubComponent(
 		ui,
-		createModelBrowserSource(settings),
+		createModelBrowserSource(settings, undefined, options.roleAgentUsage),
 		registry,
 		options.scoped ? modelsFn().map(model => ({ model })) : [],
 		{
@@ -410,6 +412,107 @@ describe("ModelHub", () => {
 			// reads as unassigned instead of keeping the cleared value.
 			expect(smolRow).not.toContain("worker-model");
 			expect(smolRow).toContain("—");
+		});
+	});
+
+	describe("role info panel", () => {
+		const SMOL_TEXT = "A fast, low-cost model for lightweight work.";
+
+		/** Opens the Roles view and moves onto the smol row (one step below `default`). */
+		function openRolesOnSmol(hub: ModelHubComponent): void {
+			hub.handleInput(UP); // All models → Roles
+			hub.handleInput("\n"); // dive into the role rows
+			hub.handleInput(DOWN); // default → smol
+		}
+
+		test("i toggles the info panel on a role row and shows the built-in description", () => {
+			const { hub } = createHub({ models: [makeModel("test", "chat-model")] });
+			installTestTheme();
+			openRolesOnSmol(hub);
+
+			hub.handleInput("i");
+			expect(normalize(hub.render(220))).toContain(SMOL_TEXT);
+			hub.handleInput("i");
+			expect(normalize(hub.render(220))).not.toContain(SMOL_TEXT);
+		});
+
+		test("Escape closes the panel and the hub stays open", () => {
+			const { hub, onCancel } = createHub({ models: [makeModel("test", "chat-model")] });
+			installTestTheme();
+			openRolesOnSmol(hub);
+			hub.handleInput("i");
+
+			hub.handleInput(ESC);
+			expect(onCancel).not.toHaveBeenCalled();
+			expect(normalize(hub.render(220))).not.toContain(SMOL_TEXT);
+
+			hub.handleInput(ESC);
+			expect(onCancel).toHaveBeenCalledTimes(1);
+		});
+
+		test("Escape cancels assign mode on the first press even with the panel open", () => {
+			const { hub, onCancel } = createHub({ models: [makeModel("test", "chat-model")], scoped: true });
+			installTestTheme();
+			openRolesOnSmol(hub);
+			hub.handleInput("i");
+			hub.handleInput("\n");
+			expect(normalize(hub.render(220))).not.toContain(SMOL_TEXT);
+
+			hub.handleInput(ESC);
+			expect(onCancel).not.toHaveBeenCalled();
+			expect(normalize(hub.render(220))).not.toContain("Assigning");
+			expect(normalize(hub.render(220))).toContain(SMOL_TEXT);
+		});
+
+		test("Escape on the + New role row with the panel flag set closes the hub", () => {
+			const { hub, onCancel } = createHub({ models: [makeModel("test", "chat-model")] });
+			installTestTheme();
+			openRolesOnSmol(hub);
+			hub.handleInput("i");
+			hub.handleInput(UP); // default
+			hub.handleInput(UP); // + New fallback…
+			hub.handleInput(UP); // + New role…, the panel is not drawn here
+
+			hub.handleInput(ESC);
+			expect(onCancel).toHaveBeenCalledTimes(1);
+		});
+
+		test("up and down with the panel open move the panel to the new role", () => {
+			const { hub } = createHub({ models: [makeModel("test", "chat-model")] });
+			installTestTheme();
+			openRolesOnSmol(hub);
+			hub.handleInput("i");
+			expect(normalize(hub.render(220))).toContain(SMOL_TEXT);
+
+			hub.handleInput(DOWN); // smol → next role
+			expect(normalize(hub.render(220))).toContain("A model for slower, deeper reasoning.");
+		});
+
+		test("the footer shows i info on a role row", () => {
+			const { hub } = createHub({ models: [makeModel("test", "chat-model")] });
+			installTestTheme();
+			openRolesOnSmol(hub);
+
+			expect(footerLine(hub.render(220))).toContain("i info");
+		});
+
+		test("a custom role used by an agent shows Used by and the agent description", () => {
+			const roleAgentUsage = (role: string): ModelBrowserRoleAgentUsage[] =>
+				role === "reviewer" ? [{ agent: "code-review", description: "Reviews diffs", position: "primary" }] : [];
+			const settings = Settings.isolated({ modelTags: { reviewer: { name: "Reviewer" } } });
+			const { hub } = createHub({ models: [makeModel("test", "chat-model")], settings, roleAgentUsage });
+			installTestTheme();
+			hub.handleInput(UP);
+			hub.handleInput("\n");
+			// The name is listed on every frame; wait for the cursor to reach its row.
+			for (let step = 0; step < 40 && !normalize(hub.render(220)).includes("❯ ○ Reviewer"); step++) {
+				hub.handleInput(DOWN);
+			}
+			hub.handleInput("i");
+
+			const text = normalize(hub.render(220));
+			expect(text).toContain("Used by: code-review (primary)");
+			expect(text).toContain("Reviews diffs");
 		});
 	});
 

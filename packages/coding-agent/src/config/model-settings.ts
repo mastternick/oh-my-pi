@@ -14,6 +14,8 @@ export interface ModelTagDef {
 	color?: string;
 	/** If true, the role is functional but not shown in the model selector UI. */
 	hidden?: boolean;
+	/** Shown in the model hub's role info panel; a role without one keeps its built-in description. */
+	description?: string;
 }
 
 /** Model tags keyed by tag id (`modelTags`). */

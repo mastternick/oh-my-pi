@@ -40,7 +40,7 @@ import { plainText } from "../native/spans";
 import { isNativeRendering } from "../native/state";
 import { Input } from "../components/input";
 import { routeSgrMouseInput, type SgrMouseEvent } from "../mouse";
-import { truncateToWidth, visibleWidth } from "../utils";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../utils";
 import type {
 	ModelBrowserSource,
 	ModelBrowserRegistry,
@@ -295,12 +295,14 @@ type RolesAction =
 	| "compactor"
 	| "save"
 	| "nextPreset"
-	| "prevPreset";
+	| "prevPreset"
+	| "info";
 
 /** Printable keys of the Roles view and the command each runs. */
 const ROLES_ACTION_KEYS: Record<string, RolesAction> = {
 	x: "clear",
 	f: "fallback",
+	i: "info",
 	c: "cycle",
 	n: "new",
 	t: "thinking",
@@ -460,6 +462,8 @@ export class ModelHubComponent implements Component {
 	#roleScrollStart = 0;
 	/** Roles rows actually drawn this frame; bounds mouse hit-testing to the visible window. */
 	#rolesVisibleCount = 0;
+	/** Roles-view info panel for the selected role; Esc closes it before the hub. */
+	#roleInfoOpen = false;
 
 	#assigning: AssignTarget | null = null;
 	#strip: StripState | null = null;
@@ -798,7 +802,7 @@ export class ModelHubComponent implements Component {
 
 		this.#entries = entries;
 		if (!entries.some(entry => entry.id === this.#activeEntryId)) {
-			this.#activeEntryId = "all";
+			this.#switchEntry("all");
 			this.#sidebarFollowActive = true;
 		}
 	}
@@ -824,7 +828,7 @@ export class ModelHubComponent implements Component {
 		}
 		const replacement = this.#nearestNavigableEntry(anchor.index);
 		if (!replacement) return;
-		this.#activeEntryId = replacement.id;
+		this.#switchEntry(replacement.id);
 		this.#frame.sidebarScroll = Math.max(0, this.#entries.indexOf(replacement) - anchor.offset);
 	}
 
@@ -846,9 +850,16 @@ export class ModelHubComponent implements Component {
 		return this.#entries.find(entry => entry.id === this.#activeEntryId) ?? this.#entries[0];
 	}
 
+	/** Point the sidebar at `id`; the Roles info panel belongs to the Roles entry, so leaving it closes the panel. */
+	#switchEntry(id: string): void {
+		if (id === this.#activeEntryId) return;
+		this.#activeEntryId = id;
+		this.#roleInfoOpen = false;
+	}
+
 	#setActiveEntry(id: string): void {
 		if (!this.#entries.some(entry => entry.id === id)) return;
-		this.#activeEntryId = id;
+		this.#switchEntry(id);
 		this.#sidebarFollowActive = true;
 		this.#applyScope();
 		const entry = this.#activeEntry();
@@ -2357,7 +2368,10 @@ export class ModelHubComponent implements Component {
 		}
 	}
 
-	/** The cancel key's ladder: close a strip, leave assign mode, clear the query, then close the hub. */
+	/**
+	 * The cancel key's ladder: close a strip, close the role info panel, leave assign mode, clear the query,
+	 * then close the hub.
+	 */
 	#cancel(): void {
 		if (this.#assignmentPending) {
 			this.#callbacks.onCancel();
@@ -2365,6 +2379,10 @@ export class ModelHubComponent implements Component {
 		}
 		if (this.#strip) {
 			this.#closeStrip();
+			return;
+		}
+		if (this.#roleInfoVisibleRole() !== undefined) {
+			this.#roleInfoOpen = false;
 			return;
 		}
 		if (this.#assigning !== null) {
@@ -2533,6 +2551,73 @@ export class ModelHubComponent implements Component {
 		}
 	}
 
+	/** Role whose info panel a row selects: role and fallback rows, and a compaction row's parent. */
+	#rolesInfoRole(row: RolesRow | undefined): string | undefined {
+		const target =
+			row?.kind === "compaction" ? this.#rolesRows.find((r, i) => rolesRowKey(r, i) === row.parent) : row;
+		return target?.kind === "role" || target?.kind === "fallback" ? target.role : undefined;
+	}
+
+	/** Role whose info panel is drawn now; every renderer and the Esc ladder read this one predicate. */
+	#roleInfoVisibleRole(): string | undefined {
+		if (!this.#roleInfoOpen || this.#assigning !== null || this.#activeEntry().kind !== "roles") return undefined;
+		return this.#rolesInfoRole(this.#rolesRows[this.#roleIndex]);
+	}
+
+	/** Facts shown by the Roles info panel, read from the sources the role rows already use. */
+	#roleInfoFacts(role: string): { title: string; description: string; details: [string, string][] } {
+		const info = this.#settings.getRoleInfo(role);
+		const usage = this.#settings.getRoleAgentUsage?.(role);
+		const primary = usage?.find(entry => entry.position === "primary");
+		const assigned = this.#roles[role];
+		const chain = this.#fallbackChains()[role] ?? [];
+		const source = !info.description && primary ? `agent (${primary.agent})` : (info.descriptionSource ?? "none");
+		const usedBy = usage ? usage.map(entry => `${entry.agent} (${entry.position})`).join(", ") || "none" : "unknown";
+		const now = assigned?.model
+			? `${assigned.model.provider}/${assigned.model.id} · thinking ${assigned.thinkingLevel ?? "default"}`
+			: "none";
+		const cycle = this.#cycleOrder().includes(role) ? "yes" : "no";
+		const scope = `${this.#settings.getModelRoleSource(role)} · in cycle: ${cycle}`;
+		return {
+			title: `${info.name}${info.tag ? ` (${info.tag})` : ""} · @${role}`,
+			description: info.description ?? primary?.description ?? "No description.",
+			details: [
+				["Description from:", source],
+				["Used by:", usedBy],
+				["Now:", now],
+				["Fallbacks:", chain.join(", ") || "none"],
+				["Scope:", scope],
+			],
+		};
+	}
+
+	/**
+	 * Classic info panel lines for `role`, wrapped to `width` and capped at `maxLines`. Priority, highest first: the
+	 * title, "Used by" and "Now", the description (cut with an ellipsis when it does not fit), then the other facts.
+	 */
+	#roleInfoLines(role: string, width: number, maxLines: number): string[] {
+		if (maxLines <= 0) return [];
+		const facts = this.#roleInfoFacts(role);
+		const title = truncateToWidth(theme.fg("accent", facts.title), width);
+		const details = facts.details.map(([label, value]) => ({
+			label,
+			line: truncateToWidth(theme.fg("dim", `${label} ${value}`), width),
+		}));
+		const budget = maxLines - 1;
+		const core = details.filter(detail => detail.label === "Used by:" || detail.label === "Now:").slice(0, budget);
+		const room = budget - core.length;
+		let description = wrapTextWithAnsi(facts.description, Math.max(1, width - 4)).map(line => `   ${line}`);
+		if (description.length > room) {
+			description = description.slice(0, room);
+			if (room > 0) description[room - 1] = `${description[room - 1]}…`;
+		}
+		const optional = details
+			.filter(detail => detail.label !== "Used by:" && detail.label !== "Now:")
+			.slice(0, room - description.length);
+		const shown = new Set([...core, ...optional]);
+		return [title, ...description, ...details.filter(detail => shown.has(detail)).map(detail => detail.line)];
+	}
+
 	/** One Roles-view command on the selected row (keys and action-bar buttons share it). */
 	#runRolesAction(action: RolesAction): void {
 		const row = this.#rolesRows[this.#roleIndex];
@@ -2558,6 +2643,9 @@ export class ModelHubComponent implements Component {
 				if (subject) this.#startAssignCompactor(subject);
 				return;
 			}
+			case "info":
+				if (this.#rolesInfoRole(row)) this.#roleInfoOpen = !this.#roleInfoOpen;
+				return;
 			case "cycle":
 				if (role) this.#toggleCycleMembership(role);
 				return;
@@ -2908,7 +2996,12 @@ export class ModelHubComponent implements Component {
 		// Window the list around the cursor so entries past the panel height stay
 		// reachable; the trailing indicator line steals one row when clipped.
 		const total = this.#rolesRows.length;
-		const capacity = Math.max(0, rows - 2 - this.#rolesRowStart);
+		const infoRole = this.#roleInfoVisibleRole();
+		// The info panel shares the list area; capped so at least three list rows stay visible.
+		const infoLines = infoRole
+			? this.#roleInfoLines(infoRole, width, Math.max(0, rows - 5 - this.#rolesRowStart))
+			: [];
+		const capacity = Math.max(0, rows - 2 - this.#rolesRowStart - infoLines.length);
 		const overflow = total > capacity;
 		const viewHeight = overflow ? Math.max(0, capacity - 1) : capacity;
 		this.#roleScrollStart = this.#ensureRoleVisible(viewHeight, total);
@@ -3006,6 +3099,7 @@ export class ModelHubComponent implements Component {
 			line = this.#finishRolesRow(line, width, hovered);
 			lines.push(line);
 		}
+		lines.push(...infoLines);
 
 		if (overflow) {
 			const hiddenAbove = this.#roleScrollStart;
@@ -3136,8 +3230,9 @@ export class ModelHubComponent implements Component {
 					? ` · ${formatKeyHint("k")} compaction limit`
 					: "";
 			const compactor = this.#compactionSubject(row) ? ` · ${formatKeyHint("m")} compactor` : "";
+			const infoHint = this.#rolesInfoRole(row) ? ` · ${formatKeyHint("i")} info` : "";
 			if (row?.kind === "compaction") {
-				return `${upDown} rows · ${enter} pick compactor · ${formatKeyHint("x")} use itself · ${left} providers`;
+				return `${upDown} rows · ${enter} pick compactor · ${formatKeyHint("x")} use itself${infoHint} · ${left} providers`;
 			}
 			if (row?.kind === "fallback") {
 				// Advertise `t` only when the entry resolves: wildcards always
@@ -3145,7 +3240,7 @@ export class ModelHubComponent implements Component {
 				// action would be inert there.
 				const editable = this.#resolveFallbackEntry(row.role, row.chainIndex) !== undefined;
 				const thinking = editable ? ` · ${formatKeyHint("t")} thinking` : "";
-				return `${upDown} rows · ${enter} replace · ${formatKeyHint("f")} add another · ${formatKeyHint("x")} remove${thinking}${compaction}${compactor}${this.#reorderFooterHint(row)} · ${left} providers`;
+				return `${upDown} rows · ${enter} replace · ${formatKeyHint("f")} add another · ${formatKeyHint("x")} remove${thinking}${infoHint}${compaction}${compactor}${this.#reorderFooterHint(row)} · ${left} providers`;
 			}
 			if (row?.kind === "chainKey") {
 				return `${upDown} rows · ${formatKeyHints(["enter", "f"])} add fallback · ${formatKeyHint("x")} clear chain · ${left} providers`;
@@ -3159,7 +3254,7 @@ export class ModelHubComponent implements Component {
 			const thinking = editable ? ` · ${formatKeyHint("t")} thinking` : "";
 			const savePreset = this.#callbacks.onSavePreset ? ` · ${formatKeyHint("s")} save preset` : "";
 			const switchPreset = this.#presets().names.length > 0 ? ` · ${formatKeyHints(["p", "shift+p"])} preset` : "";
-			return `${upDown} rows · ${enter} pick · ${formatKeyHint("f")} fallback · ${formatKeyHint("x")} clear${thinking}${compaction}${compactor} · ${formatKeyHint("c")} cycle${this.#reorderFooterHint(row)} · ${formatKeyHints(["shift+up", "shift+down"])} cycle order · ${formatKeyHint("n")} new${savePreset}${switchPreset}`;
+			return `${upDown} rows · ${enter} pick · ${formatKeyHint("f")} fallback · ${formatKeyHint("x")} clear${thinking}${infoHint}${compaction}${compactor} · ${formatKeyHint("c")} cycle${this.#reorderFooterHint(row)} · ${formatKeyHints(["shift+up", "shift+down"])} cycle order · ${formatKeyHint("n")} new${savePreset}${switchPreset}`;
 		}
 		if (entry.kind === "provider" && entry.locked) {
 			return entry.oauth
@@ -3471,7 +3566,24 @@ export class ModelHubComponent implements Component {
 			items,
 			"roles",
 		);
-		return [tabs, list, this.#describeCycle(cycleOrder)];
+		const infoRole = this.#roleInfoVisibleRole();
+		const info = infoRole ? [this.#describeRoleInfo(infoRole)] : [];
+		return [tabs, list, ...info, this.#describeCycle(cycleOrder)];
+	}
+
+	/** Native info panel: the classic block's facts as text nodes. */
+	#describeRoleInfo(role: string): NativeNode {
+		const facts = this.#roleInfoFacts(role);
+		return node(
+			"col",
+			{ gap: "xs" },
+			[
+				text([span(facts.title)]),
+				text([span(facts.description)]),
+				...facts.details.map(([label, value]) => text([span(`${label} ${value}`, "dim")])),
+			],
+			"roleInfo",
+		);
 	}
 
 	#describeRolesRow(rowDef: RolesRow, index: number, cycleOrder: readonly string[]): NativeNode {
@@ -3654,6 +3766,8 @@ export class ModelHubComponent implements Component {
 		};
 		if (rolesView) {
 			const row = this.#rolesRows[this.#roleIndex];
+			const infoRole = this.#roleInfoVisibleRole();
+			const preview = this.#rolePreview(row);
 			return picker(
 				{
 					...props,
@@ -3671,7 +3785,7 @@ export class ModelHubComponent implements Component {
 					selected: row && row.kind !== "separator" ? rolesRowKey(row, this.#roleIndex) : null,
 					total: this.#allRolesRowCount(),
 				},
-				this.#rolePreview(row),
+				infoRole ? [this.#describeRoleInfo(infoRole), ...preview] : preview,
 			);
 		}
 		const catalogue = this.#browser.pickerItems(this.#availableItems);
@@ -3923,6 +4037,7 @@ export class ModelHubComponent implements Component {
 					actions.push(
 						roleAction("pick", "Pick model", "enter", true),
 						roleAction("fallback", "Add fallback", "f"),
+						roleAction("info", "Info", "i"),
 						assigned && !assigned.autoSelected ? roleAction("clear", "Clear", "x") : undefined,
 						this.#primarySwapTarget(row.role) ? roleAction("lower", "Swap with fallback", "f2") : undefined,
 						this.#roleThinkingTarget(row.role) ? roleAction("thinking", "Thinking", "t") : undefined,
@@ -3940,6 +4055,7 @@ export class ModelHubComponent implements Component {
 						roleAction("pick", "Replace", "enter", true),
 						roleAction("fallback", "Add another", "f"),
 						roleAction("clear", "Remove", "x"),
+						roleAction("info", "Info", "i"),
 						this.#resolveFallbackEntry(row.role, row.chainIndex)
 							? roleAction("thinking", "Thinking", "t")
 							: undefined,

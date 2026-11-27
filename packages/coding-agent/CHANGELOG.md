@@ -47,6 +47,7 @@
 - Explicit memories saved through `xd://retain`, `learn`, and `/memory` writes are no longer tagged `IMPORTED` and are exempt from working-memory trimming by source. Rows with a NULL source are no longer dropped by the trim predicate. Imported rows keep their guard.
 - Session-preset snapshot write failures during startup are latched and reported through RPC persistence notices instead of aborting session creation.
 - Archive reads no longer return members of the previous contents when an archive is rewritten within the same filesystem timestamp tick: archives changed in the last 2 seconds are re-read instead of cached.
+- The `/models` Roles view shows an `mcp-*` child's effective model instead of `(itself)` whenever the global layer does not carry its assignment (for example in projects whose config sets `modelPresetDefault`).
 
 ## [19.0.0] - 2026-11-18
 

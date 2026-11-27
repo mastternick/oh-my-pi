@@ -307,6 +307,10 @@ export function getRoleInfo(role: string, settings: Settings): RoleInfo {
 	const builtIn = isModelRole(role) ? MODEL_ROLES[role] : undefined;
 	const configuredTags = cfgModelTags.get(settings);
 	const configured = Object.hasOwn(configuredTags, role) ? configuredTags[role] : undefined;
+	const isMcp = role === "mcp" || role.startsWith("mcp-");
+	// `mcp-<ns>` nests under the `mcp` parent; the hub shows it top-level when `mcp` is absent or hidden.
+	const parent = role.startsWith("mcp-") ? "mcp" : undefined;
+	const mcpFields = { ...(parent ? { parent } : {}), ...(isMcp ? { compactionRow: false as const } : {}) };
 
 	if (configured) {
 		const description = configured.description || builtIn?.description;
@@ -319,12 +323,13 @@ export function getRoleInfo(role: string, settings: Settings): RoleInfo {
 			descriptionSource: configured.description ? "modelTags" : description ? "built-in" : undefined,
 			accepts: builtIn?.accepts ?? acceptsChat,
 			section: builtIn?.section ?? "chat",
+			...mcpFields,
 		};
 	}
 
-	if (builtIn) return { ...builtIn, descriptionSource: "built-in" };
+	if (builtIn) return { ...builtIn, ...mcpFields, descriptionSource: "built-in" };
 
-	return { name: role, color: "muted", accepts: acceptsChat, section: "chat" };
+	return { name: role, color: "muted", accepts: acceptsChat, section: "chat", ...mcpFields };
 }
 
 /** An agent whose `model` list references a role as `@<role>`. */
